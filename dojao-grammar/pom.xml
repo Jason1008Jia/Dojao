@@ -3,13 +3,13 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>com.dojao</groupId>
   <artifactId>dojao-grammar</artifactId>
-  <version>1.0-SNAPSHOT</version>
+  <version>1.0.0</version>
   <name>Dojao Grammar</name>
 
   <parent>
     <groupId>com.dojao</groupId>
     <artifactId>dojao</artifactId>
-    <version>1.0-SNAPSHOT</version>
+    <version>1.0.0</version>
   </parent>
 
   <dependencies>

@@ -3,7 +3,7 @@
 # Dojao 三节点部署脚本 —— 在 aliyun003（Master 机）上执行
 #
 # 做的事（严格按顺序）：
-#   1. 删除 /opt/module/dojao，把 dojao-1.0-SNAPSHOT.tar.gz 解压到 /opt/module/
+#   1. 删除 /opt/module/dojao，把 dojao-1.0.0.tar.gz 解压到 /opt/module/
 #   2. 改 /opt/module/dojao/bin/dojao：在 `set -e` 上一行插入
 #         JAVA_HOME=/opt/module/jdk-21.0.10
 #   3. 改本机（aliyun003）的 /opt/module/dojao/conf/dojao.conf：
@@ -18,7 +18,7 @@
 #
 # 用法：
 #   ./deploy-cluster.sh                                  # 自动找 tar 包
-#   ./deploy-cluster.sh /root/dojao-1.0-SNAPSHOT.tar.gz  # 显式指定
+#   ./deploy-cluster.sh /root/dojao-1.0.0.tar.gz  # 显式指定
 #   TARBALL=/path/xxx.tar.gz ./deploy-cluster.sh
 #
 # 前提：
@@ -34,7 +34,7 @@ DOJAO_HOME=/opt/module/dojao
 JAVA_HOME_VALUE=/opt/module/jdk-21.0.10
 MASTER_NODE=aliyun003
 WORKER_NODES=(aliyun001 aliyun002)
-TARBALL_NAME=dojao-1.0-SNAPSHOT.tar.gz
+TARBALL_NAME=dojao-1.0.0.tar.gz
 SSH_OPTS="${SSH_OPTS:--o ConnectTimeout=10}"
 
 CONF="$DOJAO_HOME/conf/dojao.conf"
