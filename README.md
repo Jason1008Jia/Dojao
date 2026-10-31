@@ -94,8 +94,6 @@ Arrow 列存储在内存中**不动**，只有行号在 Map / Sort 中重排；�
 | `dojao-cli` | 命令行客户端 |
 | `dojao-jdbc` | JDBC 驱动 |
 | `dojao-ai` | ReAct Agent 内核：流式推理、工具调用、多轮上下文（LangChain4j + OpenAI 兼容端点） |
-| `dojao-official-website` | 官网（Vue 3 + Vite 静态站点；构建时自动同步根目录博客与设计说明书） |
-| `dojao-dist` | 打包与发行（内置 `bin/`、`conf/dojao.conf`、`lib/connectors/`） |
 | `python/` | Python sidecar 参考实现（`dojao_udf`） |
 
 ---
@@ -112,12 +110,12 @@ cd dojao
 
 ### 启动（单机 / 分机通用）
 
-构建产物是一份自包含发行包 `dojao-dist/target/dojao-1.0-SNAPSHOT.tar.gz`，解压即用，
-内含 `bin/`（启动脚本）、`conf/dojao.conf`（一份文件描述整个集群）、`lib/`（引擎 + 内置连接器）、`python/`（sidecar 参考实现）。
-默认 `system.role = both`（同机起 Master + Worker）。
+从 [GitHub Releases](https://github.com/Jason1008Jia/Dojao/releases) 下载自包含发行包 `dojao-1.0-SNAPSHOT.tar.gz`，
+解压即用，内含 `bin/`（启动脚本）、`conf/dojao.conf`（一份文件描述整个集群）、`lib/`（引擎 + 内置连接器）、
+`python/`（sidecar 参考实现）。默认 `system.role = both`（同机起 Master + Worker）。
 
 ```bash
-tar -xzf dojao-dist/target/dojao-1.0-SNAPSHOT.tar.gz
+tar -xzf dojao-1.0-SNAPSHOT.tar.gz
 cd dojao-1.0-SNAPSHOT/dojao
 ./bin/dojao                 # 按 conf 里的 system.role 启动；也可 ./bin/dojao master|worker|both
 ```
