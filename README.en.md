@@ -1,36 +1,29 @@
 # Dojao
 
-#### Description
-{**When you're done, you can delete the content in this README and update the file with details for others getting started with your repository**}
+**A distributed data science engine for the AI era** — query MySQL / TiDB / Doris / PostgreSQL / SQL Server /
+Oracle / Hive / ClickHouse / Excel in one SQL, run Python vectorized UDFs, and let a built-in AI agent
+explore data, execute SQL and render charts — without moving data.
 
-#### Software Architecture
-Software architecture description
+## Repository
 
-#### Installation
+- Gitee: <https://gitee.com/scottjia/dojao>
+- Clone: `git clone https://gitee.com/scottjia/dojao.git`
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+## Documentation
 
-#### Instructions
+- Chinese README: [README.md](README.md)
+- UDF protocol (DFP): [UDF_PROTOCOL.md](UDF_PROTOCOL.md)
+- Custom connectors: [docs/custom-connector.md](docs/custom-connector.md)
+- Linux deployment: [docs/deploy-linux.md](docs/deploy-linux.md)
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+## Build
 
-#### Contribution
+```bash
+git clone https://gitee.com/scottjia/dojao.git
+cd dojao
+./mvnw clean package -DskipTests
+```
 
-1.  Fork the repository
-2.  Create Feat_xxx branch
-3.  Commit your code
-4.  Create Pull Request
+## License
 
-
-#### Gitee Feature
-
-1.  You can use Readme\_XXX.md to support different languages, such as Readme\_en.md, Readme\_zh.md
-2.  Gitee blog [blog.gitee.com](https://blog.gitee.com)
-3.  Explore open source project [https://gitee.com/explore](https://gitee.com/explore)
-4.  The most valuable open source project [GVP](https://gitee.com/gvp)
-5.  The manual of Gitee [https://gitee.com/help](https://gitee.com/help)
-6.  The most popular members  [https://gitee.com/gitee-stars/](https://gitee.com/gitee-stars/)
+[Apache License 2.0](LICENSE)

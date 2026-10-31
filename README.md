@@ -31,7 +31,8 @@ Hive / ClickHouse / Excel 里的数据，让数据科学家不写一行 JVM 语�
    `cosine_similarity / l2_distance / inner_product` 一条 SQL 完成，数据不动。
 4. **Python UDF + Arrow 零拷贝** —— 数据科学家用 NumPy / Polars 直接向量化执行，无跨语言逐行序列化；
    协议（DFP）**语言中立**，任何会说 Arrow 的语言都能作为函数运行时。
-5. **AI 原生集成**（规划中）—— AIFunction 注册进表达式体系，Agent 通过元数据发现并调用。
+5. **AI 原生集成** —— 内置流式 ReAct Agent：一条自然语言完成跨源取数、SQL 执行与图表展示；
+   工具按角色授权，DDL 执行前必须人工确认。
 6. **单进程可嵌入 + 可集群部署** —— 既是嵌入式引擎，也能独立集群。
 7. **算子自观测** —— `AbstractMeasurableOperator` + 零注入统计，为 Web 控制台与可解释排障提供数据。
 
@@ -74,7 +75,7 @@ Arrow 列存储在内存中**不动**，只有行号在 Map / Sort 中重排；�
 | **轻量部署** | Java 21 + 虚拟线程，单 JAR 启动；单进程可嵌入 |
 | **Web 控制台** | 查询监控 / 任务看板 / 内存与磁盘溢写观测 / 血缘 DAG / SQL 自动补全 / 函数与 Catalog 管理 |
 | **客户端** | 自带 CLI 与 JDBC 驱动；支持查询取消 |
-| **AI Agent**（骨架） | 自然语言问数 + UDF 自动成为 AI Tool；`ai.*` 配置命名空间已预留 |
+| **AI Agent** | 内置流式 ReAct 推理：思考 / 工具调用 / 观察过程逐字展示；13 个内置工具（只读 SQL、DDL 人工确认、目录与表/函数元数据、集群/查询/算子诊断、日志、CSV/Excel 导出）；`render_chart` 支持 11 种图表与混合双 Y 轴，结果集缓存（`rs3` / `last`）免重算免回传；多轮会话持久化、按账号隔离、Skill 可裁剪工具集 |
 
 ---
 
@@ -92,7 +93,7 @@ Arrow 列存储在内存中**不动**，只有行号在 Map / Sort 中重排；�
 | `dojao-ui` | Web 控制台（静态资源 + 监控 API） |
 | `dojao-cli` | 命令行客户端 |
 | `dojao-jdbc` | JDBC 驱动 |
-| `dojao-ai` | AI Agent（骨架，待扩展） |
+| `dojao-ai` | ReAct Agent 内核：流式推理、工具调用、多轮上下文（LangChain4j + OpenAI 兼容端点） |
 | `dojao-official-website` | 官网（Vue 3 + Vite 静态站点；构建时自动同步根目录博客与设计说明书） |
 | `dojao-dist` | 打包与发行（内置 `bin/`、`conf/dojao.conf`、`lib/connectors/`） |
 | `python/` | Python sidecar 参考实现（`dojao_udf`） |
