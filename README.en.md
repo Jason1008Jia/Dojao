@@ -21,7 +21,7 @@ explore data, execute SQL and render charts — without moving data.
 ```bash
 git clone https://github.com/Jason1008Jia/Dojao.git
 cd dojao
-./mvnw clean package -DskipTests
+mvn clean package -DskipTests
 ```
 
 ## License

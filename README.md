@@ -16,7 +16,7 @@ Dojao 不是一个数据库，也不只是一个查询引擎。它是一个**面
 设计初衷只有一句话：**让分析师用一条 SQL 打通散落在 MySQL / TiDB / Doris / PostgreSQL / SQL Server / Oracle /
 Hive / ClickHouse / Excel 里的数据，让数据科学家不写一行 JVM 语言就能把 Python 统计量 / 小模型直接当 SQL 函数用。**
 
-配套：**单进程可嵌入**，也能**独立组集群**（Master / Worker，Arrow Flight 传输）；
+配套：**单进程即可跑通**（Master + Worker 同进程），也能**独立组集群**（Master / Worker，Arrow Flight 传输）；
 内存不足时**自动溢写磁盘**；**算子自观测**，内置 Web 控制台看每一次查询的进度、内存与溢写。
 
 ---
@@ -33,7 +33,7 @@ Hive / ClickHouse / Excel 里的数据，让数据科学家不写一行 JVM 语�
    协议（DFP）**语言中立**，任何会说 Arrow 的语言都能作为函数运行时。
 5. **AI 原生集成** —— 内置流式 ReAct Agent：一条自然语言完成跨源取数、SQL 执行与图表展示；
    工具按角色授权，DDL 执行前必须人工确认。
-6. **单进程可嵌入 + 可集群部署** —— 既是嵌入式引擎，也能独立集群。
+6. **单进程即用 + 可集群部署** —— 默认 `system.role = both` 一个进程同时跑 Master 与 Worker，也能拆成多机集群。
 7. **算子自观测** —— `AbstractMeasurableOperator` + 零注入统计，为 Web 控制台与可解释排障提供数据。
 
 ---
@@ -56,8 +56,8 @@ Arrow 列存储在内存中**不动**，只有行号在 Map / Sort 中重排；�
 - 全节点一个共享根分配器 `NodeMemory`：算子 / 连接器 / transport 统一记账，超限只让**查询失败**，不让**节点被内核杀掉**；
 - **读端背压**把「内存不够」变成「读得慢一点」，让溢写追上来而非 OOM。
 
-> 详细推导（为什么 slot.memory 是一笔混合账、为什么堆不用大、`query.direct.limit` 如何封顶）
-> 见 **[设计说明书](dojao_design_manual.html)**。
+> 推导要点：`slot.memory` 是一笔混合账（堆内索引 + 堆外数据）；堆只装索引 / 批量暂存 / 控制面，
+> `query.direct.limit` 为堆外使用封顶。
 
 ---
 
@@ -72,10 +72,10 @@ Arrow 列存储在内存中**不动**，只有行号在 Map / Sort 中重排；�
 | **列裁剪 + 谓词下推** | 三层列裁剪（保险丝 / 需求传播 / analyzer 绑定）；连接器自报谓词下推能力，杜绝静默多读 |
 | **动态资源管理** | 查询级资源上限 + 准入排队 + 动态并行度（按数据量估算切片数）+ 资源回收 |
 | **分布式执行** | Exchange 算子（Arrow Flight）+ Fragment 计划 + Coordinator 调度；数据永不回 Master |
-| **轻量部署** | Java 21 + 虚拟线程，单 JAR 启动；单进程可嵌入 |
+| **轻量部署** | Java 21 + 虚拟线程；发行包解压即用，单进程即可跑通 Master + Worker |
 | **Web 控制台** | 查询监控 / 任务看板 / 内存与磁盘溢写观测 / 血缘 DAG / SQL 自动补全 / 函数与 Catalog 管理 |
 | **客户端** | 自带 CLI 与 JDBC 驱动；支持查询取消 |
-| **AI Agent** | 内置流式 ReAct 推理：思考 / 工具调用 / 观察过程逐字展示；13 个内置工具（只读 SQL、DDL 人工确认、目录与表/函数元数据、集群/查询/算子诊断、日志、CSV/Excel 导出）；`render_chart` 支持 11 种图表与混合双 Y 轴，结果集缓存（`rs3` / `last`）免重算免回传；多轮会话持久化、按账号隔离、Skill 可裁剪工具集 |
+| **AI Agent** | 内置流式 ReAct 推理：思考 / 工具调用 / 观察过程逐字展示；13 个内置工具（只读 SQL、DDL 人工确认、目录与表/函数元数据、集群/查询/算子诊断、日志、以及 CSV / Excel / HTML / PNG / PDF 多格式导出）；`render_chart` 支持 11 种图表与混合双 Y 轴，结果集缓存（`rs3` / `last`）免重算免回传；多轮会话持久化、按账号隔离、Skill 可裁剪工具集 |
 
 ---
 
@@ -105,8 +105,10 @@ Arrow 列存储在内存中**不动**，只有行号在 Map / Sort 中重排；�
 ```bash
 git clone https://github.com/Jason1008Jia/Dojao.git
 cd dojao
-./mvnw clean package -DskipTests
+mvn clean package -DskipTests
 ```
+
+需要 **JDK 21** 与 **Maven 3.9+**。
 
 ### 启动（单机 / 分机通用）
 
@@ -140,7 +142,7 @@ open http://localhost:2380
 -- 注册数据源（一次）
 CREATE CATALOG hive    USING hive       WITH ('catalog.hive.metastore.uris' = 'thrift://localhost:9083');
 CREATE CATALOG mydb    USING mysql      WITH ('catalog.mysql.jdbcUrl' = 'jdbc:mysql://localhost:3306/dga',
-                                              'catalog.mysql.user' = 'root', 'catalog.mysql.password' = '***');
+                                              'catalog.mysql.username' = 'root', 'catalog.mysql.password' = '***');
 
 -- Hive 埋点明细 ⋈ MySQL 用户维表，只读真正用到的列
 SELECT u.city, COUNT(*) AS c, ROUND(SUM(b.amount), 2) AS gmv
@@ -246,8 +248,6 @@ query.spill.dir      = /data1/dojao-spill,/data2/dojao-spill   # ★别放 /tmp�
 - 盘使用率上限 `query.spill.disk.maxUsage`，写满换盘，全部候选盘超限则报错而非静默写爆节点。
 - 无 LIMIT 的全局 `ORDER BY` 默认**拒绝**（`query.sort.topSpillPolicy = error`），提示你加 LIMIT。
 
-> 完整调参直觉与「6g 堆为何把 4C8G 机器拉爆」的真实事故复盘，见 **[设计说明书](dojao_design_manual.html)**。
-
 ---
 
 ## 分布式执行
@@ -299,17 +299,10 @@ query.spill.dir      = /data1/dojao-spill,/data2/dojao-spill   # ★别放 /tmp�
 
 | 文档 | 内容 |
 |---|---|
-| [`dojao_design_manual.html`](dojao_design_manual.html) | **设计说明书**：内存模型推导、窗口过滤下推两级优化、HashJoin 字节预算、高基数 GROUP BY K 路归并 |
 | [`UDF_PROTOCOL.md`](UDF_PROTOCOL.md) | **DFP 外挂函数协议**（语言中立，权威规范） |
 | [`docs/custom-connector.md`](docs/custom-connector.md) | 自定义连接器开发指引 |
 | [`docs/deploy-linux.md`](docs/deploy-linux.md) | Linux 部署与集群化 |
 | [`docs/benchmark-dojao-trino-spark.md`](docs/benchmark-dojao-trino-spark.md) | 三引擎对等压测方法、SQL 阶梯、定位边界 |
-| [`blog0`](blog0_design_rationale.html) | **设计初衷与技术选型**：为什么造 Dojao、为什么是 Java 21、Apache Arrow 与 Arrow Flight 的选型理由，以及这些选择付出的代价 |
-| [`blog1`](blog1_dojao_shuffle_model.html) – [`blog17`](blog17_column_pruning.html)（含 [`blog2_1`](blog2_1_union_distinct_grouping_sets.html)） | 系列实现博文：Shuffle 模型、GroupBy、窗口、SortMergeJoin、HashJoin、分布式任务、查询管理、跨源 join、列裁剪 … |
-| [`blog18`](blog18_dojao_ai_architecture.html) | **Dojao AI 架构与定位**：分层（通用 ReAct 内核 / 能力绑定）、8 个工具、能力面与边界、系统提示词工程、会话与技能、逐用户隔离 |
-| [`blog18_1`](blog18_1_ai_optimization.html) | **Dojao AI 优化**：混合图表（逐序列图形 + 主副双 Y 轴）、服务端结果集缓存 + 引用（`render_chart(data="rs3"/"last")` 免重算免回传） |
-| [`blog19`](blog19_flight15_cancel_lost_complete.html) | **线上 5/6 卡死复盘**：已经 ack 的 COMPLETE 为什么还是丢了 —— Arrow Flight 15 的 `completed()` 异步半关闭、`close()` 触发 `ClientCall.cancel`、探针 S8 与收尾修复 |
-| [`blog20`](blog20_grouping_sets_single_scan.html) | **多维聚合只扫一次表**：ROLLUP / CUBE / GROUPING SETS 旧路径按维度组合展开成 N 条腿、各扫一遍表；新路径用 `ExpandOperator` 一行变 N 行 + `__grouping_id`，一次聚合（`read()` 369 → 123） |
 
 ---
 
