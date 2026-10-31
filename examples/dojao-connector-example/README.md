@@ -42,7 +42,7 @@ mvn -pl dojao-spi -am install -DskipTests
 mvn -f examples/dojao-connector-example/pom.xml package
 
 # 3. 丢进部署目录（插件目录优先级见 docs/custom-connector.md §1.2）
-cp target/dojao-connector-csvdir-1.0.0.jar <dojao部署目录>/lib/connectors/
+cp target/dojao-connector-csvdir-0.1.0.jar <dojao部署目录>/lib/connectors/
 ```
 
 > `dojao-spi` 必须是 `provided`。插件类加载器对 `com.dojao.spi.*` / `com.dojao.common.*`

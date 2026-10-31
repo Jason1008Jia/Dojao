@@ -4,17 +4,17 @@
 
 ## 1. 获取发行包
 
-发行包是自包含的 `dojao-1.0.0.tar.gz`，解压即用（包内已含全部运行时依赖，所以体积偏大）。
+发行包是自包含的 `dojao-0.1.0.tar.gz`，解压即用（包内已含全部运行时依赖，所以体积偏大）。
 
-到 [GitHub Releases](https://github.com/Jason1008Jia/Dojao/releases) 下载 `dojao-1.0.0.tar.gz`，
+到 [GitHub Releases](https://github.com/Jason1008Jia/Dojao/releases) 下载 `dojao-0.1.0.tar.gz`，
 拿到后直接跳到第 2 节。
 
 ## 2. 上传解压
 
 ```bash
-scp <本地的 dojao-1.0.0.tar.gz> root@<linux-host>:/opt/
+scp <本地的 dojao-0.1.0.tar.gz> root@<linux-host>:/opt/
 ssh root@<linux-host>
-cd /opt && tar -xzf dojao-1.0.0.tar.gz
+cd /opt && tar -xzf dojao-0.1.0.tar.gz
 chmod +x dojao/bin/dojao dojao/bin/dojao-cli
 ```
 

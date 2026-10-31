@@ -112,13 +112,13 @@ mvn clean package -DskipTests
 
 ### 启动（单机 / 分机通用）
 
-从 [GitHub Releases](https://github.com/Jason1008Jia/Dojao/releases) 下载自包含发行包 `dojao-1.0.0.tar.gz`，
+从 [GitHub Releases](https://github.com/Jason1008Jia/Dojao/releases) 下载自包含发行包 `dojao-0.1.0.tar.gz`，
 解压即用，内含 `bin/`（启动脚本）、`conf/dojao.conf`（一份文件描述整个集群）、`lib/`（引擎 + 内置连接器）、
 `python/`（sidecar 参考实现）。默认 `system.role = both`（同机起 Master + Worker）。
 
 ```bash
-tar -xzf dojao-1.0.0.tar.gz
-cd dojao-1.0.0/dojao
+tar -xzf dojao-0.1.0.tar.gz
+cd dojao-0.1.0/dojao
 ./bin/dojao                 # 按 conf 里的 system.role 启动；也可 ./bin/dojao master|worker|both
 ```
 

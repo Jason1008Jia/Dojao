@@ -12,7 +12,7 @@
     -->
     <groupId>com.example.dojao</groupId>
     <artifactId>dojao-connector-csvdir</artifactId>
-    <version>1.0.0</version>
+    <version>0.1.0</version>
     <packaging>jar</packaging>
 
     <name>Dojao 自定义连接器示例（CSV 目录）</name>
@@ -25,7 +25,7 @@
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.release>21</maven.compiler.release>
-        <dojao.version>1.0.0</dojao.version>
+        <dojao.version>0.1.0</dojao.version>
         <!-- 与 Dojao 主仓库选择的 Jackson 版本对齐（Arrow 的传递依赖；引擎运行时已自带） -->
         <jackson.version>2.16.1</jackson.version>
     </properties>

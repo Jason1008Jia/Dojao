@@ -25,7 +25,7 @@
 <dependency>
     <groupId>com.dojao</groupId>
     <artifactId>dojao-spi</artifactId>
-    <version>1.0.0</version>
+    <version>0.1.0</version>
     <scope>provided</scope>
 </dependency>
 ```
@@ -74,7 +74,7 @@ com.example.mydb.MyConnectorFactory
 
 ```bash
 mvn -f examples/dojao-connector-example/pom.xml package
-cp target/dojao-connector-csvdir-1.0.0.jar <dojao部署目录>/lib/connectors/
+cp target/dojao-connector-csvdir-0.1.0.jar <dojao部署目录>/lib/connectors/
 ```
 
 重启 Master 与 Worker，然后：
