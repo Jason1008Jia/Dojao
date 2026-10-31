@@ -22,6 +22,6 @@ jobs:
         cache: maven
 
     - name: Build with Maven
-      # 如果你的项目里有测试跑不过（比如需要连 MySQL/Hive），先加上 -DskipTests
-      # 如果单测是纯本地的，可以把 -DskipTests 去掉
-      run: mvn -B package -DskipTests --file pom.xml
+      # CI 只做打包：跳过测试执行与测试编译（-DskipTests 只跳过执行，仍会 testCompile）
+      # 若以后需要跑纯本地单测，再改成 -DskipTests 或去掉该参数
+      run: mvn -B package -Dmaven.test.skip=true --file pom.xml
