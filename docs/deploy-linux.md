@@ -22,21 +22,32 @@ chmod +x dojao/bin/dojao dojao/bin/dojao-cli
 
 ```
 dojao/
+  LICENSE
   bin/
-    dojao          # 集群启动（Master 与/或 Worker）
-    dojao-cli      # 命令行客户端
+    dojao            # 启动（Master / Worker 由本机 conf 的 system.role 决定）
+    dojao-cli        # 命令行客户端
   conf/
-    dojao.conf     # 引擎配置（角色 / 端口 / 内存）
-    workers.conf   # 集群 Worker 机清单（dojao-cluster.sh 用）
+    dojao.conf       # 本机配置（角色 / 地址 / 端口 / 内存 / 溢写）
   systemd/
-    dojao.service  # systemd 单元模板
+    dojao.service    # systemd 单元模板
   lib/
-    *.jar          # 引擎 + 共享库（JDBC 驱动 / Hadoop / ORC 等）
-    connectors/    # 连接器插件目录：内置 mysql/postgres/hive/clickhouse/excel/sqlserver + 第三方
-  data/            # 运行时自动创建（SQLite 元数据库）
+    *.jar            # 引擎 + 共享库（JDBC 驱动 / Hadoop / ORC 等）
+    connectors/      # 连接器插件：clickhouse/doris/excel/hive/mysql/oracle/postgres/sqlserver/tidb + 第三方
+  python/
+    dojao_udf/       # Python UDF sidecar 参考实现（base.py / sidecar.py / udf_pb2.py / examples/）
+    generate_pb.sh   # 重新生成 UDF protobuf 桩
+    requirements.txt
+    README.md
+  data/              # 运行时自动创建（SQLite 元数据库）
+  logs/              # 建议的运行日志目录（如 nohup ./bin/dojao >> logs/dojao.out 2>&1）
+  spill/             # 运行时自动创建（默认溢写目录，可用 query.spill.dir 改为多块盘）
 ```
 
 本机需有 **JDK 21+**。`bin/dojao` 优先用 `$JAVA_HOME/bin/java`，否则找 PATH 里的 `java`。
+
+只有使用 **Python UDF** 时才需要 Python **3.11+**，并在 sidecar 使用的解释器里安装
+`pip install -r python/requirements.txt`（`pyarrow` / `numpy` / `pandas` / `protobuf`）；
+纯 SQL 与 Java 函数场景可不装。用法见 [`python/README.md`](../python/README.md)。
 
 ## 3. 配置 `conf/dojao.conf`
 
@@ -50,25 +61,38 @@ dojao/
 system.role = both                # 同机拉起 Master + Worker 两个 JVM
 system.master.host = 0.0.0.0      # 绑全网卡，别机才连得进
 system.master.port = 6530
-system.worker.host = 127.0.0.1    # ★只在单机（both）成立；分机必须改成各机自己的地址
+system.worker.host = 127.0.0.1    # ★只在单机（both）成立；分布式部署必须改成各机自己的地址
 system.ui.port = 2380
 system.metastore.sqlite.path = data/dojao-metastore.db
 ```
 
-### 分机（A = Master，B / C = Worker，共用同一份 conf）
+### 分布式部署（A = Master，B / C = Worker）
 
-靠**角色前缀** `<role>.<key>` 描述异构集群，不用维护多份文件：
+每台机器安装一份发行包，**各自编辑本机的 `conf/dojao.conf`** —— 不存在一份跨机共享的配置，
+也不需要 Worker 清单。Master 只负责监听端口；Worker 启动后按本机配置里的 Master 地址主动注册，
+注册成功即加入集群。
 
 ```properties
-# ---- A 机 ----
-system.role = master
-system.worker.host = <A 的内网 IP>        # A 机自己也要跑 Worker 时填本机地址
+# ---- A 机（Master；也要承担计算时用 both） ----
+system.role = both                        # 只做 Master 用 master
+system.master.host = 0.0.0.0              # 绑定地址，确保 Worker 连得进来
+system.worker.host = <A 的内网 IP>        # role=both 时必填：对外通告的 Worker 地址
 
-# ---- B / C 机 ----
+# ---- B / C 机（Worker） ----
 system.role = worker
+system.master.host = <A 的内网 IP>        # Worker 主动注册的目标
 system.worker.host = <本机的内网 IP>      # ★必须改！否则别的机器把它解析成自己的回环
-worker.system.master.host = <A 的内网 IP>
 ```
+
+各机分别启动，顺序无关（Master 未就绪时 Worker 会退避重试约 30s）：
+
+```bash
+./bin/dojao        # 按本机 conf 的 system.role 启动；也可临时 ./bin/dojao master|worker|both
+```
+
+**扩容 / 缩容**：新增 D 机只需安装发行包，写 `system.role = worker`、`system.master.host = <A 机 IP>`、
+`system.worker.host = <D 机 IP>`，启动后自动注册；下线直接停对应 Worker 进程。
+Master 侧无需维护任何节点清单。
 
 **★`system.worker.host` 是「对外通告地址」，不是绑卡地址**（Flight 服务器恒绑 `0.0.0.0:port`）。
 它注册进 Master，并随每次派发下发给所有 Worker 当作「怎么找这个 Worker」。
@@ -84,18 +108,6 @@ worker.system.master.host = <A 的内网 IP>
 
 启用 systemd 时，该键写在 `conf/dojao.conf` 里即可（不必再写单元文件）。
 
-**一键启动**：在 A 机把 B / C 的主机名写进 `conf/workers.conf`（一行一个，本机不写）：
-
-```text
-aliyun001
-aliyun002
-```
-
-然后在 A 机执行 `./bin/dojao-cluster.sh`：先起本机，再按清单 ssh 到各机，在各自的安装目录执行
-`nohup ./bin/dojao >> logs/dojao.out 2>&1 &`。脚本不传角色参数，每台机器读自己
-`conf/dojao.conf` 的 `system.role`。前提是 A 到各机免密 ssh、各机安装路径一致。
-`./bin/dojao-cluster.sh stop` 可反序停止。
-
 ### 按机器规模调的几个键
 
 | 键 | 默认 | 说明 |
@@ -108,6 +120,8 @@ aliyun002
 | `query.memory.maxFragments` | `2 × worker.parallelism` | （精调）单 Worker 并发片段上限，参与 fragmentDirect 摊薄 |
 | `query.slot.memory` | 派生 | （精调）单个可溢写算子的内存预算，超 `slot × query.spill.ratio` 溢写 |
 | `query.memory.highWatermark` / `lowWatermark` | `0.85` / `0.75` | 堆外用量背压水位：越过高水位则读取端放缓，回落到低水位放行 |
+| `query.spill.dir` | `<DOJAO_HOME>/spill` | 溢写目录；逗号分隔可配多块盘，实例间轮转分摊 I/O（详见下节） |
+| `query.spill.disk.maxUsage` | `0.8` | 单块溢写盘使用率上限（(0,1]）；超限换下一块盘，全部超限则本次溢写失败（详见下节） |
 | `system.master.parallelism` | `4` | 每 query 并行分区数 |
 | `system.worker.parallelism` | `8` | 单 Worker 任务池容量（随包 `conf/dojao.conf` 设为 `6`） |
 | `query.parallelism.bytesPerSlot` | `1G` | 每 scan 分区承载字节数（决定单表并行度） |
@@ -121,16 +135,42 @@ aliyun002
 >
 > `3` = 三卡槽流水线（1 份在累加、1 份在写盘、1 份空闲）；单槽溢写阈值 = `slot × ratio`，
 > 所以三槽峰值 `3 × slot × ratio = fragmentDirect` —— 它恰好等于一个片段的堆外份额。
-> ⚠ 该值在 **Master 进程**里计算（启动时）并随片段下发，因此被 **Master 的** `system.master.memory`
-> 封顶：随包默认 `master.memory = 2g` ⇒ Arrow 预算 819M ⇒ `slot` 落在 32M 下限——即使 Worker 配了 5g。
-> 想放大单算子预算，要么调大 `system.master.memory`，要么按 Master 的配置显式写 `query.slot.memory`。
+> ⚠ 该值在 **Master 进程**里按**本进程的角色配置**派生（`system.role = master` ⇒ 读 `system.master.memory`），
+> 启动时算好并随片段下发给 Worker；Worker 收到的是定值，**不会**用自己的 `system.worker.memory` 重算。
+> 随包默认 `master.memory = 2g` ⇒ 堆外 1g ⇒ Arrow 预算 819M ⇒ `slot` 落在 32M 下限——即使 Worker 配了 5g 也不会变大。
+> `system.worker.memory` 决定的是 Worker JVM 的 `-Xmx` / `-XX:MaxDirectMemorySize` 和它自己的 Arrow
+> 共享根预算（片段实际运行的内存容器），不是这个 slot 数。单机 `system.role = both` 时角色为 `BOTH`，
+> 派生回落到 `system.worker.memory`。
+> 想放大单算子预算，推荐按 Master 的配置**显式写 `query.slot.memory`**；调大 `system.master.memory` 也能让派生变大，
+> 但会让 Master 进程本身占更多内存。
 > Arrow 向量全走堆外，**堆与堆外都必须封顶**，否则小内存机上会被内核 OOM-killer 杀进程（无 Java 异常）。
 
-### HDFS 侧不用做任何事
+### 溢写目录与磁盘保护
 
-Windows 上那套 `hadoop.home.dir` + `bin/winutils.exe` 兜底是 **`isWindows()` 守卫**的，Linux 上不会触发；
-反过来，机器上装了 Hadoop 并设了 `HADOOP_HOME`，会自动把 `hadoop.home.dir` 指过去（正好是对的）。
-那批公网保活参数（`ipc.ping.interval` 等）在内网也无害，保持默认即可。
+溢写是「内存换磁盘」：算子内存到达 `slot.memory × query.spill.ratio`（默认 0.8）时落盘。落盘位置和「盘写满怎么办」由下面两个键控制：
+
+```properties
+# 溢写目录：逗号分隔可配多块盘，把溢写 I/O 摊开。
+# 相对路径按 DOJAO_HOME 解析，建议写绝对路径；空项忽略、保序去重。
+query.spill.dir = /data1/dojao-spill,/data2/dojao-spill,/data3/dojao-spill
+
+# 单块溢写盘使用率上限：(0,1]，默认 0.8 即「用到 80% 就不再往这块盘写」。
+query.spill.disk.maxUsage = 0.8
+```
+
+行为说明：
+
+- **多目录轮转**：每个溢写算子实例启动时按 round-robin 取一个根目录，在其下建唯一子目录
+  `<算子名>-p<PID>-<序号>`，各实例互不干扰；正常关闭 / SIGTERM 自动清理，`kill -9` 留下的孤儿目录
+  由下次启动扫描清理（只认上述命名，不碰用户自己放进去的目录）。
+- **写前查盘**：每次真正写溢写文件前都检查目标目录所在盘的**使用率**。达到
+  `query.spill.disk.maxUsage` 就换到 `query.spill.dir` 里下一块合格的盘；**所有候选盘都超限**则本次溢写
+  失败、查询报错，错误信息会列出全部候选目录及各自使用率 / 可用空间（不会静默把磁盘写爆）。
+- **判定不了视为可用**（fail-open）：路径不存在且父目录也不存在、或文件系统不支持 `statfs` 时放行，
+  避免因查不到容量误杀查询。
+- **不要指向 `/tmp`**：很多 Linux 的 `/tmp` 是 tmpfs（内存盘），「溢写到磁盘」会变成吃内存，反而把节点 OOM。
+- 别和 `query.spill.ratio` 混淆：后者是**内存**触发阈值（达到 slot 预算的多少比例开始溢写），
+  `query.spill.disk.maxUsage` 才是**磁盘**使用率上限。
 
 ## 4. 建 Hive catalog
 
@@ -208,7 +248,7 @@ nohup ./bin/dojao > dojao.log 2>&1 &
 |---|---|
 | **6530** | Master Flight —— Worker 注册 + 客户端提交 SQL 的**唯一入口** |
 | **2380** | Web 控制台（监控看板 + SQL 控制台） |
-| 4009+ | Worker Flight —— 同机 `both` 时走回环，无需对外开放；分机部署才需要在 Worker 之间互通 |
+| 4009+ | Worker Flight —— 同机 `both` 时走回环，无需对外开放；分布式部署才需要在 Worker 之间互通 |
 
 跨机访问只需在防火墙 / 安全组放开 **6530** 与 **2380**。
 

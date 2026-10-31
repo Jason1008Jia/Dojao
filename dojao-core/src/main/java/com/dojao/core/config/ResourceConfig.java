@@ -33,7 +33,7 @@ import java.util.Properties;
  * / {@code -Dsystem.role=worker}）。键查找链由此扩展为
  * <b>{@code -D<key>} &gt; 文件 {@code <role>.<key>} &gt; 文件 {@code <key>} &gt; 内置默认</b>，
  * 例如 {@code master.system.master.host = 0.0.0.0} 与 {@code worker.system.master.host = <Master IP>}
- * 可共存于同一份 conf，描述异构集群。</p>
+ * 可共存于同一份 conf（仅在需要一份文件描述多种角色时使用；常规部署每台机器各写本机键，无需前缀）。</p>
  *
  * <p><b>全仓唯一入口</b>：{@code dojao-metastore} / {@code dojao-ui} 看不到本类，其
  * {@code System.getProperty} 调用点靠本类类初始化时的<b>回填</b>（{@link #backfillToSystemProperties()}）

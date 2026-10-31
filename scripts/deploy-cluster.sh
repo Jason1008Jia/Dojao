@@ -9,7 +9,6 @@
 #   3. 改本机（aliyun003）的 /opt/module/dojao/conf/dojao.conf：
 #         system.master.host = aliyun003
 #         system.worker.host = aliyun003
-#      并按 WORKER_NODES 生成 conf/workers.conf（dojao-cluster.sh 的启动清单）
 #   4. 清掉 aliyun001/002 上的旧目录（防止旧版 jar 残留），再 xsync 分发整个 dojao 目录
 #   5. ssh aliyun001 / aliyun002，各改自己的 conf：
 #         system.worker.host = aliyun001 | aliyun002
@@ -103,24 +102,13 @@ fi
 grep -nE '^(JAVA_HOME=|set -e$)' "$BIN" | sed 's/^/    /' || true
 
 # ==================== 3/6 本机（Master 机）conf ====================
-log "3/6 修改本机 $MASTER_NODE 的 conf + 生成 conf/workers.conf"
+log "3/6 修改本机 $MASTER_NODE 的 conf"
 
 [ -f "$CONF" ] || die "找不到 $CONF"
 set_conf "$CONF" system.master.host "$MASTER_NODE"
 set_conf "$CONF" system.worker.host "$MASTER_NODE"
 ok "已设置 system.master.host / system.worker.host = $MASTER_NODE"
 show_conf "$CONF"
-
-# dojao-cluster.sh 只读 conf/workers.conf 决定 ssh 到哪几台机器启动；这里按部署清单生成。
-# 必须在第 4 步 xsync 之前写，这样 Worker 机也会同步到同一份清单（路径/顺序一致）。
-WORKERS_CONF="$DOJAO_HOME/conf/workers.conf"
-{
-    echo "# 集群 Worker 机清单（由 scripts/deploy-cluster.sh 生成；一行一个，本机不写）"
-    for node in "${WORKER_NODES[@]}"; do
-        echo "$node"
-    done
-} > "$WORKERS_CONF"
-ok "已生成 conf/workers.conf：${WORKER_NODES[*]}"
 
 # ==================== 4/6 清理旧目录 + xsync 分发 ====================
 log "4/6 清理各 Worker 旧目录并分发 $DOJAO_HOME"
@@ -193,9 +181,10 @@ cat <<EOF
   $MASTER_NODE 的 system.role 当前为 [${ROLE_NOW:-未设置}] —— 只想起 Master 就改成 master；
   想连它一起当第 3 个 Worker（共 3 Worker）就保持 both。
 
-启动（在 Master 机上）：
-  /opt/module/dojao/bin/dojao-cluster.sh   # 本机 + conf/workers.conf 里的全部 Worker
-  或逐台 /opt/module/dojao/bin/dojao       # 各机按自己 conf 的 system.role 启动
+启动（每台机器各自执行，顺序无关）：
+  /opt/module/dojao/bin/dojao              # 各机按自己 conf 的 system.role 启动
+Worker 启动后会按 conf 里的 system.master.host 主动注册到 Master；
+扩容时新机器只需写好 system.role = worker 与 Master 地址后启动。
 
 注意：conf 在进程启动时读一次，改完必须重启进程。
 EOF

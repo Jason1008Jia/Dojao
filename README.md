@@ -110,10 +110,10 @@ mvn clean package -DskipTests
 
 需要 **JDK 21** 与 **Maven 3.9+**。
 
-### 启动（单机 / 分机通用）
+### 启动（单机 / 分布式通用）
 
 从 [GitHub Releases](https://github.com/Jason1008Jia/Dojao/releases) 下载自包含发行包 `dojao-0.1.0.tar.gz`，
-解压即用，内含 `bin/`（启动脚本）、`conf/dojao.conf`（一份文件描述整个集群）、`lib/`（引擎 + 内置连接器）、
+解压即用，内含 `bin/`（启动脚本）、`conf/dojao.conf`（本机配置）、`lib/`（引擎 + 内置连接器）、
 `python/`（sidecar 参考实现）。默认 `system.role = both`（同机起 Master + Worker）。
 
 ```bash
@@ -122,10 +122,11 @@ cd dojao-0.1.0/dojao
 ./bin/dojao                 # 按 conf 里的 system.role 启动；也可 ./bin/dojao master|worker|both
 ```
 
-分机部署（A = Master，B / C = Worker）：用 `<role>.<key>` 前缀在同一份配置里按生效角色取值，
-例如 B / C 机写 `worker.system.master.host = <A 机 IP>`；把 B / C 的主机名写进 Master 的
-`conf/workers.conf`，再在 Master 上执行 `./bin/dojao-cluster.sh` 一键启动（各机角色仍由
-`conf/dojao.conf` 的 `system.role` 决定）。完整步骤见 [`docs/deploy-linux.md`](docs/deploy-linux.md)。
+分布式部署（A = Master，B / C = Worker）：每台机器各自编辑本机 `conf/dojao.conf` ——
+A 机写 `system.role = both`（或 `master`）与 `system.master.host = 0.0.0.0`；
+B / C 机写 `system.role = worker`、`system.master.host = <A 机 IP>`、`system.worker.host = <本机 IP>`。
+各机分别启动 `./bin/dojao`，Worker 会主动注册到 Master，无需节点清单；扩容只需在新机写好角色与
+Master 地址后启动。完整步骤见 [`docs/deploy-linux.md`](docs/deploy-linux.md)。
 
 ### 连接
 

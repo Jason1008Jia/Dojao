@@ -20,11 +20,11 @@ import java.util.concurrent.TimeUnit;
 /**
  * 集群日志只读查看：读取 Master / Worker 的 {@code dojao.out}。</p>
  *
- * <p><b>日志在哪</b>：{@code bin/dojao-cluster.sh} 用
+ * <p><b>日志在哪</b>：推荐各机用
  * {@code nohup ./bin/dojao >> logs/dojao.out 2>&1} 启动，每台机器一个文件；logback 本身只输出到
  * STDOUT（见 {@code dojao-server/src/main/resources/logback.xml}），没有滚动文件。UI 跑在 Master
  * 进程内 ⇒ 本机日志直接读文件；其余 Worker 机走 <b>Master → Worker 的免密 ssh</b>
- * （部署脚本 {@code scripts/deploy-cluster.sh} 的前提就是 root 免密 ssh 到各 Worker）。</p>
+ * （需集群各机安装路径一致，并配置到各 Worker 的免密 ssh）。</p>
  *
  * <p><b>路径</b>：默认取 {@code ${dojao.home}/logs/dojao.out} 的绝对路径（{@code bin/dojao}
  * 会注入 {@code -Ddojao.home}）。集群各机安装路径一致，所以同一个绝对路径在 Worker 上也成立；

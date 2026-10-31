@@ -9,8 +9,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Dojao <b>一键启动入口</b>（部署态）—— 读 {@code conf/dojao.conf}，按 {@code system.role} 拉起
- * 独立 JVM 进程（Master 与 / 或 Worker），把"一堆配置"收敛成"一个文件 + 一条命令"。
+ * Dojao 启动入口（部署态）—— 读本机 {@code conf/dojao.conf}，按 {@code system.role} 拉起
+ * 独立 JVM 进程（Master 与 / 或 Worker）。
  *
  * <p><b>角色</b>（{@code system.role}，{@code -Dsystem.role=...} 可覆盖）：
  * <ul>
@@ -20,9 +20,9 @@ import java.util.List;
  *       （各自盖 {@code -Dsystem.role=master} / {@code -Dsystem.role=worker}）。</li>
  * </ul>
  *
- * <p><b>角色前缀</b>：子进程启动时角色是具体的，故配置文件可用 {@code <role>.<key>} 描述异构集群 ——
- * 例如三台机器共用同一份 conf：A 机 {@code master.system.master.host=0.0.0.0}，
- * B/C 机 {@code worker.system.master.host=<A 的 IP>}，各取各的段。</p>
+ * <p><b>角色前缀</b>：子进程启动时角色是具体的，故配置文件可用 {@code <role>.<key>} 描述不同角色。
+ * 常规分布式部署每台机器各自一份 conf，直接写本机键即可，无需前缀；Worker 按
+ * {@code system.master.host} 主动注册到 Master，Master 不维护节点清单。</p>
  *
  * <p><b>常用配置键</b>（全部写在 {@code conf/dojao.conf}）：
  * <pre>
