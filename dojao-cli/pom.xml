@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dojao</groupId>
+        <artifactId>dojao</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>dojao-cli</artifactId>
+    <name>Dojao CLI</name>
+    <description>
+        命令行客户端：交互式 SQL 终端，支持语法高亮、自动补全、
+        查询历史、结果格式化（表格/CSV/JSON）。
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-core</artifactId>
+        </dependency>
+
+        <!-- JLine（终端交互） -->
+        <dependency>
+            <groupId>org.jline</groupId>
+            <artifactId>jline</artifactId>
+        </dependency>
+
+        <!-- 日志实现 -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <mainClass>com.dojao.cli.DojaoCli</mainClass>
+                        </manifest>
+                    </archive>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

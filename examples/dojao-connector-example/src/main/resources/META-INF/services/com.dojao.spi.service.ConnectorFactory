@@ -1,0 +1,3 @@
+# 自定义连接器工厂登记表：一行一个实现类全限定名。
+# 引擎（Master / Worker）启动时用 ServiceLoader 读这份声明来发现连接器。
+com.example.dojao.csvdir.CsvDirConnectorFactory

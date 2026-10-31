@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dojao Console</title>
+<link rel="stylesheet" href="css/style.css">
+<!-- 首屏先落主题（防闪烁）：CSS 变量分支靠 <html data-theme>，必须在首帧前定好。
+     与 state.js 的 THEME_KEY / initTheme() 同一份 localStorage 键。 -->
+<script>(function(){try{var t=localStorage.getItem('dojao.theme');document.documentElement.setAttribute('data-theme',t==='dark'?'dark':'light');}catch(e){}})();</script>
+</head>
+<body>
+
+<header>
+  <img class="brand-mark" src="img/logo.png" alt="" aria-hidden="true">
+  <h1 id="header-title">Dojao Console</h1>
+  <nav class="top-nav" id="top-nav">
+    <button type="button" class="nav-tab active" data-view="home" onclick="switchTab('home')">首页</button>
+    <button type="button" class="nav-tab" data-view="tasks" onclick="switchTab('tasks')">任务管理</button>
+    <button type="button" class="nav-tab" data-view="monitor" onclick="switchTab('monitor')">监控</button>
+    <button type="button" class="nav-tab" data-view="ai" onclick="switchTab('ai')">AI</button>
+  </nav>
+  <span class="header-spacer"></span>
+  <span class="badge" id="header-badge">首页</span>
+  <span class="header-user" id="header-user"></span>
+  <!-- 刷新当前功能区：只重拉当前 tab 的数据，其他页面的状态保持不动 -->
+  <button type="button" class="refresh-btn" id="refresh-btn"
+          title="刷新当前页面（只刷新选中的功能区，不影响其他页面）"
+          aria-label="刷新当前页面"
+          onclick="refreshCurrentView()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M20.5 12a8.5 8.5 0 1 1-2.49-6.01"/>
+      <path d="M20.5 4.5V10h-5.5"/>
+    </svg>
+  </button>
+  <button type="button" class="settings-btn app-menu-anchor" id="settings-btn"
+          title="设置：页面 / 函数 / AI 模型"
+          aria-label="设置"
+          onclick="openHeaderSettingsMenu(event)">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="3"/>
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+    </svg>
+  </button>
+  <button type="button" class="theme-toggle" id="theme-toggle" onclick="toggleTheme()"
+          title="切换到深色模式" aria-label="切换到深色模式">
+    <svg class="ico-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>
+    </svg>
+    <svg class="ico-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="4.2"/>
+      <path d="M12 2.5v2.4M12 19.1v2.4M4.2 4.2l1.7 1.7M18.1 18.1l1.7 1.7M2.5 12h2.4M19.1 12h2.4M4.2 19.8l1.7-1.7M18.1 5.9l1.7-1.7"/>
+    </svg>
+  </button>
+  <button type="button" class="logout-btn" id="logout-btn">登出</button>
+</header>
+
+<div class="main">
+
+  <!-- ========== 首页：SQL 工作台（左 catalog 树 + 右编辑器/结果）========== -->
+  <div class="home-view" id="home-view">
+    <aside class="catalog-sidebar">
+      <div class="catalog-sidebar-title">
+        <span>Catalog 浏览</span>
+        <span class="catalog-title-actions">
+          <!-- 新建 catalog：打开「连接器卡片 → 表单」向导，后台执行 CREATE CATALOG（见 js/catalog-create.js） -->
+          <button type="button" id="catalog-create-btn" class="catalog-refresh-btn catalog-new-btn"
+                  title="新建 catalog（选择连接器填表单，无需写 SQL）"
+                  aria-label="新建 catalog"
+                  onclick="openCatalogCreateDialog()">
+            <svg class="cat-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 5v14M5 12h14"/>
+            </svg>
+          </button>
+          <button type="button" id="catalog-refresh-btn" class="catalog-refresh-btn"
+                  title="刷新 catalog 列表（新建 / 删除 catalog 后点这里看到最新状态）"
+                  aria-label="刷新"
+                  onclick="refreshCatalogTree()">
+            <svg class="cat-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M20.5 12a8.5 8.5 0 1 1-2.49-6.01"/>
+              <path d="M20.5 4.5V10h-5.5"/>
+            </svg>
+          </button>
+        </span>
+      </div>
+      <div class="catalog-tree" id="catalog-tree">
+        <div class="catalog-loading">加载中&hellip;</div>
+      </div>
+      <!-- 左下角【管理】：点击弹出 函数管理 / AI 模型管理 / 页面设置（见 js/manage.js）-->
+      <div class="catalog-sidebar-footer">
+        <button type="button" class="catalog-manage-btn app-menu-anchor" id="catalog-manage-btn"
+                title="管理：函数管理 / AI 模型管理 / 页面设置"
+                onclick="openCatalogManageMenu(event)">
+          <svg class="cm-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+          <span>管理</span>
+        </button>
+      </div>
+    </aside>
+    <section class="home-main">
+      <div class="sql-console">
+        <!-- 查询控制台标签栏：像 DataGrip / DBeaver 那样可开多个 SQL 区域。
+             tab 列表由 js/sql-console.js 渲染；＋ 新建，打开 读本地 .sql/.txt。 -->
+        <div class="sql-console-tabs-bar">
+          <div class="sql-console-tabs" id="sql-console-tabs"></div>
+          <button type="button" class="sql-console-icon-btn" id="sql-new-console-btn"
+                  title="新增查询控制台">＋</button>
+          <button type="button" class="sql-console-icon-btn" id="sql-open-file-btn"
+                  title="打开本地 SQL 文件（.sql / .txt）">打开</button>
+          <input type="file" id="sql-file-input" accept=".sql,.txt,text/plain"
+                 style="display:none" aria-hidden="true">
+        </div>
+        <div class="sql-editor-wrap">
+          <div class="sql-editor-toolbar">
+            <!-- onmousedown 阻止默认：点「运行」时不让浏览器把焦点从编辑器挪走，
+                 否则「选中一段只跑选中部分」的选区高亮会在点按钮的瞬间消失（选区值其实还在，
+                 但用户看不见，像是白选了）。键盘 Ctrl+Enter 本就发生在框内，无此问题。 -->
+            <button id="submit-btn" class="run-btn" type="button"
+                    title="运行（Ctrl + Enter；框内有选中则只运行选中部分）"
+                    onmousedown="event.preventDefault()"
+                    onclick="submitQuery()">
+              <svg class="run-ico" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M7.6 4.9a1 1 0 0 0-1.5.87v12.46a1 1 0 0 0 1.5.87l10.7-6.23a1 1 0 0 0 0-1.74z"/>
+              </svg>
+            </button>
+            <button id="sql-cancel-btn" class="cancel-btn" type="button"
+                    onclick="cancelSqlQuery()" style="display:none">取消</button>
+          </div>
+          <!-- 编辑器 = 原生 textarea（光标/选区/输入法/Ctrl+Z 全保持原生）+ 背后一层同度量的高亮垫层。
+               textarea 的文字设为透明、只留光标色，看到的颜色全部来自垫层（见 js/sql-highlight.js）。
+               垫层 pointer-events:none，不吃任何鼠标事件。 -->
+          <div class="sql-editor-body">
+            <pre class="sql-highlight" id="sql-highlight" aria-hidden="true"><code id="sql-highlight-code"></code></pre>
+            <textarea id="query-input" class="sql-editor" spellcheck="false"
+                      placeholder="输入 SQL 执行（Ctrl + Enter 运行；选中一段则只运行选中部分；多条语句用分号分隔，将按顺序串行执行。例如 select * from mysql.dga.users limit 10）"
+                      onkeydown="if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();submitQuery();}"></textarea>
+          </div>
+        </div>
+        <div class="sql-splitter" id="sql-splitter"
+             title="拖动调整编辑区高度（双击恢复默认）"></div>
+        <div id="query-error" class="query-error"></div>
+
+        <div class="sql-result" id="sql-result" style="display:none">
+          <div class="sql-result-head">
+            <span class="sql-spinner" id="sql-spinner"></span>
+            <span class="sql-result-id" id="sql-result-id"></span>
+            <span class="status-badge queued" id="sql-result-badge">SUBMITTED</span>
+            <span class="sql-elapsed" id="sql-elapsed"></span>
+            <span class="sql-result-note" id="sql-result-note"></span>
+            <div class="sql-result-tools" id="sql-result-tools">
+              <button type="button" class="res-tool-btn" id="sql-chart-btn"
+                      title="把当前结果渲染成图表（柱状 / 折线 / 面积 / 饼图 / 散点）"
+                      onclick="toggleSqlChartBar()">
+                <svg class="res-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3 20h18"/><path d="M6 20v-7"/><path d="M11 20V6"/><path d="M16 20v-4"/>
+                </svg>出图</button>
+              <button type="button" class="res-tool-btn" id="export-csv-btn"
+                      title="把当前结果导出为 CSV（含表头，UTF-8 带 BOM，Excel 打开不乱码）"
+                      onclick="exportSqlCsv()">
+                <svg class="res-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 14.5V3.5"/><path d="M6.8 8.7 12 3.5l5.2 5.2"/>
+                  <path d="M4 14.5v3.5a2.5 2.5 0 0 0 2.5 2.5h11a2.5 2.5 0 0 0 2.5-2.5v-3.5"/>
+                </svg>导出 CSV</button>
+              <button type="button" class="res-tool-btn" id="export-excel-btn"
+                      title="把当前结果导出为 Excel 工作簿（.xls，Excel / WPS 双击可开）"
+                      onclick="exportSqlExcel()">
+                <svg class="res-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 14.5V3.5"/><path d="M6.8 8.7 12 3.5l5.2 5.2"/>
+                  <path d="M4 14.5v3.5a2.5 2.5 0 0 0 2.5 2.5h11a2.5 2.5 0 0 0 2.5-2.5v-3.5"/>
+                </svg>导出 Excel</button>
+            </div>
+          </div>
+          <div class="sql-chart-bar" id="sql-chart-bar" style="display:none">
+            <label class="scb-field">类型
+              <select class="scb-select" id="sql-chart-type" onchange="renderSqlChart()">
+                <option value="bar">柱状</option>
+                <option value="line">折线</option>
+                <option value="area">面积</option>
+                <option value="pie">饼图</option>
+                <option value="scatter">散点</option>
+              </select>
+            </label>
+            <label class="scb-field">分类 / 横轴
+              <select class="scb-select" id="sql-chart-category" onchange="renderSqlChart()"></select>
+            </label>
+            <div class="scb-field scb-values-field">数值列
+              <div class="scb-values" id="sql-chart-values"></div>
+            </div>
+            <label class="scb-field">标题
+              <input class="scb-input" id="sql-chart-title" type="text" placeholder="可选"
+                     oninput="renderSqlChart()">
+            </label>
+            <div class="scb-actions">
+              <button type="button" class="res-tool-btn" onclick="refreshSqlChartDefaults()"
+                      title="按列类型重新智能选择分类列与数值列">智能默认</button>
+              <button type="button" class="res-tool-btn" onclick="closeSqlChart()">收起</button>
+            </div>
+          </div>
+          <div class="sql-chart-panel" id="sql-chart-panel" style="display:none">
+            <div class="sql-chart-box" id="sql-chart-box"></div>
+          </div>
+          <div class="sql-result-table-wrap" id="sql-result-wrap">
+            <table class="job-table result-table" id="sql-result-table">
+              <thead id="sql-result-head"></thead>
+              <tbody id="sql-result-body"></tbody>
+            </table>
+          </div>
+          <!-- 查询出错卡片：报错居中展示 + 复制 / AI 修复入口（AI 模块上线后接真实修复能力）-->
+          <div class="sql-error-card" id="sql-error-card" style="display:none">
+            <div class="sql-error-icon">
+              <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor"
+                   stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+                <line x1="12" y1="9" x2="12" y2="13"/>
+                <line x1="12" y1="17" x2="12.01" y2="17"/>
+              </svg>
+            </div>
+            <div class="sql-error-title">查询出错</div>
+            <!-- 主区：一行 cause 链（真因在链尾，如 「Operator Limit next failed <- Hive 表中不存在列: xxx」）-->
+            <div class="sql-error-msg" id="sql-error-msg"></div>
+            <!-- 折叠区：完整多行堆栈。默认收起，避免刷屏；展开后交给人 / AI 定位到具体代码行 -->
+            <details class="sql-error-detail" id="sql-error-detail" style="display:none">
+              <summary>查看完整堆栈（定位根因）</summary>
+              <pre id="sql-error-detail-pre"></pre>
+            </details>
+            <div class="sql-error-actions">
+              <button type="button" class="err-btn" id="err-copy-btn" onclick="copySqlError()">
+                <svg class="err-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="9" y="9" width="11" height="11" rx="2.2"/>
+                  <path d="M5.5 15V6.2A2.2 2.2 0 0 1 7.7 4h8.6"/>
+                </svg>复制</button>
+              <button type="button" class="err-btn primary" onclick="askAiToFix()">
+                <svg class="err-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94z"/>
+                </svg>用 AI 修复</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ========== 任务管理：集群概览卡片 + 任务列表 ========== -->
+  <div class="dashboard-view hidden" id="tasks-view">
+    <div class="cluster-stats">
+      <div class="stat-card" id="stat-running">
+        <div class="stat-label">Running Queries</div>
+        <div class="stat-value" id="stat-running-val">0</div>
+      </div>
+      <div class="stat-card" id="stat-queued">
+        <div class="stat-label">Queued Queries</div>
+        <div class="stat-value" id="stat-queued-val">0</div>
+      </div>
+      <div class="stat-card" id="stat-blocked">
+        <div class="stat-label">Failed Queries</div>
+        <div class="stat-value" id="stat-blocked-val">0</div>
+      </div>
+      <div class="stat-card" id="stat-workers">
+        <div class="stat-label">Active Workers</div>
+        <div class="stat-value" id="stat-workers-val">0</div>
+        <div class="stat-sub" id="stat-workers-sub"></div>
+      </div>
+      <div class="stat-card" id="stat-cpu">
+        <div class="stat-label">CPU Cores</div>
+        <div class="stat-value" id="stat-cpu-val">0 / 0</div>
+        <div class="stat-sub" id="stat-cpu-sub"></div>
+      </div>
+      <div class="stat-card" id="stat-memory">
+        <div class="stat-label">Total Memory</div>
+        <div class="stat-value" id="stat-memory-val">0 / 0</div>
+        <div class="stat-sub" id="stat-memory-sub"></div>
+      </div>
+    </div>
+
+    <div class="monitor-banner hidden" id="monitor-banner">
+      <svg class="ui-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+        <path d="M12 9.5v3.5"/><path d="M12 17h.01"/>
+      </svg>控制台未绑定查询监控（独立预览模式）&mdash;&mdash; 监控与 SQL 执行接口不可用。
+    </div>
+
+    <div class="job-list">
+      <div class="job-list-head">
+        <div class="job-filters" id="job-filters" role="group" aria-label="按任务状态筛选">
+          <button type="button" class="job-filter active" data-state="ALL"
+                  onclick="setJobStateFilter('ALL')">全部</button>
+          <button type="button" class="job-filter" data-state="RUNNING"
+                  onclick="setJobStateFilter('RUNNING')">运行中</button>
+          <button type="button" class="job-filter" data-state="SUBMITTED"
+                  onclick="setJobStateFilter('SUBMITTED')">排队中</button>
+          <button type="button" class="job-filter" data-state="FINISHED"
+                  onclick="setJobStateFilter('FINISHED')">已完成</button>
+          <button type="button" class="job-filter" data-state="FAILED"
+                  onclick="setJobStateFilter('FAILED')">失败</button>
+          <button type="button" class="job-filter" data-state="CANCELED"
+                  onclick="setJobStateFilter('CANCELED')">已取消</button>
+        </div>
+        <h3>Query History（任务列表）</h3>
+      </div>
+      <div id="job-table-container">
+        <div class="empty-state">
+          <div class="icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="10.8" cy="10.8" r="7.3"/>
+              <path d="m20.2 20.2-4.6-4.6"/>
+            </svg>
+          </div>
+          <div>No queries yet. 提交 SQL 后这里会出现任务，点击查看执行 DAG。</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== 监控：Master / Worker 资源 · 线程 · 集群使用情况 ========== -->
+  <div class="monitor-view hidden" id="monitor-view">
+   <div class="monitor-scroll">
+    <div class="monitor-error" id="monitor-error" style="display:none"></div>
+
+    <!-- 概览：8 张紧凑卡片（大数字 + 小标签 + 迷你趋势线 / 说明行），4×2 定列宽 -->
+    <div class="mon-cards">
+      <div class="mon-card">
+        <div class="mc-label">集群 CPU</div>
+        <div class="mc-value"><span id="mon-cpu">0</span><span class="mc-unit">%</span></div>
+        <canvas class="mc-spark" id="mon-spark-cpu"></canvas>
+      </div>
+      <div class="mon-card">
+        <div class="mc-label">物理内存</div>
+        <div class="mc-value"><span id="mon-mem">0</span><span class="mc-unit" id="mon-mem-unit">GB</span></div>
+        <canvas class="mc-spark" id="mon-spark-mem"></canvas>
+      </div>
+      <div class="mon-card">
+        <div class="mc-label">JVM 堆</div>
+        <div class="mc-value"><span id="mon-heap">0</span><span class="mc-unit" id="mon-heap-unit">GB</span></div>
+        <canvas class="mc-spark" id="mon-spark-heap"></canvas>
+      </div>
+      <div class="mon-card">
+        <div class="mc-label">JVM 线程</div>
+        <div class="mc-value"><span id="mon-threads">0</span></div>
+        <canvas class="mc-spark" id="mon-spark-thread"></canvas>
+      </div>
+      <div class="mon-card">
+        <div class="mc-label">活跃节点</div>
+        <div class="mc-value"><span id="mon-nodes">0</span><span class="mc-unit" id="mon-nodes-total">/ 0</span></div>
+        <div class="mc-sub" id="mon-nodes-sub">&mdash;</div>
+      </div>
+      <div class="mon-card">
+        <div class="mc-label">CPU 核数</div>
+        <div class="mc-value"><span id="mon-cores">0</span></div>
+        <div class="mc-sub" id="mon-cores-sub">&mdash;</div>
+      </div>
+      <div class="mon-card">
+        <div class="mc-label">并发槽位</div>
+        <div class="mc-value"><span id="mon-slots">0</span></div>
+        <div class="mc-sub" id="mon-slots-sub">&mdash;</div>
+      </div>
+      <div class="mon-card">
+        <div class="mc-label">运行任务</div>
+        <div class="mc-value"><span id="mon-tasks">0</span></div>
+        <div class="mc-sub" id="mon-tasks-sub">&mdash;</div>
+      </div>
+    </div>
+
+    <!-- 节点资源：一节点一卡，卡内一个指标一行（标签 + 数值 + 细进度条） -->
+    <div class="mon-section-title">节点资源</div>
+    <div class="mon-node-cards" id="mon-node-list">
+      <div class="mon-empty">加载中&hellip;</div>
+    </div>
+
+    <!-- 趋势：2 列网格，2px 细线 + 仅水平参考线 + 稀疏时间刻度 -->
+    <div class="mon-section-title">资源趋势<span class="mon-section-sub">近 6 分钟 · 每 2 秒采样</span></div>
+    <div class="mon-charts">
+      <div class="mon-chart-card">
+        <div class="mc-label">CPU 使用率</div>
+        <canvas class="mon-chart" id="mon-chart-cpu"></canvas>
+      </div>
+      <div class="mon-chart-card">
+        <div class="mc-label">JVM 堆使用</div>
+        <canvas class="mon-chart" id="mon-chart-heap"></canvas>
+      </div>
+      <div class="mon-chart-card">
+        <div class="mc-label">JVM 线程数</div>
+        <canvas class="mon-chart" id="mon-chart-thread"></canvas>
+      </div>
+      <div class="mon-chart-card">
+        <div class="mc-label">物理内存占用</div>
+        <canvas class="mon-chart" id="mon-chart-mem"></canvas>
+      </div>
+      <div class="mon-chart-card">
+        <div class="mc-label">直接内存（受管）</div>
+        <canvas class="mon-chart" id="mon-chart-direct"></canvas>
+      </div>
+      <div class="mon-chart-card">
+        <div class="mc-label">磁盘读</div>
+        <canvas class="mon-chart" id="mon-chart-diskread"></canvas>
+      </div>
+      <div class="mon-chart-card">
+        <div class="mc-label">磁盘写</div>
+        <canvas class="mon-chart" id="mon-chart-diskwrite"></canvas>
+      </div>
+    </div>
+   </div>
+  </div>
+
+  <!-- ========== AI：ChatGPT 风格（ReAct 流式推理经 /api/ai/chat/stream → LangChain4j）==========
+       左侧「会话列表 .ai-side」+ 右侧主区（上半对话区 #ai-hero 独立滚动，下半输入区 .ai-composer 吸底）。 -->
+  <div class="ai-view hidden" id="ai-view">
+    <aside class="ai-side" id="ai-side">
+      <button type="button" class="ai-newchat" id="ai-newchat">
+        <svg class="ai-newchat-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 5v14M5 12h14"/>
+        </svg>
+        <span>新对话</span>
+      </button>
+      <div class="ai-session-list" id="ai-session-list"></div>
+    </aside>
+    <div class="ai-main" id="ai-main">
+      <div class="ai-hero" id="ai-hero">
+        <div class="ai-thread" id="ai-thread">
+          <div class="ai-hero-title">Dojao AI</div>
+          <div class="ai-hero-sub">用自然语言查询你的数据</div>
+          <div class="ai-reply" id="ai-reply"></div>
+        </div>
+      </div>
+      <div class="ai-composer">
+        <div class="ai-skill-bar">
+          <label class="ai-skill-label" for="ai-skill-select">技能</label>
+          <select id="ai-skill-select" class="ai-skill-select" title="选择一个技能，让 AI 按该角色的提示词与工具集工作">
+            <option value="">（不使用技能）</option>
+          </select>
+          <button type="button" class="ai-skill-manage" id="ai-skill-manage" title="管理技能">管理</button>
+        </div>
+        <div class="ai-attach-bar" id="ai-attach-bar" hidden></div>
+        <div class="ai-input-wrap">
+          <button type="button" class="ai-attach" id="ai-attach" aria-label="添加参考文件"
+                  title="添加参考文件（txt / md / csv / excel / word 等）">
+            <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
+            </svg>
+          </button>
+          <input type="file" id="ai-file-input" class="ai-file-input" multiple hidden
+                 accept=".txt,.text,.log,.sql,.csv,.tsv,.json,.xml,.yaml,.yml,.md,.markdown,.html,.htm,.docx,.xlsx">
+          <textarea id="ai-input" class="ai-input" rows="2" spellcheck="false"
+                    placeholder="向 Dojao AI 提问，例如：统计上个月各产品的销量"></textarea>
+          <button type="button" class="ai-send" id="ai-send">发送</button>
+        </div>
+        <div class="ai-hint" id="ai-hint">Enter 发送 · Ctrl+Enter 换行 · 点左侧回形针或直接把文件拖到这里添加参考文件</div>
+      </div>
+      <!-- 拖拽落区提示层：从桌面/资源管理器拖入文件时覆盖整个对话主区。
+           pointer-events:none —— 拖拽事件仍由 #ai-main 的捕获监听处理，提示层不打断拖拽。 -->
+      <div class="ai-drop-overlay" id="ai-drop-overlay" hidden aria-hidden="true">
+        <div class="ai-drop-box">
+          <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor"
+               stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <path d="M7 10l5-5 5 5"></path>
+            <path d="M12 5v12"></path>
+          </svg>
+          <div class="ai-drop-title">松开以添加参考文件</div>
+          <div class="ai-drop-sub">支持 txt / md / csv / excel / word，单文件 ≤ 10MB，最多 5 个</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== DAG VIEW（任务管理下钻）========== -->
+  <div class="dag-view" id="dag-view">
+    <div class="dag-topbar" id="dag-topbar">
+      <button class="back-btn" onclick="switchTab('tasks')">&larr; 返回</button>
+      <span class="topbar-title" id="dag-query-title"><span id="dag-query-text"
+            onmouseenter="showSqlTooltip()"
+            onmouseleave="scheduleHideSqlTooltip()"></span></span>
+      <div class="sql-tooltip" id="sql-tooltip"
+           onmouseenter="showSqlTooltip()"
+           onmouseleave="scheduleHideSqlTooltip()">
+        <button class="sql-tooltip-copy" id="sql-tooltip-copy" type="button"
+                title="复制完整 SQL 到剪贴板"
+                onclick="copySqlTooltip(event)">复制全部</button>
+        <div class="sql-tooltip-body" id="sql-tooltip-body"></div>
+      </div>
+      <span class="status-badge running" id="dag-status-badge">RUNNING</span>
+    </div>
+    <div class="dag-container" id="dag-container">
+      <div id="dag"></div>
+
+      <div class="detail-page" id="detail-page">
+        <div class="detail-topbar" id="detail-topbar">
+          <button class="back-btn" onclick="hideNodeDetail()">&larr; 返回</button>
+          <span class="node-type-tag tag-neutral" id="detail-tag">Scan</span>
+          <span class="topbar-title" id="detail-label"></span>
+          <span class="topbar-sub" id="detail-op"></span>
+        </div>
+        <div class="detail-content" id="detail-content"></div>
+
+        <!-- Task 详情子页面 -->
+        <div class="task-detail-overlay" id="task-detail-overlay">
+          <div class="task-detail-topbar">
+            <button class="back-btn" onclick="hideTaskDetail()">&larr; 返回</button>
+            <span class="node-type-tag tag-neutral" id="task-detail-tag">TASK</span>
+            <span class="topbar-title" id="task-detail-label"></span>
+            <span class="topbar-sub" id="task-detail-sub"></span>
+          </div>
+          <div class="task-detail-body" id="task-detail-body"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ========== 新建 Catalog 向导（DBeaver 风格：先选连接器卡片，再填表单）========== -->
+<div class="cc-overlay" id="catalog-create-overlay" aria-hidden="true"
+     onmousedown="catalogCreateBackdrop(event)">
+  <div class="cc-modal" role="dialog" aria-modal="true" aria-labelledby="cc-title">
+    <div class="cc-head">
+      <div class="cc-head-main">
+        <button type="button" class="cc-back hidden" id="cc-back"
+                title="返回连接器列表" onclick="catalogCreateBack()">←</button>
+        <span class="cc-title" id="cc-title">新建 Catalog</span>
+        <span class="cc-sub" id="cc-sub">选择要连接的数据库类型</span>
+      </div>
+      <button type="button" class="cc-close" title="关闭" aria-label="关闭"
+              onclick="closeCatalogCreate()">×</button>
+    </div>
+    <div class="cc-body" id="cc-body">
+      <div class="cc-loading">加载连接器…</div>
+    </div>
+    <div class="cc-foot">
+      <button type="button" class="cc-btn cc-btn-ghost" id="cc-test"
+              onclick="catalogCreateTest()" disabled>测试连接</button>
+      <div class="cc-foot-right">
+        <span class="cc-status" id="cc-status"></span>
+        <button type="button" class="cc-btn cc-btn-primary" id="cc-create"
+                onclick="catalogCreateSubmit()" disabled>创建</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- External dependency（本地 vendor，不依赖外网 CDN）-->
+<script src="vendor/vis-network.min.js"></script>
+<script src="vendor/echarts.min.js"></script>
+
+<!-- Application scripts (load order matters) -->
+<script src="js/state.js"></script>
+<script src="js/utils.js"></script>
+<script src="js/auth.js"></script>
+<script src="js/simulation.js"></script>
+<script src="js/dag-renderer.js"></script>
+<script src="js/detail.js"></script>
+<script src="js/catalog.js"></script>
+<script src="js/catalog-create.js"></script>
+<script src="js/sql-highlight.js"></script>
+<script src="js/sql-autocomplete.js"></script>
+<script src="js/charts.js"></script>
+<script src="js/markdown.js"></script>
+<script src="js/dashboard.js"></script>
+<script src="js/manage.js"></script>
+<script src="js/monitor.js"></script>
+<script src="js/sql-console.js"></script>
+<script src="js/app.js"></script>
+
+<script>Auth.bindHeader();</script>
+
+</body>
+</html>

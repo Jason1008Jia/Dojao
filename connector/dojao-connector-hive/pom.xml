@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dojao</groupId>
+        <artifactId>dojao</artifactId>
+        <version>1.0-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>dojao-connector-hive</artifactId>
+    <name>Dojao Connector Hive</name>
+    <description>
+        Hive 连接器：连接 Hive MetaStore（Thrift）做元数据探查（表路径 / 行数 / 列类型），
+        再直连 HDFS 读取数据文件。支持 type='hive2' / type='hive3' 两种 catalog 类型。
+        不再使用 Hive-JDBC。
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-spi</artifactId>
+        </dependency>
+        <!-- ORC / Parquet / 文本 → Arrow 的转换器（含 orc-core、parquet-hadoop、hadoop-common） -->
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-connector-common</artifactId>
+        </dependency>
+
+        <!-- Hive MetaStore 瘦客户端 —— 只做元数据探查（Thrift 协议，Hive2/Hive3 共用）。
+             排除 hadoop-*：只保留 dojao-connector-common 里声明的 hadoop-common 3.3.6 一份客户端栈，
+             否则 hive 自带的老 hadoop 会与 hadoop-common 抢类。 -->
+        <dependency>
+            <groupId>org.apache.hive</groupId>
+            <artifactId>hive-standalone-metastore</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.apache.hadoop</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
+        <!-- HDFS 客户端实现（DistributedFileSystem）：读 hdfs:// 上的 ORC/Parquet/文本文件必需。
+             dojao-connector-common 只带 hadoop-common，不含 hdfs 文件系统实现类。
+
+             ★必须排掉它拖来的 kotlin-stdlib：hadoop-hdfs-client 自己要用 kotlin，版本由其父
+             hadoop-project-3.3.6 钉死在 1.4.10；而 Web UI 的 Javalin 6 是 kotlin 1.9 写的（用到
+             kotlin.enums.EnumEntriesKt）。Maven 就近优先会让 1.4.10 压过
+             javalin → kotlin-stdlib-jdk8:1.9.22 → kotlin-stdlib:1.9.22 那条链，于是 Master 启动到
+             WebUiModule 时抛 NoClassDefFoundError: kotlin/enums/EnumEntriesKt。
+             这里排掉老版本 + 显式钉 1.9.22（与本模块无 javalin 依赖时的独立使用也自洽）。 -->
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-hdfs-client</artifactId>
+            <version>3.3.6</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.jetbrains.kotlin</groupId>
+                    <artifactId>kotlin-stdlib</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.jetbrains.kotlin</groupId>
+                    <artifactId>kotlin-stdlib-common</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.jetbrains.kotlin</groupId>
+            <artifactId>kotlin-stdlib</artifactId>
+            <version>1.9.22</version>
+        </dependency>
+
+        <!-- ParquetFileArrowConverter 由 dojao-connector-common 提供，parquet-hadoop 随之传递而来；
+             此处不重复声明。 -->
+    </dependencies>
+
+</project>

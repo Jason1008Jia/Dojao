@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package dojao.core.exchange;
+
+option java_multiple_files = true;
+option java_package = "com.dojao.core.rpc.exchange";
+option java_outer_classname = "ExchangeProto";
+
+// ============================================================
+// Worker↔Worker 数据交换控制包络（Arrow Flight 数据面）
+//
+// 数据面用 Flight doExchange：每 (worker, exchangeId) 一条流，Arrow 原生 batch
+// 承载数据页，本 proto 只承载每批 application metadata（控制字段）。
+// 三类消息：
+//   DATA      一个数据页（batch 本体 = 页内容；metadata 携带桶号/页序号）
+//   COMPLETE  本发送方该桶数据已发完（接收端累计收齐 numSenders 后放分区结束）
+//   FAIL      本发送方该桶发送失败（接收端 fail-fast）
+//
+// 流控由 Flight（gRPC 底座）提供：服务端消费慢 → 客户端 putNext 阻塞 → 发送端
+// （HashPartition 分发线程）阻塞 → 上游扫描阻塞（背压链）。
+// ============================================================
+
+message ExchangeControl {
+  // 本次 shuffle 的标识（查询内唯一，与发送端 ShuffleReader 的 exchangeId 一致）
+  string exchange_id = 1;
+  // 逻辑分区号（bucket）
+  int32 bucket_id = 2;
+
+  enum Kind {
+    DATA = 0;      // 一个数据页（batch 本体 = 页内容）
+    COMPLETE = 1;  // 本发送方该桶数据已发完
+    FAIL = 2;      // 本发送方该桶发送失败（接收端 fail-fast）
+  }
+  Kind kind = 3;
+
+  // FAIL：错误描述
+  string cause = 4;
+  // DATA：页序号（元数据透传，v1 暂不参与语义）
+  int64 batch_index = 5;
+  // DATA：是否溢写页（v1 仅支持内存页，恒 false；溢写页跨 JVM 暂不支持）
+  bool is_spilled = 6;
+}

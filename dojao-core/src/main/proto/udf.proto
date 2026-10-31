@@ -1,0 +1,131 @@
+syntax = "proto3";
+
+package dojao.core.udf;
+
+option java_multiple_files = true;
+option java_package = "com.dojao.core.rpc.udf";
+option java_outer_classname = "UdfProto";
+
+// ============================================================
+// Dojao Function Protocol (DFP) v2 —— 语言无关的外挂函数协议
+//
+// 本协议是"引擎 ↔ 任意语言函数运行时（sidecar）"的权威契约。
+// 任何语言，只要实现本协议（收发以下控制包络 + 读写 Arrow 批次），
+// 即可作为 Dojao 的函数运行时被 CREATE FUNCTION 使用。Python 是官方
+// 参考实现（python/ 目录），不是唯一合法实现 —— 这正是"协议开放、
+// 官方只做 Python、其余语言由用户/社区按文档扩展"的策略地基。
+//
+// 【数据面】Arrow Flight doExchange(path="invoke")
+//   请求流 1 条：原生 Arrow RecordBatch（输入）+ application metadata = UdfControl
+//   响应流 1 条：原生 Arrow RecordBatch（结果）+ application metadata = UdfMeta
+//   —— 响应返回 = 该批完成。类型系统用 Arrow 本身（语言无关），本 proto 不重定义类型。
+//
+// 【控制面】Arrow Flight doAction
+//   ping            → Result 载荷 = UdfPing（探活 + 能力 + 协议版本协商）
+//   check_function  → body = function_ref(UTF-8)，Result 载荷 = UdfMeta
+//                     （status + 结构化 FunctionSignature）。冒烟校验，坏函数 fail-fast。
+//   ship_code       → 预留（见下方 SHIP_CODE）
+//
+// 【失败语义】用户函数异常 → UdfMeta.status=ERROR + message(traceback)，连接不断；
+//   进程崩溃 / 超时由传输层（Flight UNAVAILABLE / TIMED_OUT）判定。这是区分
+//   "用户代码 bug" 与 "系统/传输故障" 的唯一可靠信号。
+//
+// 【协议版本】PROTOCOL_VERSION = 2
+//   1 = 初版（Python 专属语义：function_name=module.ClassName；签名塞在 message 的 JSON）
+//   2 = 语言中立（function_ref 为后端自定义的不透明引用；结构化 FunctionSignature
+//       用 Arrow schema 承载类型；ping 增加 runtime_name / protocol_version）
+// ============================================================
+
+// 一次函数调用的控制包络（随 doExchange 每批 application metadata 发送）。
+message UdfControl {
+  // 函数引用 —— 由函数后端（FunctionBackend + sidecar SDK）自定义语法的"不透明定位串"。
+  // 协议不解释其内容；sidecar 按本语言 SDK 的规则解析它。
+  // Python 后端约定：module.ClassName（如 my_fns.IsHigh）。
+  // 其他语言可自定义，例如 Rust："libmy.so#my_fn" / Go："pkg.Symbol" / JS："@scope/mod#fn"。
+  string function_ref = 1;
+
+  // 操作类型（见 Op）。
+  Op op = 2;
+
+  // 聚合状态（不透明字节，协议原样透传；标量忽略）。ACCUMULATE / EVALUATE 用。
+  bytes opaque_state = 3;
+
+  // MERGE 用：source 状态（并入 target = opaque_state）。
+  bytes source_state = 4;
+
+  // COLLECT_EVALUATE 用：batch 前 key_column_count 列为分组键，其后为声明的值列
+  // （均为 List 列，每行 = 该 key 攒齐的全部值）。
+  int32 key_column_count = 5;
+
+  // 调用方协议版本（冗余；权威协商在 ping）。用于未来在单次调用上做兼容判断。
+  uint32 protocol_version = 6;
+
+  enum Op {
+    // 标量：输入 batch → 结果 batch（1→1，矢量化）。
+    EVAL = 0;
+    // 聚合（增量四阶段）：
+    CREATE_STATE = 1;  // 建空状态 → 返回 opaque_state
+    ACCUMULATE = 2;    // 输入 batch + state → ack（新状态经 opaque_state 返回）
+    MERGE = 3;         // target + source state → ack
+    EVALUATE = 4;      // state → 结果 batch
+    // 预留：控制面下发函数代码。当前代码分发走 CREATE FUNCTION 的 code_path（共享 FS / URL，
+    // 语言无关地"给一个 artifact 路径"），故 SHIP_CODE 尚未启用；定义留作未来就地下发
+    // （源码 / 字节码 / wasm）之用，payload 语义待定。
+    SHIP_CODE = 5;
+    // collect-evaluate 型：输入 = 引擎已按 key 分组的 (key 列 + List 值列) batch，
+    // 每 key 一行，sidecar 逐行取 list.value(row) 逐 key 调用户 evaluate → 返回 N 行结果列。
+    COLLECT_EVALUATE = 6;
+  }
+}
+
+// 函数签名 —— 语言无关的函数契约描述（check_function 成功时回传）。
+// 各语言 SDK 把本语言声明的函数翻译成本结构；引擎据此注册，
+// 不解析任何语言特定的类型名或加载语法。
+message FunctionSignature {
+  FunctionKind kind = 1;
+
+  // 输入列名（顺序 = SQL 实参顺序）。标量函数可留空。
+  repeated string input_columns = 2;
+
+  // 输出类型：Arrow schema 的 IPC 序列化字节（encapsulated schema message，
+  // 即 pyarrow 的 Schema.serialize() 产物）。用 Arrow 承载类型 = 完全语言无关；
+  // 引擎反序列化后取首字段类型，不做"语言类型名 → Arrow"的映射表。
+  bytes output_schema = 3;
+
+  enum FunctionKind {
+    SCALAR = 0;     // 标量 1→1
+    AGGREGATE = 1;  // 增量四阶段聚合
+    COLLECT = 2;    // collect-evaluate 聚合
+    TABLE = 3;      // 表函数（预留）
+    WINDOW = 4;     // 窗口函数（预留）
+  }
+}
+
+// 响应元数据（随 doExchange 每批 application metadata 返回；也用于 check_function 的 Result）。
+// 空字节 = UdfMeta.OK（protobuf 默认值被省略）。
+message UdfMeta {
+  Status status = 1;
+
+  // 人类可读消息：ERROR 时为错误描述 / 用户代码 traceback（诊断用，非结构化契约）。
+  string message = 2;
+
+  // CREATE_STATE / ACCUMULATE / MERGE：新状态（标量 / EVAL 忽略）。
+  bytes opaque_state = 3;
+
+  // check_function 成功时回传的结构化函数签名（其余 op 忽略）。
+  FunctionSignature signature = 4;
+
+  enum Status {
+    OK = 0;
+    ERROR = 1;
+  }
+}
+
+// PING：探活 + 能力 / 版本上报（doAction("ping") 的 Result 载荷）。
+message UdfPing {
+  string sidecar_version = 1;   // 运行时构建标识（如 "dojao-udf-0.2.0"）
+  string runtime_name = 2;      // 运行时名（如 "python" / "rust" / "go"）
+  bool runtime_ready = 3;       // 运行时是否就绪（依赖齐全，可服务）
+  uint32 protocol_version = 4;  // 实现的协议版本（引擎据此校验兼容区间）
+  string message = 5;           // 环境信息 / 失败原因
+}

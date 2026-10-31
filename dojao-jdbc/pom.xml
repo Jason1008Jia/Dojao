@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dojao</groupId>
+        <artifactId>dojao</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>dojao-jdbc</artifactId>
+    <name>Dojao JDBC Driver</name>
+    <description>JDBC driver for Dojao distributed query engine, connecting via Arrow Flight.</description>
+
+    <dependencies>
+        <!-- dojao-core provides Arrow Flight 客户端依赖 + QueryRequest/QueryResponse 消息 -->
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-core</artifactId>
+        </dependency>
+
+        <!-- 测试需要 MySQL Connector（注册 catalog 用） -->
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-connector-mysql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- 测试需要 DojaoServer 启动器 -->
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-server</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+</project>

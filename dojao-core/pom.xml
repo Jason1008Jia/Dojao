@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dojao</groupId>
+        <artifactId>dojao</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>dojao-core</artifactId>
+    <name>Dojao Core</name>
+    <description>
+        核心引擎：SQL 解析（ANTLR4）、语义分析、逻辑计划、优化、
+        物理计划生成、任务调度、资源管理、分布式 Master/Worker 通信。
+    </description>
+
+    <dependencies>
+        <!-- Internal modules -->
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-spi</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-grammar</artifactId>
+        </dependency>
+        <!-- Test scope: PlannerTest / Test2 等集成测试用 -->
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-connector-mysql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-connector-postgres</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Protobuf（消息定义：master.proto / exchange.proto / udf.proto 生成代码） -->
+        <dependency>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java-util</artifactId>
+        </dependency>
+
+        <!-- Apache Arrow + Flight（统一传输协议；flight-core 传递提供 grpc-netty 底座） -->
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-vector</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-memory-netty</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-format</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>flight-core</artifactId>
+        </dependency>
+
+        <!-- Guava -->
+        <dependency>
+            <groupId>com.google.guava</groupId>
+            <artifactId>guava</artifactId>
+        </dependency>
+
+        <!-- Jackson (plan serialization) -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+
+        <!-- Logging -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+        </dependency>
+
+        <!-- 集成测试：加载 dojao-ui 的 WebUiModule -->
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-ui</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- 1. OS detection (required by protobuf-maven-plugin for native protoc) -->
+            <plugin>
+                <groupId>kr.motd.maven</groupId>
+                <artifactId>os-maven-plugin</artifactId>
+            </plugin>
+            <!-- 2. Protobuf → Java code generation（生成到 target/generated-sources/protobuf，
+                      IntelliJ 经 Maven 导入自动注册为生成源码根；不再提交生成类到 src/main/java） -->
+            <plugin>
+                <groupId>org.xolstice.maven.plugins</groupId>
+                <artifactId>protobuf-maven-plugin</artifactId>
+            </plugin>
+            <!-- 3. ANTLR4 → Java code generation -->
+            <plugin>
+                <groupId>org.antlr</groupId>
+                <artifactId>antlr4-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

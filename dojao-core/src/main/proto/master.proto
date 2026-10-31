@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package dojao.core;
+
+option java_multiple_files = true;
+option java_package = "com.dojao.core.rpc";
+
+// ==================== Query Execution ====================
+
+message QueryRequest {
+    string sql = 1;
+}
+
+message Column {
+    string name = 1;
+    string type = 2;
+}
+
+message Row {
+    repeated string values = 1;
+}
+
+message QueryResponse {
+    repeated Column columns = 1;
+    repeated Row    rows    = 2;
+    string          query_id = 3;
+}
+
+// 注意：QueryService 已从 gRPC 迁到 Arrow Flight（doAction "execute_query"）。
+// 本文件仅保留 QueryRequest / QueryResponse 消息定义，供 Flight 请求-响应体使用。

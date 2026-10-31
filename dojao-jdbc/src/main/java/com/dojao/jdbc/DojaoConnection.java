@@ -1,0 +1,173 @@
+package com.dojao.jdbc;
+
+import org.apache.arrow.flight.FlightClient;
+import org.apache.arrow.memory.BufferAllocator;
+
+import java.sql.*;
+import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.Executor;
+
+/**
+ * JDBC Connection 实现，持有到 Master 的 Arrow Flight 客户端。
+ *
+ * <p>MVP: auto-commit 始终为 true，read-only，不支持事务。</p>
+ */
+public class DojaoConnection implements Connection {
+
+    final FlightClient client;
+    final BufferAllocator allocator;
+    final String url;
+    private final Properties clientInfo;
+    private boolean closed;
+
+    DojaoConnection(FlightClient client, BufferAllocator allocator,
+                    String url, Properties clientInfo) {
+        this.client = client;
+        this.allocator = allocator;
+        this.url = url;
+        this.clientInfo = new Properties(clientInfo);
+    }
+
+    FlightClient client() { return client; }
+
+    // ==================== Statements ====================
+
+    @Override
+    public Statement createStatement() throws SQLException {
+        checkClosed();
+        return new DojaoStatement(this);
+    }
+
+    @Override
+    public PreparedStatement prepareStatement(String sql) throws SQLException {
+        checkClosed();
+        return new DojaoPreparedStatement(this, sql);
+    }
+
+    // ==================== Close ====================
+
+    @Override
+    public void close() throws SQLException {
+        if (!closed) {
+            try {
+                client.close();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                allocator.close();
+            }
+            closed = true;
+        }
+    }
+
+    @Override
+    public boolean isClosed() { return closed; }
+
+    @Override
+    public boolean isValid(int timeout) { return !closed; }
+
+    // ==================== Metadata ====================
+
+    @Override
+    public DatabaseMetaData getMetaData() {
+        return new DojaoDatabaseMetaData(this);
+    }
+
+    // ==================== Auto-commit (always true) ====================
+
+    @Override
+    public boolean getAutoCommit() { return true; }
+
+    @Override
+    public void setAutoCommit(boolean autoCommit) { /* no-op */ }
+
+    // ==================== Read-only (always true) ====================
+
+    @Override
+    public boolean isReadOnly() { return true; }
+
+    @Override
+    public void setReadOnly(boolean readOnly) { /* no-op */ }
+
+    // ==================== Client Info ====================
+
+    @Override
+    public Properties getClientInfo() { return new Properties(clientInfo); }
+
+    @Override
+    public void setClientInfo(Properties props) {
+        clientInfo.clear();
+        if (props != null) clientInfo.putAll(props);
+    }
+
+    @Override
+    public String getClientInfo(String name) { return clientInfo.getProperty(name); }
+
+    @Override
+    public void setClientInfo(String name, String value) { clientInfo.setProperty(name, value); }
+
+    // ==================== Catalog / Schema ====================
+
+    @Override public String getCatalog() { return null; }
+    @Override public void setCatalog(String catalog) { /* no-op */ }
+    @Override public String getSchema() { return null; }
+    @Override public void setSchema(String schema) { /* no-op */ }
+
+    // ==================== Native SQL ====================
+
+    @Override
+    public String nativeSQL(String sql) { return sql; }
+
+    // ==================== Unsupported ====================
+
+    @Override public void commit() throws SQLException { throw notSupported(); }
+    @Override public void rollback() throws SQLException { throw notSupported(); }
+    @Override public void rollback(Savepoint s) throws SQLException { throw notSupported(); }
+    @Override public Savepoint setSavepoint() throws SQLException { throw notSupported(); }
+    @Override public Savepoint setSavepoint(String name) throws SQLException { throw notSupported(); }
+    @Override public void releaseSavepoint(Savepoint s) throws SQLException { throw notSupported(); }
+    @Override public int getTransactionIsolation() { return TRANSACTION_NONE; }
+    @Override public void setTransactionIsolation(int level) throws SQLException { throw notSupported(); }
+    @Override public int getHoldability() { return ResultSet.CLOSE_CURSORS_AT_COMMIT; }
+    @Override public void setHoldability(int holdability) throws SQLException { throw notSupported(); }
+    @Override public Statement createStatement(int rt, int rc) throws SQLException { throw notSupported(); }
+    @Override public Statement createStatement(int rt, int rc, int rh) throws SQLException { throw notSupported(); }
+    @Override public PreparedStatement prepareStatement(String sql, int rt, int rc) throws SQLException { throw notSupported(); }
+    @Override public PreparedStatement prepareStatement(String sql, int rt, int rc, int rh) throws SQLException { throw notSupported(); }
+    @Override public PreparedStatement prepareStatement(String sql, int autoGeneratedKeys) throws SQLException { throw notSupported(); }
+    @Override public PreparedStatement prepareStatement(String sql, int[] columnIndexes) throws SQLException { throw notSupported(); }
+    @Override public PreparedStatement prepareStatement(String sql, String[] columnNames) throws SQLException { throw notSupported(); }
+    @Override public CallableStatement prepareCall(String sql) throws SQLException { throw notSupported(); }
+    @Override public CallableStatement prepareCall(String sql, int rt, int rc) throws SQLException { throw notSupported(); }
+    @Override public CallableStatement prepareCall(String sql, int rt, int rc, int rh) throws SQLException { throw notSupported(); }
+    @Override public Clob createClob() throws SQLException { throw notSupported(); }
+    @Override public Blob createBlob() throws SQLException { throw notSupported(); }
+    @Override public NClob createNClob() throws SQLException { throw notSupported(); }
+    @Override public SQLXML createSQLXML() throws SQLException { throw notSupported(); }
+    @Override public Array createArrayOf(String typeName, Object[] elements) throws SQLException { throw notSupported(); }
+    @Override public Struct createStruct(String typeName, Object[] attributes) throws SQLException { throw notSupported(); }
+    @Override public Map<String, Class<?>> getTypeMap() { return Map.of(); }
+    @Override public void setTypeMap(Map<String, Class<?>> map) { /* no-op */ }
+    @Override public void setNetworkTimeout(Executor executor, int ms) { /* no-op */ }
+    @Override public int getNetworkTimeout() { return 0; }
+    @Override public void abort(Executor executor) { closeQuietly(); }
+    @Override public SQLWarning getWarnings() { return null; }
+    @Override public void clearWarnings() { /* no-op */ }
+    @Override public <T> T unwrap(Class<T> iface) throws SQLException { throw notSupported(); }
+    @Override public boolean isWrapperFor(Class<?> iface) { return false; }
+
+    // ==================== Internal ====================
+
+    private void checkClosed() throws SQLException {
+        if (closed) throw new SQLException("Connection is closed");
+    }
+
+    private void closeQuietly() {
+        try { close(); } catch (SQLException ignored) { /* quiet */ }
+    }
+
+    static SQLException notSupported() {
+        return new SQLFeatureNotSupportedException("Not supported by Dojao JDBC Driver");
+    }
+}

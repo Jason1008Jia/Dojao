@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dojao</groupId>
+        <artifactId>dojao</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>dojao-ai</artifactId>
+    <name>Dojao AI</name>
+    <description>
+        AI Agent：自然语言查库、AI 查询优化、Agent 编排（骨架，待扩展）。
+    </description>
+
+    <dependencies>
+        <!-- LangChain4j：OpenAI 兼容端点（OpenAI / Azure / DeepSeek / 通义 等）。
+             传递带 langchain4j-core（dev.langchain4j.model.chat.ChatModel 等抽象）。版本由根 pom 管理。 -->
+        <dependency>
+            <groupId>dev.langchain4j</groupId>
+            <artifactId>langchain4j-open-ai</artifactId>
+        </dependency>
+    </dependencies>
+
+</project>

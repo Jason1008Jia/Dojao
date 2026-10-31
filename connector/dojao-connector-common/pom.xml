@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dojao</groupId>
+        <artifactId>dojao</artifactId>
+        <version>1.0-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>dojao-connector-common</artifactId>
+    <name>Dojao Connector Common</name>
+    <description>
+        连接器公共实现库：文件格式（ORC / Parquet / 文本）→ Arrow 的转换器。
+
+        为什么单独一个模块，而不是塞进 dojao-spi？这些转换器要拖 Hadoop / ORC / Parquet 一大坨依赖。
+        dojao-spi 是「写连接器的人只需要引入的那一个包」，必须保持轻量 —— 因此把它挪到这里：
+        dojao-spi 只留契约与轻量 bean，需要读文件格式的连接器（如 Hive）再依赖本模块。
+        依赖方向是 dojao-spi ← dojao-connector-common ← dojao-connector-hive，不会反向污染。
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-spi</artifactId>
+        </dependency>
+
+        <!-- ORC + Hadoop（ORCFileArrowConverter 依赖）
+             ★排除 hadoop-client-api：orc-shims 的 java17 profile（JDK 17+ 自动激活）会给它挂上
+             hadoop-client-api（compile 作用域），一路透传到所有依赖方。该 jar 的
+             org.apache.hadoop.conf.Configuration 引用 org.apache.hadoop.shaded.com.ctc.wstx.io.InputBootstrapper
+             —— 那个类只在 hadoop-client-runtime 里，而本项目用的是非 shaded 的 hadoop-common 3.3.6
+             （下面显式声明）。两者同时在 classpath 时谁先被加载取决于顺序，一旦 hadoop-client-api
+             胜出就在 FileSystem.get() 处抛 NoClassDefFoundError: org/apache/hadoop/shaded/...
+             这里把整棵子树里的 hadoop-client-api 剪掉，保证 Hadoop 客户端栈唯一 = hadoop-common 3.3.6。 -->
+        <dependency>
+            <groupId>org.apache.orc</groupId>
+            <artifactId>orc-core</artifactId>
+            <version>1.9.3</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.apache.hadoop</groupId>
+                    <artifactId>hadoop-common</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.apache.hadoop</groupId>
+                    <artifactId>hadoop-client-api</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <!-- ORC 列式读写用的 VectorizedRowBatch / HiveDecimalWritable -->
+        <dependency>
+            <groupId>org.apache.hive</groupId>
+            <artifactId>hive-storage-api</artifactId>
+            <version>2.8.1</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-common</artifactId>
+            <version>3.3.6</version>
+        </dependency>
+
+        <!-- Parquet → Arrow（ParquetFileArrowConverter）。
+             与上面 orc-core 同款理由：排除 hadoop-client-api / hadoop-common / hadoop-client-runtime，
+             只保留 hadoop-common 3.3.6 一份 Hadoop 客户端栈。 -->
+        <dependency>
+            <groupId>org.apache.parquet</groupId>
+            <artifactId>parquet-hadoop</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.apache.hadoop</groupId>
+                    <artifactId>hadoop-common</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.apache.hadoop</groupId>
+                    <artifactId>hadoop-client-api</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.apache.hadoop</groupId>
+                    <artifactId>hadoop-client-runtime</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <!-- 写 Parquet 必须能加载 Hadoop MapReduce 的 FileOutputFormat：
+             parquet-hadoop 的 ParquetOutputFormat 继承它，而 ParquetWriter 的构造器无条件调用
+             ParquetOutputFormat.createEncryptionProperties(...)（没有加密工厂时返回 null），
+             JVM 解析该方法所在类时就要解析父类 —— 没有这个 jar 就抛
+             NoClassDefFoundError: org/apache/hadoop/mapreduce/lib/output/FileOutputFormat。
+             parquet-hadoop 只把它标成 provided（真实 Hive 环境由 Hive 自带），这里补上。
+             版本与 hadoop-common 对齐（3.3.6），排除全部传递依赖，只用它自己的 mapreduce 包。 -->
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-mapreduce-client-core</artifactId>
+            <version>3.3.6</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>*</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+    </dependencies>
+
+</project>

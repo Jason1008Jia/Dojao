@@ -1,0 +1,43 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.dojao</groupId>
+  <artifactId>dojao-grammar</artifactId>
+  <version>1.0-SNAPSHOT</version>
+  <name>Dojao Grammar</name>
+
+  <parent>
+    <groupId>com.dojao</groupId>
+    <artifactId>dojao</artifactId>
+    <version>1.0-SNAPSHOT</version>
+  </parent>
+
+  <dependencies>
+    <!-- SPI：Catalog, Schema, Table, Column, DataSourceMetaService -->
+    <dependency>
+      <groupId>com.dojao</groupId>
+      <artifactId>dojao-spi</artifactId>
+    </dependency>
+
+    <!-- MetaStore：元数据管理中心 -->
+    <dependency>
+      <groupId>com.dojao</groupId>
+      <artifactId>dojao-metastore</artifactId>
+    </dependency>
+
+    <!-- 测试：MySQL 连接器 -->
+    <dependency>
+      <groupId>com.dojao</groupId>
+      <artifactId>dojao-connector-mysql</artifactId>
+      <scope>test</scope>
+    </dependency>
+
+    <!-- 测试：Arrow DefaultAllocationManager（MysqlConnector 构造 RootAllocator 需要） -->
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-memory-netty</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+</project>

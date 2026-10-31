@@ -1,0 +1,2 @@
+com.dojao.connector.hive.Hive2ConnectorFactory
+com.dojao.connector.hive.Hive3ConnectorFactory

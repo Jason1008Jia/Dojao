@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dojao</groupId>
+        <artifactId>dojao</artifactId>
+        <version>1.0-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>dojao-connector-excel</artifactId>
+    <name>Dojao Connector Excel</name>
+    <description>
+        Excel（.xlsx / .xlsm）连接器：把工作簿当数据源参与联邦查询。
+        catalog = 目录（或单个工作簿），schema = 工作簿，table = 工作表；
+        读取恒为单分区（一个工作簿一个工作表就是一条文件流，切分只会重复解析 ZIP）。
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-spi</artifactId>
+        </dependency>
+
+        <!-- 测试用：离线探针需要真实 Arrow 分配器（arrow-vector 只带接口）。
+             test 作用域，不进运行时也不污染插件 jar。 -->
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-memory-netty</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+</project>

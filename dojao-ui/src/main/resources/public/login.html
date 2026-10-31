@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 · Dojao Console</title>
+<link rel="stylesheet" href="css/style.css">
+<!-- 首屏先落主题（防闪烁），与 index.html / state.js 共用同一份 localStorage 键。 -->
+<script>(function(){try{var t=localStorage.getItem('dojao.theme');document.documentElement.setAttribute('data-theme',t==='dark'?'dark':'light');}catch(e){}})();</script>
+</head>
+<body class="login-body">
+
+<div class="login-wrap">
+  <form class="login-card" id="login-form">
+    <div class="login-brand">
+      <img class="brand-mark" src="img/logo.png" alt="" aria-hidden="true">
+      <span class="login-brand-name">Dojao Console</span>
+    </div>
+    <div class="login-title">登录</div>
+    <div class="login-sub">分布式 SQL 引擎管理控制台</div>
+
+    <label class="login-field">
+      <span class="login-field-label">用户名</span>
+      <input type="text" id="login-username" name="username"
+             autocomplete="username" spellcheck="false" autofocus>
+    </label>
+
+    <label class="login-field">
+      <span class="login-field-label">口令</span>
+      <input type="password" id="login-password" name="password"
+             autocomplete="current-password">
+    </label>
+
+    <div class="login-error" id="login-error"></div>
+
+    <button type="submit" id="login-btn" class="login-btn">登 录</button>
+  </form>
+</div>
+
+<script src="js/utils.js"></script>
+<script src="js/auth.js"></script>
+<script>Auth.initLoginPage();</script>
+
+</body>
+</html>

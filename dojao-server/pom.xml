@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dojao</groupId>
+        <artifactId>dojao</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>dojao-server</artifactId>
+    <name>Dojao Server</name>
+    <description>
+        服务入口：启动 REST API + 监控 UI，聚合所有连接器和模块，
+        提供一个完整的可运行 JAR（包含嵌入式 Web 服务器和 Dashboard）。
+    </description>
+
+    <dependencies>
+        <!-- 聚合所有核心模块 -->
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-core</artifactId>
+        </dependency>
+        <!--
+            连接器已插件化：server 主代码不再 import 任何连接器类，运行时也不再依赖它们
+            （分发时以插件 jar 落 lib/connectors/，见 dojao-dist/pom.xml 与 assembly）。
+            这里保留 test 作用域只为让 server 的探针 / 集成测试仍能直接 new 连接器：
+            不进运行时 classpath、也不随 server 传递到 dojao-dist。
+            IDE 直跑 DevClusterMain 走 classpath 的 ServiceLoader 发现连接器（IDE 默认把 test
+            依赖放进运行 classpath），与插件目录机制并存，互不冲突。
+        -->
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-connector-mysql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- TiDB / Doris 连接器（MySQL 线路协议）：探针 / 集成测试用。 -->
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-connector-tidb</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-connector-doris</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-connector-postgres</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Hive 连接器：ServiceLoader 发现 hive2/hive3 两个 type（测试用）。 -->
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-connector-hive</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Excel 连接器（本地工作簿，单分区读取）：探针 / 集成测试用。 -->
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-connector-excel</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- SQL Server 连接器：探针 / 集成测试用。 -->
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-connector-sqlserver</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Oracle 连接器：探针 / 集成测试用。 -->
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-connector-oracle</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-ui</artifactId>
+        </dependency>
+
+        <!-- 日志实现 -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+        </dependency>
+
+        <!-- Javalin（内嵌 HTTP + 监控 UI） -->
+        <dependency>
+            <groupId>io.javalin</groupId>
+            <artifactId>javalin</artifactId>
+        </dependency>
+
+        <!-- Jackson YAML（读取配置） -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.dataformat</groupId>
+            <artifactId>jackson-dataformat-yaml</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- 打包为可执行 Fat JAR -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <mainClass>com.dojao.server.DojaoServer</mainClass>
+                        </manifest>
+                    </archive>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

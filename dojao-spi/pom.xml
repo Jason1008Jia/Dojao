@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dojao</groupId>
+        <artifactId>dojao</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>dojao-spi</artifactId>
+    <name>Dojao SPI</name>
+    <description>
+        SPI 接口层：包含连接器 SPI、UDF SPI、存储 SPI、监控 SPI 等所有扩展点接口定义。
+        同时承担原 dojao-connector-api 的职能。
+
+        本模块必须保持轻量 —— 第三方写自定义连接器时，只需要把 dojao-spi 加进自己的工程。
+        因此这里只放「契约 + 轻量 bean + 纯 JDBC/Arrow 工具」，任何会拖进 Hadoop / ORC / Parquet /
+        数据湖 SDK 的实现都放到对应的连接器模块或 dojao-connector-common 里。
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-common</artifactId>
+        </dependency>
+
+        <!-- Arrow Vector（SPI 层用 Arrow 作为列式数据交换标准） -->
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-vector</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-format</artifactId>
+        </dependency>
+
+        <!-- 注：ORC / Parquet / 文本文件的 Arrow 转换器已迁到 dojao-connector-common，
+             对应的 orc-core / parquet-hadoop / hadoop-common / hive-storage-api 依赖也一并迁走。
+             需要它们的连接器请依赖 com.dojao:dojao-connector-common。 -->
+
+        <!-- 测试用：离线探针需真实 Arrow 内存分配器（arrow-vector 只带接口，具体实现由 netty/unsafe
+             提供）。test 作用域，不污染 SPI 的轻量契约（下游消费者不受影响）。 -->
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-memory-netty</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+</project>

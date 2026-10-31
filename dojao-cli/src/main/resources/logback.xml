@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!-- 关闭 logback 自身诊断输出 -->
+    <statusListener class="ch.qos.logback.core.status.NopStatusListener"/>
+
+    <!--
+      日志一律写 stderr：stdout 只放查询结果，保证 `-F csv > out.csv` / `-F json` 拿到的是干净数据。
+      级别默认 WARN —— Arrow / gRPC 的 INFO 日志（内存分配、连接建立等）对 CLI 用户是噪音，
+      需要排查时用 -Dlogback.configurationFile=... 或改这里。
+    -->
+    <appender name="STDERR" class="ch.qos.logback.core.ConsoleAppender">
+        <target>System.err</target>
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level %logger{20} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <root level="${dojao.cli.log.level:-WARN}">
+        <appender-ref ref="STDERR"/>
+    </root>
+</configuration>

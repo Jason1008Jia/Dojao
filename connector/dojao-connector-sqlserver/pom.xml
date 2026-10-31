@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dojao</groupId>
+        <artifactId>dojao</artifactId>
+        <version>1.0-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>dojao-connector-sqlserver</artifactId>
+    <name>Dojao Connector SQL Server</name>
+    <description>
+        Microsoft SQL Server 连接器：表扫描、谓词下推、分区并行读取、CTAS 建表与写入。
+        catalog = 连接串指向的数据库，schema = dbo 等 SQL Server schema，table = 表。
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-spi</artifactId>
+        </dependency>
+
+        <!-- Microsoft JDBC Driver for SQL Server（其余依赖均为 optional，离线可解析） -->
+        <dependency>
+            <groupId>com.microsoft.sqlserver</groupId>
+            <artifactId>mssql-jdbc</artifactId>
+        </dependency>
+
+        <!-- 测试用：离线探针需要真实 Arrow 分配器（arrow-vector 只带接口）。
+             test 作用域，不进运行时也不污染插件 jar。 -->
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-memory-netty</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+</project>

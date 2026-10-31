@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+        自定义连接器示例：刻意「不是」Dojao 的子模块（没有 <parent>）。
+
+        第三方抱着本目录就能抄着写自己的连接器：它只依赖 dojao-spi（provided），
+        与 Dojao 主仓库的构建、版本、模块划分都无关。放到 lib/connectors/ 即可被引擎加载。
+    -->
+    <groupId>com.example.dojao</groupId>
+    <artifactId>dojao-connector-csvdir</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>Dojao 自定义连接器示例（CSV 目录）</name>
+    <description>
+        把一个本地目录当成数据库读的自定义连接器：演示元数据探查、切片并行扫描
+        （planSplits / openSplit / Split 载荷）、谓词下推契约的最小完整实现。
+        开发指引见仓库 docs/custom-connector.md。
+    </description>
+
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <maven.compiler.release>21</maven.compiler.release>
+        <dojao.version>1.0-SNAPSHOT</dojao.version>
+        <!-- 与 Dojao 主仓库选择的 Jackson 版本对齐（Arrow 的传递依赖；引擎运行时已自带） -->
+        <jackson.version>2.16.1</jackson.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>com.fasterxml.jackson.core</groupId>
+                <artifactId>jackson-core</artifactId>
+                <version>${jackson.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.fasterxml.jackson.core</groupId>
+                <artifactId>jackson-annotations</artifactId>
+                <version>${jackson.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.fasterxml.jackson.core</groupId>
+                <artifactId>jackson-databind</artifactId>
+                <version>${jackson.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <!--
+            必须 provided：引擎运行时已经自带 dojao-spi（及其传递依赖 dojao-common / arrow-vector）。
+            打进 jar 会导致「插件自带的 SPI 类」与引擎的不是同一个 Class 对象，
+            插件会被 ConnectorRegistry 拒绝加载（日志里报 连接器加载失败 [<jar>]: ...）。
+        -->
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-spi</artifactId>
+            <version>${dojao.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- 示例本身不需要任何第三方依赖；真实连接器把自己的驱动加在这里
+             （注意：插件 jar 必须自带这些依赖，引擎只把 lib/connectors/ 里的 jar 装上插件 classpath）。 -->
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+            </plugin>
+            <!--
+                需要「自带依赖」的连接器可打开 shade 插件打 fat jar：
+                mvn package 后把 target/<artifact>-jar-with-dependencies.jar 丢进 lib/connectors/。
+                本示例无外部依赖，故不启用。
+            -->
+        </plugins>
+    </build>
+
+</project>

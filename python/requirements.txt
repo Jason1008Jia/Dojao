@@ -1,0 +1,14 @@
+# Runtime: pyarrow bundles Arrow Flight (data plane + control plane), no extra gRPC needed.
+# NOTE: keep this file ASCII-only -- pip parses it with the locale encoding (GBK on
+# Chinese Windows), non-ASCII comments make pip fail with UnicodeDecodeError.
+pyarrow>=15.0
+numpy
+pandas
+# protobuf runtime: udf_pb2.py (control-envelope message stubs) imports google.protobuf
+# at sidecar startup -- it is a RUNTIME dep, not only build-time.
+# Floor = the gencode version stamped in udf_pb2.py ("Protobuf Python Version"); its
+# ValidateProtobufRuntimeVersion() refuses an older (or wrong-major) runtime at import.
+protobuf>=7.35.1
+
+# Build-time: only used to regenerate udf_pb2.py from udf.proto (generate_pb.sh).
+grpcio-tools>=1.60

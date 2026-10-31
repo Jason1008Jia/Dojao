@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dojao</groupId>
+        <artifactId>dojao</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>dojao-ui</artifactId>
+    <name>Dojao UI</name>
+    <description>
+        Web 可视化界面：输入 SQL → 展示优化后的 DAG 执行计划。
+        基于 Javalin 内嵌服务器 + vis-network 前端。
+    </description>
+
+    <dependencies>
+        <!-- 内部模块 -->
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-grammar</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-metastore</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-common</artifactId>
+        </dependency>
+        <!-- AI 服务（LangChain4j 对话内核）：/api/ai/* 端点背后的引擎 -->
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-ai</artifactId>
+        </dependency>
+        <!-- 连接器不再编译期依赖：UI 主代码零连接器引用（预览用自包含 DemoInMemoryConnector，
+             连接器统一插件化到 lib/connectors/）。 -->
+        <!-- HiveTest / HiveBehaviorGen 造数用（仅测试）：ORC Writer 直写 hdfs://。
+             这些转换器已从 dojao-spi 迁到 dojao-connector-common，故依赖也随之而来
+             （orc-core / hive-storage-api / hadoop-common / parquet-hadoop）。 -->
+        <dependency>
+            <groupId>com.dojao</groupId>
+            <artifactId>dojao-connector-common</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Web 服务器 -->
+        <dependency>
+            <groupId>io.javalin</groupId>
+            <artifactId>javalin</artifactId>
+        </dependency>
+
+        <!-- 强制 Jetty 11（解决 Hadoop/Hive 传递依赖的 Jetty 9.x 与 Javalin 所需 Jetty 11 的冲突） -->
+        <dependency>
+            <groupId>org.eclipse.jetty</groupId>
+            <artifactId>jetty-server</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.eclipse.jetty</groupId>
+            <artifactId>jetty-servlet</artifactId>
+        </dependency>
+
+        <!-- JSON -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+
+        <!-- 日志 -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+        </dependency>
+
+        <!-- HiveTest 造数用（仅测试）：ORC Writer 直写 hdfs://（不碰 Hive 元数据，分区注册由使用者
+             在 Hive 客户端手工执行，故不引 hive-jdbc —— 它本身就是个零传递依赖的空壳 pom，
+             要真跑起来还得拖进 hive-common 那棵 25 个 jar 的树，而其中 orc-core→orc-shims 的
+             java17 profile 会把 hadoop-client-api 重新拉回来，污染整个 Hadoop 客户端栈）。 -->
+        <!-- ORC 的 PhysicalFsWriter 会引用 HdfsDataOutputStream（本地写也走这段），必须补
+             HDFS 客户端；版本对齐 dojao-connector-common 里的 hadoop-common 3.3.6。
+             ★排掉它拖来的老 kotlin-stdlib（hadoop-project-3.3.6 钉死的 1.4.10，不含
+             kotlin.enums.EnumEntriesKt，会让 Javalin 6 起不来）；理由详见
+             connector/dojao-connector-hive/pom.xml 的同名依赖。 -->
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-hdfs-client</artifactId>
+            <version>3.3.6</version>
+            <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.jetbrains.kotlin</groupId>
+                    <artifactId>kotlin-stdlib</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.jetbrains.kotlin</groupId>
+                    <artifactId>kotlin-stdlib-common</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <!-- 显式补回兼容版本（javalin 那条链本身就是 1.9.22，这里对齐同一版本） -->
+        <dependency>
+            <groupId>org.jetbrains.kotlin</groupId>
+            <artifactId>kotlin-stdlib</artifactId>
+            <version>1.9.22</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <mainClass>com.dojao.ui.DojaoUiApp</mainClass>
+                        </manifest>
+                    </archive>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

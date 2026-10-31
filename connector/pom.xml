@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dojao</groupId>
+        <artifactId>dojao</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>dojao-connector</artifactId>
+    <packaging>pom</packaging>
+    <name>Dojao Connectors</name>
+    <description>数据源连接器聚合模块</description>
+
+    <!--
+        只保留「已实现」的连接器：mysql / tidb / doris / postgres / hive / clickhouse / excel /
+        sqlserver / oracle。
+
+        这些模块在 reactor 内构建，但分发时一律以插件形式落 dojao-dist 的 lib/connectors/
+        （assembly 按 artifactId 把它们从 lib/ 排除、改放 lib/connectors/）——引擎 lib/ 不再含任何连接器 jar。
+
+        其余数据源（mariadb、hudi、iceberg、kafka、elasticsearch）
+        不再以空模块形式挂在 reactor 里 —— 那样只会让每次构建都去拉一堆用不上的驱动 jar，
+        而且与本工程「连接器即插件」的定位相冲突。它们现在的落地方式是：
+        第三方（或我们自己后续）实现 SPI 接口打成 jar，丢进部署目录 lib/connectors/ 即可，
+        引擎侧零改动。开发指引见 docs/custom-connector.md。
+    -->
+    <modules>
+        <!-- 连接器公共实现库（文件格式 → Arrow 转换器）：所有连接器可依赖，本身不承载插件 -->
+        <module>dojao-connector-common</module>
+        <module>dojao-connector-mysql</module>
+        <!-- TiDB：MySQL 线路协议 + EXPLAIN estRows 行数估算 -->
+        <module>dojao-connector-tidb</module>
+        <!-- Apache Doris：MySQL 线路协议 + DISTRIBUTED BY 建表 + REPLACE WITH TABLE 原子覆盖 -->
+        <module>dojao-connector-doris</module>
+        <module>dojao-connector-postgres</module>
+        <module>dojao-connector-hive</module>
+        <module>dojao-connector-clickhouse</module>
+        <!-- 本地工作簿（.xlsx / .xlsm）：零第三方依赖，读取恒为单分区 -->
+        <module>dojao-connector-excel</module>
+        <!-- Microsoft SQL Server：MSSQL JDBC 驱动 + 中括号标识符 + TOP/OFFSET-FETCH 分页 -->
+        <module>dojao-connector-sqlserver</module>
+        <!-- Oracle：ojdbc11 + 双引号标识符（大小写折叠）+ FETCH FIRST / OFFSET-FETCH 分页 -->
+        <module>dojao-connector-oracle</module>
+    </modules>
+
+</project>

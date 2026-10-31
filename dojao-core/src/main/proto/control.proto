@@ -1,0 +1,562 @@
+syntax = "proto3";
+
+package dojao.core.control;
+
+option java_multiple_files = true;
+option java_package = "com.dojao.core.rpc.control";
+option java_outer_classname = "ControlProto";
+
+// ============================================================
+// 真分布式控制面（Master ↔ Worker，Arrow Flight doAction / doExchange 载体）
+//
+// 消息分三类：
+//   1. 注册 / 心跳 / 注销  —— Master 侧注册端点（doAction）：
+//      "register" / "heartbeat" / "unregister"。RegisterResponse 回传集群节点表，
+//      Worker 据此构建 NetworkExchangeManager（worker↔worker 直连拓扑）。
+//   2. 任务派发 / 取消    —— Master → Worker（doAction）：
+//      "dispatch_scan" / "dispatch_fragment" / "cancel_task"。载荷 = ReadRequest /
+//      FragmentSpecMsg（片段全量序列化，Worker 侧按名重建算子）。
+//   3. 结果回传          —— Worker → Master（doExchange "result/{taskId}"）：
+//      每 (taskId) 一条流，Arrow batch = 数据页，metadata = ResultEventMsg 控制包络
+//      （DATA / FINISHED / FAILED，镜像 exchange.proto 的 ExchangeControl 模式）。
+//
+// 序列化约定：FragmentSpec 各步骤为纯 DTO（不引用运行期算子），聚合/窗口函数以
+// aggregateName / functionName 字符串传输，Worker 侧按名重建 —— 与伪分布式同构。
+// ============================================================
+
+// ==================== 节点 & 资源 ====================
+
+message WorkerNodeMsg {
+  string worker_id = 1;
+  string host = 2;
+  int32 port = 3;
+  string version = 4;
+  int64 start_time_nanos = 5;
+}
+
+enum WorkerStateMsg {
+  INITIALIZING = 0;
+  REGISTERED = 1;
+  IDLE = 2;
+  BUSY = 3;
+  FAILED = 4;
+  STOPPED = 5;
+}
+
+message ResourceSummaryMsg {
+  int32 cpu_cores = 1;
+  int32 cpu_usage_pct = 2;
+  int64 total_memory_bytes = 3;
+  int64 used_memory_bytes = 4;
+  int64 total_disk_bytes = 5;
+  int64 free_disk_bytes = 6;
+  int32 max_concurrency = 7;
+  int64 timestamp_nanos = 8;
+  // 监控页用（proto3 缺省 0，旧发送方不带 = 接收方按 0 处理，向后兼容）
+  int64 heap_used_bytes = 9;
+  int64 heap_max_bytes = 10;
+  int32 thread_count = 11;
+  // 受管直接内存（进程级共享根 NodeMemory）：用量 / 上限 + 按类别聚合明细。
+  // proto3 缺省 0 / 空 ⇒ 旧发送方与滚动升级兼容。
+  int64 direct_used_bytes = 12;
+  int64 direct_budget_bytes = 13;
+  repeated AllocatorUsageMsg allocators = 14;
+  // 进程级磁盘 IO 累计字节（Linux /proc/self/io 的 read_bytes / write_bytes；非 Linux 为 0）。
+  // 累计计数 ⇒ 监控页按相邻采样点差分画速率；proto3 缺省 0 与旧发送方兼容。
+  int64 disk_read_bytes = 15;
+  int64 disk_write_bytes = 16;
+  // 本进程 RSS（Linux /proc/self/status 的 VmRSS；非 Linux 为 0）——
+  // 与「主机已用内存」区分：后者含可回收页缓存，RSS 才是进程真正占住的物理内存。
+  int64 process_rss_bytes = 17;
+}
+
+// 单个命名分配器类别的用量快照（监控页内存明细）。
+message AllocatorUsageMsg {
+  string category = 1;
+  int64 allocated_bytes = 2;
+  int64 peak_bytes = 3;
+  int64 limit_bytes = 4;
+}
+
+// ==================== 注册 / 心跳 / 注销 ====================
+
+message RegisterRequest {
+  WorkerNodeMsg node = 1;
+  ResourceSummaryMsg resource = 2;
+}
+
+message RegisterResponse {
+  bool ok = 1;
+  string error = 2;
+  // 集群全量节点表（含 self）——Worker 据此构建 worker↔worker 交换拓扑。
+  repeated WorkerNodeMsg cluster_nodes = 3;
+}
+
+message HeartbeatRequest {
+  WorkerNodeMsg node = 1;
+  WorkerStateMsg state = 2;
+  ResourceSummaryMsg resource = 3;
+}
+
+message HeartbeatResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message UnregisterRequest {
+  WorkerNodeMsg node = 1;
+}
+
+message UnregisterResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+// ==================== Catalog 定义（派发随附） ====================
+
+// 派发载荷随附的 catalog 定义（type + 连接属性），与 cluster_nodes / functions 同款：
+// 真分布式下 Worker 是独立 JVM —— Master 与 Worker 未必共享元数据库（甚至未必同机），
+// 也不该要求 Worker 预置 catalog。带上定义后，Worker 凭载荷即可现场构造连接器，
+// 「这个 catalog 怎么连」不再依赖共享 SQLite 文件，也不再需要 Worker 重启。
+message CatalogDefMsg {
+  string name = 1;
+  string type = 2;                  // 连接器类型：mysql / hive2 / hive3 / ...
+  map<string, string> properties = 3;   // 连接属性（jdbcUrl / hive.metastore.uris ...），不含 type
+}
+
+// ==================== 读取请求（连接器） ====================
+
+message ReadRequestMsg {
+  string catalog = 1;
+  string schema = 2;
+  string table = 3;
+  repeated string columns = 4;       // 列投影，空 = 全列
+  string filter_expression = 5;      // 空 = 无过滤（Optional<String>）
+  int64 offset = 6;
+  int64 limit = 7;
+}
+
+// ==================== 函数定义（L2：Master 随片段派发附带，Worker 按名重建自定义函数） ====================
+
+message FunctionDefinitionMsg {
+  string name = 1;
+  string type = 2;          // java | python | ...
+  string jar_path = 3;      // java jar 路径 / 其他语言 code_path
+  string class_name = 4;    // java 全限定类名 / module.ClassName
+  map<string, string> properties = 5;
+  string comment = 6;
+  string created_at = 7;
+  string updated_at = 8;
+}
+
+// ==================== 片段步骤（FragmentSpec 各 record 的镜像） ====================
+
+enum JoinTypeMsg {
+  INNER = 0;
+  LEFT = 1;
+  RIGHT = 2;
+  FULL = 3;
+  CROSS = 4;
+}
+
+// 本地 join 算法（Master 按两侧数据量选定，随 JoinStep 下发；默认 HASH → 旧 Master/Worker 混搭优雅降级）。
+enum JoinAlgorithmMsg {
+  HASH = 0;         // 分区哈希 join：build 侧必须装进每分区内存预算（build = 右表）
+  SORT_MERGE = 1;   // 排序归并 join：两侧排序阶段可溢写，不受"build 侧必须装内存"限制
+  BROADCAST = 2;    // 广播 join：右表整份复制到每台（由分区方式实现，Worker 侧仍跑 HashJoin）
+}
+
+// 分区方式 —— 决定 HashPartitionOperator 把每行发往哪个桶。
+// 前一种配合 numPartitions = 分区数 n（co-partitioning）；后两种配合 numPartitions = Worker 数 w（广播）。
+enum DistributionMsg {
+  DIST_HASH = 0;      // 按 key 哈希取桶（默认）
+  DIST_REPLICATE = 1; // 整页复制到全部桶（广播 build 侧）：每台拿到完整一份右表
+  DIST_FIXED = 2;     // 整页固定发往一个桶（广播 probe 侧）：切片就地入桶，零跨机
+}
+
+enum WindowFunctionTypeMsg {
+  ROW_NUMBER = 0;
+  RANK = 1;
+  DENSE_RANK = 2;
+  SUM = 3;
+  AVG = 4;
+  COUNT = 5;
+  MAX = 6;
+  MIN = 7;
+  LAG = 8;
+  LEAD = 9;
+  AGGREGATE = 10;
+}
+
+message ScanStepMsg {
+  string catalog = 1;
+  ReadRequestMsg request = 2;
+  // 切片私有载荷（连接器自定义字节，引擎只搬运不解释；空 = 整表切片，用 request 直接读）。
+  // 与 DispatchScanRequest.split_payload 同义：Producer 片段的 ScanStep 由本字段携带。
+  bytes split_payload = 3;
+}
+
+message PartitionStepMsg {
+  string exchange_id = 1;
+  repeated string key_columns = 2;
+  int32 num_partitions = 3;
+  repeated string owner_worker_ids = 4;
+  repeated string exchange_ids = 5;
+  // 分区方式（缺省 DIST_HASH → 旧发送方仍按哈希分区执行，优雅降级）
+  DistributionMsg distribution = 6;
+  int32 fixed_bucket = 7;             // DIST_FIXED 的目标桶号（= 生产者所在 Worker 槽位）
+}
+
+message ExchangeInStepMsg {
+  string exchange_id = 1;
+  int32 num_partitions = 2;
+  int32 num_senders = 3;
+  repeated bool owned = 4;           // owned[pid] = 本 Worker 是否拥有该桶
+}
+
+message JoinStepMsg {
+  repeated string left_key_columns = 1;
+  repeated string right_key_columns = 2;
+  JoinTypeMsg join_type = 3;
+  int64 memory_limit = 4;
+  int32 num_partitions = 5;
+  JoinAlgorithmMsg algorithm = 6;   // 缺省 HASH（0）→ 不设该字段的旧发送方仍按哈希 join 执行
+  // 右表（build 侧）声明列，Arrow IPC 元数据字节（见 ArrowSchemaIpc）；空 = 未声明（旧发送方 /
+  // 派生表右通道无连接器元数据）→ Worker 侧退回「收到过右页才知道类型」的旧行为。
+  bytes right_schema_ipc = 7;
+  // 左表（probe 侧）声明列，语义与 right_schema_ipc 对称：RIGHT / FULL join 某分区左表一页未收时，
+  // 「右行 + 左列全 NULL」的孤儿行需要左列类型才能构造输出 schema。
+  bytes left_schema_ipc = 8;
+}
+
+message AggregationDtoMsg {
+  string input_column = 1;
+  string output_column = 2;
+  string aggregate_name = 3;
+  // collect-evaluate 型：SQL 实际收集列（按位交付给外挂函数）；非 collect 型为空。
+  // 声明名（CollectAggregateFunction.inputColumns()）仅作参数位标签，不要求与 SQL 列同名。
+  repeated string collect_input_columns = 4;
+}
+
+message CaseBranchMsg {
+  string condition = 1;
+  string value = 2;   // 数值字面量 或 列引用
+}
+
+message CaseProjectionMsg {
+  string derived_column = 1;
+  repeated CaseBranchMsg branches = 2;
+  string else_value = 3;   // 空 = NULL；数值字面量 或 列引用
+}
+
+// GROUP BY 表达式派生列（分区键）：Producer 扫描后、HashPartition 前逐行物化。
+// derived_column = SELECT 别名或表达式归一化文本（如 year(created_at)）；
+// expr_text = OpaqueExpr 原始 SQL 文本，Worker 侧 ExprParser 重建 AST 求值。
+message GroupKeyExpressionMsg {
+  string derived_column = 1;
+  string expr_text = 2;
+}
+
+message ExpandSetMsg {
+  repeated string members = 1;                                // 该维度组合参与的维度列
+}
+
+// 多维聚合展开（GROUP BY ROLLUP/CUBE/GROUPING SETS）：让 N 条维度组合共用一次扫描 + join。
+// 未设置（null）= 普通聚合，行为不变。
+message ExpandStepMsg {
+  repeated string dim_columns = 1;                            // 全部维度列（分组键前缀）
+  repeated ExpandSetMsg grouping_sets = 2;                    // 每个维度组合
+}
+
+message AggregateStepMsg {
+  repeated string key_columns = 1;
+  repeated AggregationDtoMsg aggregations = 2;
+  repeated CaseProjectionMsg case_projections = 3;
+  int64 memory_limit = 4;
+  int32 num_partitions = 5;
+}
+
+message WindowFunctionSpecMsg {
+  WindowFunctionTypeMsg type = 1;
+  string input_column = 2;    // 空 = null
+  string output_column = 3;
+  int32 offset = 4;
+  // defaultValue（Object，可空）——oneof 覆盖数字/字符串/布尔
+  oneof default_value_variant {
+    int64 default_int = 5;
+    double default_double = 6;
+    string default_string = 7;
+    bool default_bool = 8;
+  }
+  string function_name = 9;   // 聚合窗口函数名，空 = null
+  WindowFrameMsg frame = 10;   // ROWS 帧；空(message 字段)= 运行帧（默认）
+}
+
+// 窗口 ROWS 帧 —— 相对当前行的偏移区间 [i - start_back, i - end_back]（均在分区内）。
+// 仅携带「无需未来行」的有限回溯帧；运行/默认帧不设该字段。
+message WindowFrameMsg {
+  int32 start_back = 1;   // 距当前行的起始回溯行数（>=0）
+  int32 end_back = 2;     // 距当前行的结束回溯行数（>=0）；0 = CURRENT ROW
+}
+
+message WindowStepMsg {
+  repeated string partition_by = 1;
+  repeated string order_by = 2;
+  repeated bool ascending = 3;
+  repeated WindowFunctionSpecMsg functions = 4;
+  int64 memory_limit = 5;
+  int32 num_partitions = 6;
+  // 提前过滤下推（rn <= N / rr = N 等）：把外层 WHERE 窗口函数列 op 值 的过滤条件下推到
+  // Worker 侧 WindowSortOperator，在 Phase 1 末尾就地裁掉不合格行，避免整组回传 Master 再过滤。
+  // 空 = 无下推（老 Worker / 不满足下推条件的窗口函数）。proto3 message 字段天然可空。
+  WindowFilterMsg filter = 7;
+}
+
+// 窗口提前过滤配置 —— WindowFilterConfig 的线格式镜像（枚举用名称字符串，抗枚举重排）。
+message WindowFilterMsg {
+  WindowFunctionTypeMsg function_type = 1;  // 被过滤的窗口函数类型
+  int64 target_value = 2;                   // 目标值 N（必须 > 0）
+  int32 aggregate_col_index = 3;            // -1 = 位置型/排名型；>=0 = MIN/MAX/SUM/AVG 输入列索引
+  bool no_order_by = 4;                     // true = 全量窗口（分区级聚合值）
+  WindowFilterOpMsg op = 5;                 // 比较操作符
+}
+
+// WindowFilterConfig.FilterOp 的线格式镜像。
+enum WindowFilterOpMsg {
+  WINDOW_FILTER_EQ = 0;
+  WINDOW_FILTER_LE = 1;
+  WINDOW_FILTER_LT = 2;
+  WINDOW_FILTER_GE = 3;
+  WINDOW_FILTER_GT = 4;
+}
+
+// 分布式写目标：挂在终端 Consumer 上，Worker 把该分区最终输出就地写走、不回传数据页
+// （只回传 FINISHED + row_count）。target_columns 空 = 用页 schema 列名（按位置对应）。
+message SinkStepMsg {
+  string catalog = 1;
+  string schema = 2;
+  string table = 3;
+  repeated string target_columns = 4;
+}
+
+// 顶层 ORDER BY + LIMIT/OFFSET 的片内截断尾（top-N 下推）：挂在最终产生结果的分区流尾部，
+// Worker 本地按 order_by_keys 排序后只回传前 offset+limit 行（Master 再在候选集上做全局
+// 排序取 [offset, offset+limit)）。order_by_keys ∈ 该分片输出 schema（升/降见 ascending）。
+message SortLimitStepMsg {
+  repeated string order_by_keys = 1;
+  repeated bool ascending = 2;
+  int64 offset = 3;
+  int64 limit = 4;          // < 0 = 只排不截断（Phase 2 全排序用，本期不产生）
+  int64 memory_limit = 5;   // 片内 WindowSort 内存上限（超限溢写）
+}
+
+// ==================== 片段（FragmentSpec sealed 族的镜像） ====================
+
+message ProducerMsg {
+  string fragment_id = 1;
+  string self_worker_id = 2;
+  ScanStepMsg scan = 3;
+  PartitionStepMsg partition = 4;
+  repeated GroupKeyExpressionMsg group_key_expressions = 5;   // 空 = 无 GROUP BY 表达式派生列
+  ExpandStepMsg expand = 6;                                   // 未设置 = 无多维聚合展开
+}
+
+message ConsumerMsg {
+  string fragment_id = 1;
+  string self_worker_id = 2;
+  ExchangeInStepMsg left_in = 3;
+  ExchangeInStepMsg right_in = 4;
+  JoinStepMsg join = 5;
+  SinkStepMsg sink = 6;   // 空 = 无写目标（SELECT 回传）
+  SortLimitStepMsg tail = 7;   // 空 = 无 top-N 片内截断
+}
+
+message AggregateConsumerMsg {
+  string fragment_id = 1;
+  string self_worker_id = 2;
+  ExchangeInStepMsg in = 3;
+  AggregateStepMsg aggregate = 4;
+  SinkStepMsg sink = 5;   // 空 = 无写目标（SELECT 回传）
+  SortLimitStepMsg tail = 6;   // 空 = 无 top-N 片内截断
+  // 该分区聚合输出上的<b>二级聚合</b>（分布式全局聚合下沉的 partial 段）：
+  // 非空 → 本地聚合输出再喂给同 Worker 的第二次 HashAggregation（key 通常为空 = 全局 partial），
+  // 每分区只回传 1 行 partial，Master 侧 PartialAggregationMergeOperator 再合并成最终行。
+  AggregateStepMsg follow_up = 7;
+}
+
+message WindowConsumerMsg {
+  string fragment_id = 1;
+  string self_worker_id = 2;
+  ExchangeInStepMsg in = 3;
+  WindowStepMsg window = 4;
+  SinkStepMsg sink = 5;   // 空 = 无写目标（SELECT 回传）
+  SortLimitStepMsg tail = 6;   // 空 = 无 top-N 片内截断
+}
+
+message ChainedJoinConsumerMsg {
+  string fragment_id = 1;
+  string self_worker_id = 2;
+  ExchangeInStepMsg left_in = 3;
+  ExchangeInStepMsg right_in = 4;
+  JoinStepMsg join = 5;
+  oneof follow_up {
+    WindowStepMsg window = 6;
+    AggregateStepMsg aggregate = 7;
+  }
+  SinkStepMsg sink = 8;   // 空 = 无写目标（SELECT 回传）
+  SortLimitStepMsg tail = 9;   // 空 = 无 top-N 片内截断
+}
+
+message MiddleJoinConsumerMsg {
+  string fragment_id = 1;
+  string self_worker_id = 2;
+  ExchangeInStepMsg left_in = 3;
+  ExchangeInStepMsg right_in = 4;
+  JoinStepMsg join = 5;
+  PartitionStepMsg next_partition = 6;
+  ExpandStepMsg expand = 7;                                   // 未设置 = 无多维聚合展开
+}
+
+// 派生表分布式 join 的聚合中间层：own 桶原始数据 → 本地 HashAggregation →
+// （派生内层 HAVING：聚合输出行级过滤）→ 按派生表一侧 join 键重新哈希分区 →
+// 推给派生表 join 交换（不回传 Master）。
+message MiddleAggregateConsumerMsg {
+  string fragment_id = 1;
+  string self_worker_id = 2;
+  ExchangeInStepMsg in = 3;
+  AggregateStepMsg aggregate = 4;
+  PartitionStepMsg next_partition = 5;
+  string filter_after_aggregate = 6;   // 空 = 无 HAVING（可空派生内层 HAVING 谓词，列 ∈ 本地聚合输出列）
+}
+
+// 派生表分布式 join 的窗口中间层：own 桶原始数据 → 本地 WindowSort + WindowFunction →
+// 按派生表一侧 join 键重新哈希分区 → 推给派生表 join 交换（不回传 Master）。
+message MiddleWindowConsumerMsg {
+  string fragment_id = 1;
+  string self_worker_id = 2;
+  ExchangeInStepMsg in = 3;
+  WindowStepMsg window = 4;
+  PartitionStepMsg next_partition = 5;
+}
+
+message FragmentSpecMsg {
+  oneof spec {
+    ProducerMsg producer = 1;
+    ConsumerMsg consumer = 2;
+    AggregateConsumerMsg aggregate_consumer = 3;
+    WindowConsumerMsg window_consumer = 4;
+    ChainedJoinConsumerMsg chained_join_consumer = 5;
+    MiddleJoinConsumerMsg middle_join_consumer = 6;
+    MiddleAggregateConsumerMsg middle_aggregate_consumer = 7;
+    MiddleWindowConsumerMsg middle_window_consumer = 8;
+  }
+}
+
+// ==================== 派发 / 取消 ====================
+
+message DispatchScanRequest {
+  string worker_id = 1;   // 目标 Worker
+  string job_id = 2;
+  string task_id = 3;
+  string catalog = 4;
+  ReadRequestMsg request = 5;
+  // 集群节点表（含各 Worker 真实 workerId → host:port）：Worker 据此 learnNodes 补齐交换拓扑，
+  // 解决"先注册的 Worker 不知道后注册的兄弟"问题。派发即携带，Worker 侧增量学习。
+  repeated WorkerNodeMsg cluster_nodes = 6;
+  SortLimitStepMsg tail = 7;   // 空 = 无 top-N 片内截断（本分区任务本地排序 + 截断后回传）
+  // 本任务扫描所用 catalog 的定义（type + 连接属性）。Worker 收到即装入本地内存表，
+  // 无须与 Master 共享元数据库、也无须预置。空 = 老 Master / 未注册（回落 Worker 自身 MetaStore）。
+  repeated CatalogDefMsg catalogs = 8;
+  // 切片私有载荷（连接器自定义字节，引擎只搬运不解释）。空 = 整表切片（用 request 直接读），
+  // 也是老 Master / 谓词型连接器（MySQL / PostgreSQL）的常态。
+  bytes split_payload = 9;
+}
+
+message DispatchFragmentRequest {
+  string worker_id = 1;
+  string job_id = 2;
+  string task_id = 3;
+  FragmentSpecMsg spec = 4;
+  repeated WorkerNodeMsg cluster_nodes = 5;   // 同上：Worker 增量学习交换拓扑
+  // 本片段聚合引用的自定义函数定义（内置函数不在其中）。真分布式下 Worker 是独立 JVM，
+  // 静态注册表不共享，须随载荷带过去，Worker 侧 registerExternal + ensureLoaded 后按名重建。
+  repeated FunctionDefinitionMsg functions = 6;
+  // 本片段引用的 catalog 定义（Producer 的扫描源 / 带写目标的 Consumer 的写目标）。
+  // 理由同 DispatchScanRequest.catalogs。
+  repeated CatalogDefMsg catalogs = 7;
+}
+
+message CancelTaskRequest {
+  string worker_id = 1;
+  string task_id = 2;
+}
+
+message DispatchAck {
+  bool ok = 1;
+  string error = 2;
+}
+
+// ==================== 结果回传（doExchange 控制包络） ====================
+
+message ResultEventMsg {
+  string task_id = 1;
+  int64 batch_index = 2;   // DATA：页序号（透传）
+
+  enum Kind {
+    DATA = 0;       // Arrow batch 本体 = 数据页
+    FINISHED = 1;   // 本任务全部数据已发完
+    FAILED = 2;     // 本任务执行失败（fail-fast）
+    PROGRESS = 3;   // 心跳：任务仍在推进但无结果回传（metadata-only 消息，无 body，不依赖流 schema）
+  }
+  Kind kind = 3;
+  string cause = 4;   // FAILED：错误描述
+  int64 row_count = 5;   // FINISHED：本分区写走的行数（分布式写；SELECT 回传恒 0）
+}
+
+// ==================== 查询遥测（Worker → Master，~1s 上抛） ====================
+// 只覆盖「数据不回传 Master」的片段：Producer（Scan→Shuffle）/ 中间层（Join→Shuffle /
+// Aggregate→Shuffle）—— 它们发出的行数只有 Worker 自己知道（尾部 HashPartitionOperator 的
+// rowsProcessed），Master 侧据此填 Scan/Join 框的真实行数。终端 Consumer / 独立 Scan 叶子
+// 的行数由数据面回传（FragmentData / ScanPage）天然到 Master，属权威值，不进遥测 → 无双计。
+// 行数为单调累计值，Master 按 task_id 覆盖，丢一拍下拍自愈（best-effort）。
+// bytes_in / bytes_out 同源同语义（尾部 HashPartitionOperator 的 inputBytes / outputBytes）：
+// 字节统计只存在于算子对象上（page.getSizeInBytes()），Worker 片段内部发了多少字节 Master
+// 无从得知，与行数一样只能靠这条上行链路 —— 否则 Scan/Join/Mid 阶段框的字节恒 0。
+
+message QueryFragmentTelemetryMsg {
+  string task_id = 1;        // = fragmentId
+  int64 rows_emitted = 2;    // 该段累计发出的行数（scan/join/agg 输出语义）；-1 = 本帧无行数通道
+  bool done = 3;             // 该片段已真正结束（Worker 收尾补发的最终帧）：Master 据此把任务
+                             // 从 RUNNING 置 FINISHED，Scan/Join/Mid 框在真实完成时立即变绿，
+                             // 而非等整条查询收尾被统一扫尾（rows_emitted 为最终行数）
+  int64 bytes_in = 4;        // 该段累计读入字节（尾部 HashPartitionOperator.inputBytes）
+  int64 bytes_out = 5;       // 该段累计发出字节（尾部 HashPartitionOperator.outputBytes）
+  int64 spilled_bytes = 6;   // 该段累计溢写字节（算子 OperatorStats.spilledBytes）；-1 = 本帧无溢写通道。
+                             // 与行数/字节不同，溢写只发生在 Worker 进程内（Master 侧算子从不溢写），
+                             // 终端 Consumer（窗口排序 / 聚合 / 排序归并 join）也会溢写 → 必须单独一条
+                             // 通道上报，否则监控上「溢写总量」恒为空。帧内独立有效：纯溢写帧
+                             // rows_emitted = -1，Master 只覆盖溢写表、不动行数/字节表（无双计）。
+}
+
+message QueryTelemetryGroup {
+  string query_id = 1;
+  repeated QueryFragmentTelemetryMsg fragments = 2;
+}
+
+message QueryTelemetryMsg {
+  WorkerNodeMsg node = 1;    // 上报 Worker（审计 / 后续 per-worker 视图）
+  repeated QueryTelemetryGroup queries = 2;
+  // 本节点「正在跑」的 jobId（= 片段派发 jobId = Master 侧 operator queryId）—— 僵尸片段回收用：
+  // Master 据此回信哪些查询它已不认识（已结束 / 已超时剔除 / Master 重启过）→ Worker 就地取消这些
+  // 片段，释放被残留片段占住的池槽位。为空 = 本次不请求（按间隔节流，不是每拍都带）。
+  repeated string running_query_ids = 3;
+}
+
+message QueryTelemetryResponse {
+  bool ok = 1;
+  string error = 2;
+  // 上一条消息 running_query_ids 中 Master「已不认」的子集（查询不在活跃表，或非 SUBMITTED/RUNNING）
+  // —— Worker 收到即取消这些 jobId 的全部本地片段（幂等）。Master 不认 ≠ 一定该杀：Worker 仍只对
+  // 出现在本表里的 jobId 动手，绝不会误杀 Master 侧仍活跃的查询。
+  repeated string stale_query_ids = 3;
+}
