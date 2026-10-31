@@ -6,8 +6,8 @@ explore data, execute SQL and render charts — without moving data.
 
 ## Repository
 
-- Gitee: <https://gitee.com/scottjia/dojao>
-- Clone: `git clone https://gitee.com/scottjia/dojao.git`
+- GitHub: <https://github.com/Jason1008Jia/Dojao>
+- Clone: `git clone https://github.com/Jason1008Jia/Dojao.git`
 
 ## Documentation
 
@@ -19,7 +19,7 @@ explore data, execute SQL and render charts — without moving data.
 ## Build
 
 ```bash
-git clone https://gitee.com/scottjia/dojao.git
+git clone https://github.com/Jason1008Jia/Dojao.git
 cd dojao
 ./mvnw clean package -DskipTests
 ```

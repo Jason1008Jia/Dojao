@@ -105,7 +105,7 @@ Arrow 列存储在内存中**不动**，只有行号在 Map / Sort 中重排；�
 ### 构建
 
 ```bash
-git clone https://gitee.com/scottjia/dojao.git
+git clone https://github.com/Jason1008Jia/Dojao.git
 cd dojao
 ./mvnw clean package -DskipTests
 ```
