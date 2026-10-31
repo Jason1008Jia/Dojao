@@ -262,8 +262,14 @@ public final class NestedTypeSupport {
         if (v instanceof SmallIntVector x) return Long.toString(x.get(row));
         if (v instanceof IntVector x) return Long.toString(x.get(row));
         if (v instanceof BigIntVector x) return Long.toString(x.get(row));
-        if (v instanceof Float4Vector x) return Float.toString(x.get(row));
-        if (v instanceof Float8Vector x) return Double.toString(x.get(row));
+        if (v instanceof Float4Vector x) {
+            float f = x.get(row);
+            return Float.isFinite(f) ? new BigDecimal(Float.toString(f)).toPlainString() : Float.toString(f);
+        }
+        if (v instanceof Float8Vector x) {
+            double d = x.get(row);
+            return Double.isFinite(d) ? new BigDecimal(Double.toString(d)).toPlainString() : Double.toString(d);
+        }
         if (v instanceof DecimalVector x) {
             Object o = x.getObject(row);
             return o instanceof BigDecimal bd ? bd.toPlainString() : String.valueOf(o);

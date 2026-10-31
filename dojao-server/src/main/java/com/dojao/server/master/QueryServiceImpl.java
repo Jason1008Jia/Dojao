@@ -28,6 +28,7 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -608,7 +609,7 @@ public class QueryServiceImpl {
                             // [1, 2] / {a=1}，这里统一渲染成与 Hive 文本一致的 JSON 风格。
                             String value = NestedTypeSupport.isNested(vec)
                                     ? NestedTypeSupport.formatValue(vec, r)
-                                    : (vec.isNull(r) ? "NULL" : String.valueOf(vec.getObject(r)));
+                                    : (vec.isNull(r) ? "NULL" : plainText(vec.getObject(r)));
                             row.addValues(value);
                         }
                         builder.addRows(row.build());
@@ -663,6 +664,23 @@ public class QueryServiceImpl {
     /** 列名是否只是规划期未展开的 {@code *} 占位（单列且值为 "*"）。 */
     private static boolean isStarOnlyCols(List<String> outCols) {
         return outCols.size() == 1 && "*".equals(outCols.get(0));
+    }
+
+    /**
+     * 结果值转文本：浮点数按十进制展开，避免 {@code 4.6258752709998167E8} 这类科学计数法。
+     * NaN / Infinity 保持 Java 原样（BigDecimal 无法表示）。
+     */
+    private static String plainText(Object value) {
+        if (value instanceof Double d) {
+            return Double.isFinite(d) ? new BigDecimal(d.toString()).toPlainString() : d.toString();
+        }
+        if (value instanceof Float f) {
+            return Float.isFinite(f) ? new BigDecimal(f.toString()).toPlainString() : f.toString();
+        }
+        if (value instanceof BigDecimal bd) {
+            return bd.toPlainString();
+        }
+        return String.valueOf(value);
     }
 
     // ==================== 写语句响应 ====================
