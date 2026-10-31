@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Dojao 三节点部署脚本 —— 在 aliyun003（Master 机）上执行
+# Dojao 三节点部署脚本 —— 在 192.168.10.3（Master 机）上执行
 #
 # 做的事（严格按顺序）：
 #   1. 删除 /opt/module/dojao，把 dojao-0.1.0.tar.gz 解压到 /opt/module/
 #   2. 改 /opt/module/dojao/bin/dojao：在 `set -e` 上一行插入
 #         JAVA_HOME=/opt/module/jdk-21.0.10
-#   3. 改本机（aliyun003）的 /opt/module/dojao/conf/dojao.conf：
-#         system.master.host = aliyun003
-#         system.worker.host = aliyun003
-#   4. 清掉 aliyun001/002 上的旧目录（防止旧版 jar 残留），再 xsync 分发整个 dojao 目录
-#   5. ssh aliyun001 / aliyun002，各改自己的 conf：
-#         system.worker.host = aliyun001 | aliyun002
+#   3. 改本机（192.168.10.3）的 /opt/module/dojao/conf/dojao.conf：
+#         system.master.host = 192.168.10.3
+#         system.worker.host = 192.168.10.3
+#   4. 清掉 192.168.10.1 / 192.168.10.2 上的旧目录（防止旧版 jar 残留），再 xsync 分发整个 dojao 目录
+#   5. ssh 192.168.10.1 / 192.168.10.2，各改自己的 conf：
+#         system.worker.host = 192.168.10.1 | 192.168.10.2
 #         system.role        = worker
 #   6. 回显三台机器的最终关键配置（只读）
 #
@@ -23,7 +23,7 @@
 # 前提：
 #   * 有写 /opt/module 的权限 —— 直接以 root 执行，**别用 sudo**
 #     （sudo 会换掉 SSH 密钥上下文，第 5 步就 ssh 不出去了）
-#   * 已配好到 aliyun001 / aliyun002 的免密 ssh（含 known_hosts）
+#   * 已配好到 192.168.10.1 / 192.168.10.2 的免密 ssh（含 known_hosts）
 #   * xsync 可用
 # ============================================================================
 set -euo pipefail
@@ -31,8 +31,8 @@ set -euo pipefail
 # ---------------------------- 可调参数 ----------------------------
 DOJAO_HOME=/opt/module/dojao
 JAVA_HOME_VALUE=/opt/module/jdk-21.0.10
-MASTER_NODE=aliyun003
-WORKER_NODES=(aliyun001 aliyun002)
+MASTER_NODE=192.168.10.3
+WORKER_NODES=(192.168.10.1 192.168.10.2)
 TARBALL_NAME=dojao-0.1.0.tar.gz
 SSH_OPTS="${SSH_OPTS:--o ConnectTimeout=10}"
 

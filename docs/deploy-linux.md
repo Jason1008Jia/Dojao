@@ -172,29 +172,37 @@ query.spill.disk.maxUsage = 0.8
 - 别和 `query.spill.ratio` 混淆：后者是**内存**触发阈值（达到 slot 预算的多少比例开始溢写），
   `query.spill.disk.maxUsage` 才是**磁盘**使用率上限。
 
-## 4. 建 Hive catalog
+## 4. 建 Catalog
 
-catalog 注册信息落在 SQLite（`system.metastore.sqlite.path`），**重启不丢**。两种方式：
+catalog 注册信息落在 SQLite（`system.metastore.sqlite.path`），**重启不丢**。在 CLI 或 Web 控制台直接执行：
 
-**(a) 直接复用开发机上的 `data/dojao-metastore.db`** —— 连 catalog 注册 + 持久化函数一起带过来。
-里面的 `catalog.hive.metastore.uris` / `catalog.hive.fs.defaultFS` 在集群里依然有效，拿来即用。
-注意两边 `system.metastore.sqlite.path` 的相对基准都是「安装根目录」（启动脚本会 `cd` 过去）。
-
-**(b) 到 Linux 上重建**（更干净）：
+**Hive**：
 
 ```sql
-create catalog hive using hive3 with (
-  catalog.hive.metastore.uris = 'thrift://<hms-host>:10000',
-  catalog.hive.fs.defaultFS   = 'hdfs://<namenode-host>:9000',
-  catalog.hive.hadoop.user.name = 'hdfs'
+CREATE CATALOG hive USING hive3 WITH (
+  'hive.metastore.uris' = 'thrift://192.168.10.2:9083',
+  'fs.defaultFS'        = 'hdfs://192.168.10.1:9000',
+  'hadoop.user.name'    = 'root'
 );
 ```
 
+**MySQL**：
+
+```sql
+CREATE CATALOG mysql_catalog USING mysql WITH (
+  jdbcUrl  = 'jdbc:mysql://192.168.10.2:3306/metastore?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true',
+  username = 'root',
+  password = 'JiaXin@1008'
+);
+```
+
+- 也可以直接复用开发机上的 `data/dojao-metastore.db` —— catalog 注册 + 持久化函数一起带过来，拿来即用；
+  注意两边 `system.metastore.sqlite.path` 的相对基准都是「安装根目录」（启动脚本会 `cd` 过去）。
 - `hive2` / `hive3` 两个工厂都在，能力校验已关，单套客户端通吃。
-- 属性键遵循 catalog 命名规范 `catalog.<连接器类型>.<属性名>`（Hive 系共用 `catalog.hive.`），
-  旧写法（`hive.metastore.uris` 等）依然可用。
-- **`catalog.hive.hadoop.user.name` 最值得先确认**：它会被设成 `HADOOP_USER_NAME`，决定读 HDFS 的身份。
-  集群侧一般是 `hdfs` 或 `hive`，写错了是 `Permission denied`。
+- 属性键支持两种写法：上面的裸键（`hive.metastore.uris` / `jdbcUrl` 等），以及带前缀的
+  `catalog.<连接器类型>.<属性名>`（Hive 系共用 `catalog.hive.`）。
+- **`hadoop.user.name` 最值得先确认**：它会被设成 `HADOOP_USER_NAME`，决定读 HDFS 的身份。
+  集群侧一般是 `hdfs` / `hive` / `root`，写错了是 `Permission denied`。
 - 连接器：内置 mysql/postgres/hive/clickhouse/excel/sqlserver 与三方连接器**一律**以插件 jar 放在 `lib/connectors/`；
   三方连接器把 SPI 实现打成 jar（依赖 lib/ 里没有的驱动时需自带）丢进去即可（见该目录 README）。
 
