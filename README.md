@@ -79,6 +79,44 @@ Arrow 列存储在内存中**不动**，只有行号在 Map / Sort 中重排；�
 
 ---
 
+## 界面展示
+
+Dojao 内置了一个现代化、暗黑风格的 Web 控制台，用于实时观测执行状态、监控底层资源以及进行 AI 智能问数。
+
+### 1. 交互式 SQL 编辑器
+
+支持跨源查询（如左侧的 `hive` 与 `mysql_catalog`），自动补全、高亮语法、查询耗时与结果实时反馈，并支持一键导出 CSV / Excel / 绘制图表。
+
+<p align="center">
+  <img src="docs/images/console-sql.png" alt="Dojao SQL Editor" width="900">
+</p>
+
+### 2. 任务管理与执行历史
+
+实时查看集群运行状态，追踪每条 Query 的执行耗时、返回行数、状态（已完成 / 失败）以及执行详情。
+
+<p align="center">
+  <img src="docs/images/console-tasks.png" alt="Dojao Console - Tasks" width="900">
+</p>
+
+### 3. 集群与节点资源监控
+
+直观展示集群的 CPU、物理内存、JVM 堆与线程。内存不足时的磁盘溢写过程全透明可见，彻底告别 OOM 黑盒。
+
+<p align="center">
+  <img src="docs/images/console-monitor.png" alt="Dojao Console - Monitor" width="900">
+</p>
+
+### 4. 原生 AI Agent（智能问数）
+
+内置流式 ReAct Agent。你只需用自然语言提问（如“帮我分析每日营业额”），AI 将自动规划、生成并执行 SQL，最终直接渲染出可视化图表。
+
+<p align="center">
+  <img src="docs/images/console-ai.png" alt="Dojao AI Agent" width="900">
+</p>
+
+---
+
 ## 架构总览（模块）
 
 | 模块 | 职责 |
