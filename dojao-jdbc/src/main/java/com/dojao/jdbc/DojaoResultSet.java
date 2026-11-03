@@ -31,6 +31,11 @@ public class DojaoResultSet implements ResultSet {
         this.rowCount = response.getRowsCount();
     }
 
+    /** 用于元数据构造的合成结果集（无关联 Statement），{@link #getStatement()} 返回 null。 */
+    DojaoResultSet(QueryResponse response) {
+        this(null, response);
+    }
+
     public QueryResponse getResponse() { return response; }
 
     // ==================== Cursor ====================

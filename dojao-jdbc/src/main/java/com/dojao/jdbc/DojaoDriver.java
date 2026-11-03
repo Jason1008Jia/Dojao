@@ -38,7 +38,11 @@ public class DojaoDriver implements Driver {
         int colonIdx = address.indexOf(':');
         if (colonIdx >= 0) {
             host = address.substring(0, colonIdx);
-            port = Integer.parseInt(address.substring(colonIdx + 1));
+            try {
+                port = Integer.parseInt(address.substring(colonIdx + 1));
+            } catch (NumberFormatException e) {
+                throw new SQLException("Invalid port in JDBC URL: " + url, e);
+            }
         } else {
             host = address;
             port = DojaoDriverInfo.DEFAULT_PORT;
@@ -60,7 +64,16 @@ public class DojaoDriver implements Driver {
 
     @Override
     public DriverPropertyInfo[] getPropertyInfo(String url, Properties info) {
-        return new DriverPropertyInfo[0];
+        String userName = info == null ? null : info.getProperty("user");
+        DriverPropertyInfo user = new DriverPropertyInfo("user", userName);
+        user.description = "Dojao user (reserved; authentication is not enforced yet)";
+        user.required = false;
+
+        DriverPropertyInfo password = new DriverPropertyInfo("password", null);
+        password.description = "Dojao password (reserved; authentication is not enforced yet)";
+        password.required = false;
+
+        return new DriverPropertyInfo[]{user, password};
     }
 
     @Override

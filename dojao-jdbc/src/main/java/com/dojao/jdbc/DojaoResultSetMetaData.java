@@ -4,7 +4,6 @@ import com.dojao.core.rpc.Column;
 
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
-import java.sql.Types;
 import java.util.List;
 
 /**
@@ -35,7 +34,7 @@ public class DojaoResultSetMetaData implements ResultSetMetaData {
 
     @Override
     public int getColumnType(int column) {
-        return sqlType(columns.get(column - 1).getType());
+        return JdbcMetadata.sqlType(columns.get(column - 1).getType());
     }
 
     @Override
@@ -61,24 +60,4 @@ public class DojaoResultSetMetaData implements ResultSetMetaData {
     @Override public String getCatalogName(int column) { return ""; }
     @Override public <T> T unwrap(Class<T> iface) throws SQLException { throw DojaoConnection.notSupported(); }
     @Override public boolean isWrapperFor(Class<?> iface) { return false; }
-
-    private static int sqlType(String typeName) {
-        if (typeName == null) return Types.VARCHAR;
-        return switch (typeName.toUpperCase()) {
-            case "VARCHAR", "CHAR", "TEXT" -> Types.VARCHAR;
-            case "INTEGER", "INT" -> Types.INTEGER;
-            case "BIGINT" -> Types.BIGINT;
-            case "SMALLINT" -> Types.SMALLINT;
-            case "TINYINT" -> Types.TINYINT;
-            case "FLOAT", "REAL" -> Types.FLOAT;
-            case "DOUBLE" -> Types.DOUBLE;
-            case "DECIMAL", "NUMERIC" -> Types.DECIMAL;
-            case "BOOLEAN" -> Types.BOOLEAN;
-            case "DATE" -> Types.DATE;
-            case "TIME" -> Types.TIME;
-            case "TIMESTAMP" -> Types.TIMESTAMP;
-            case "BINARY", "VARBINARY", "BLOB" -> Types.BLOB;
-            default -> Types.VARCHAR;
-        };
-    }
 }

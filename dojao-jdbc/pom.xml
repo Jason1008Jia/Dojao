@@ -36,4 +36,82 @@
         </dependency>
     </dependencies>
 
+    <build>
+        <plugins>
+            <!-- 源码包：Maven Central 必需 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-source-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>attach-sources</id>
+                        <goals>
+                            <goal>jar-no-fork</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!-- Javadoc 包：Maven Central 必需；代码注释较少，doclint 已在父 POM 关闭 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-javadoc-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>attach-javadocs</id>
+                        <goals>
+                            <goal>jar</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!-- 胖 jar：把 Arrow Flight / gRPC / Netty 等运行时依赖打进 -all.jar，
+                 供 DataGrip / DBeaver 等只接受单个驱动 jar 的工具使用。
+                 不做 relocation，避免破坏 gRPC/Netty/Arrow 的类名与 native 库路径；
+                 合并 META-INF/services 以保留 java.sql.Driver 及各 provider 注册。 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <shadedArtifactAttached>true</shadedArtifactAttached>
+                            <shadedClassifierName>all</shadedClassifierName>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <artifactSet>
+                                <excludes>
+                                    <!-- 驱动运行时只用 dojao-core 的 rpc 消息，不需要元数据存储与底层数据库驱动；
+                                         排除它们也避免把 MySQL/SQLite 的 java.sql.Driver 注册混进本驱动。 -->
+                                    <exclude>com.mysql:mysql-connector-j</exclude>
+                                    <exclude>org.xerial:sqlite-jdbc</exclude>
+                                    <!-- 驱动不应绑定宿主的 SLF4J 实现 -->
+                                    <exclude>ch.qos.logback:logback-classic</exclude>
+                                    <exclude>ch.qos.logback:logback-core</exclude>
+                                </excludes>
+                            </artifactSet>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
 </project>

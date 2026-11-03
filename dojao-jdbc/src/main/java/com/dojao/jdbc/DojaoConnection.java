@@ -1,5 +1,8 @@
 package com.dojao.jdbc;
 
+import com.dojao.core.rpc.FlightActions;
+import org.apache.arrow.flight.ActionType;
+import org.apache.arrow.flight.CallOptions;
 import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.memory.BufferAllocator;
 
@@ -7,6 +10,7 @@ import java.sql.*;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 
 /**
  * JDBC Connection 实现，持有到 Master 的 Arrow Flight 客户端。
@@ -64,8 +68,31 @@ public class DojaoConnection implements Connection {
     @Override
     public boolean isClosed() { return closed; }
 
+    /**
+     * 通过一次 {@code listActions} RPC 真实探测服务器可达性。
+     *
+     * @param timeout 秒；&lt;= 0 表示不设置额外超时
+     */
     @Override
-    public boolean isValid(int timeout) { return !closed; }
+    public boolean isValid(int timeout) {
+        if (closed) {
+            return false;
+        }
+        try {
+            Iterable<ActionType> actions = timeout > 0
+                    ? client.listActions(CallOptions.timeout(timeout, TimeUnit.SECONDS))
+                    : client.listActions();
+            // 只要 RPC 成功返回即视为可达；Dojao master 会声明 execute_query
+            for (ActionType action : actions) {
+                if (FlightActions.EXECUTE_QUERY.equals(action.getType())) {
+                    return true;
+                }
+            }
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
 
     // ==================== Metadata ====================
 
