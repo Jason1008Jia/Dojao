@@ -18,6 +18,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
@@ -285,12 +286,10 @@ public final class WorkerManager {
             throw new IllegalStateException("Worker 不可接收任务，当前状态: " + s);
         }
         TaskSlot slot = new TaskSlot(task, poolName, aborter);
-        taskSlots.put(task.taskId(), slot);
-        progressSeq.incrementAndGet();
-        if (state == WorkerState.REGISTERED || state == WorkerState.IDLE) {
-            state = WorkerState.BUSY;   // 即时切忙，不等下一个心跳
-        }
-        Future<?> future = pool.submit(() -> {
+        // ★先建 FutureTask 再执行（旧实现 pool.submit() 之后才 put）：取消恰好落在 submit 与 put 之间时，
+        //   cancelTask 拿不到 Future ⇒ 线程照跑、taskFutures 留下永久僵尸条目（此后同 taskId 的取消全部落空）。
+        //   FutureTask 在 execute 前放进表里，cancel 即使先到也能 cancel(true) 掉「尚未启动」的任务。
+        FutureTask<Void> future = new FutureTask<>(() -> {
             slot.startNanos = System.nanoTime();   // 抢到线程（此后不再受看门狗「未及执行」判死）
             progressSeq.incrementAndGet();
             try {
@@ -302,8 +301,28 @@ public final class WorkerManager {
             } finally {
                 finishTask(task.taskId());
             }
+            return null;
         });
         taskFutures.put(task.taskId(), future);
+        taskSlots.put(task.taskId(), slot);
+        progressSeq.incrementAndGet();
+        if (state == WorkerState.REGISTERED || state == WorkerState.IDLE) {
+            state = WorkerState.BUSY;   // 即时切忙，不等下一个心跳
+        }
+        // 登记期间已被 cancelTask 摘掉的（future 或 slot 任一消失）→ 绝不执行，清干净后返回。
+        if (taskFutures.get(task.taskId()) != future || !taskSlots.containsKey(task.taskId())) {
+            future.cancel(true);
+            finishTask(task.taskId());
+            return;
+        }
+        try {
+            pool.execute(future);
+        } catch (RuntimeException rej) {
+            // 池已关闭 / 拒绝：不留半截登记，槽位立刻回收。
+            future.cancel(true);
+            finishTask(task.taskId());
+            throw rej;
+        }
     }
 
     /**

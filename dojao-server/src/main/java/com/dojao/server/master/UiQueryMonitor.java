@@ -252,20 +252,24 @@ public final class UiQueryMonitor implements QueryMonitor {
         }
         for (String id : ids) {
             List<MonitorSample> pts = new ArrayList<>();
-            long prevTs = -1L, prevRead = -1L, prevWrite = -1L;
+            long prevTs = -1L, prevRead = -1L, prevWrite = -1L, prevRx = -1L, prevTx = -1L;
             for (ResourceHistory.Sample s : h.recent(id, cap)) {
                 ResourceSummary r = s.resource();
-                // 磁盘 IO 是累计字节 → 按相邻采样点差分算速率（首点无前驱 / 计数回退 → 0）
+                // 磁盘 IO / 网络收发都是累计字节 → 按相邻采样点差分算速率（首点无前驱 / 计数回退 → 0）
                 long dt = prevTs > 0L ? s.tsMillis() - prevTs : 0L;
                 long readRate = ioRate(r.diskReadBytes(), prevRead, dt);
                 long writeRate = ioRate(r.diskWriteBytes(), prevWrite, dt);
+                long rxRate = ioRate(r.netRxBytes(), prevRx, dt);
+                long txRate = ioRate(r.netTxBytes(), prevTx, dt);
                 pts.add(new MonitorSample(s.tsMillis(), r.cpuUsagePct(),
                         r.heapUsedBytes(), r.heapMaxBytes(), r.threadCount(),
                         r.usedMemoryBytes(), r.totalMemoryBytes(),
-                        r.directUsedBytes(), readRate, writeRate));
+                        r.directUsedBytes(), readRate, writeRate, rxRate, txRate));
                 prevTs = s.tsMillis();
                 prevRead = r.diskReadBytes();
                 prevWrite = r.diskWriteBytes();
+                prevRx = r.netRxBytes();
+                prevTx = r.netTxBytes();
             }
             if (!pts.isEmpty()) series.put(id, pts);
         }
@@ -352,7 +356,7 @@ public final class UiQueryMonitor implements QueryMonitor {
             for (int j = 0; j < gs.size(); j++) {
                 if (j != termLocal) gidx[j] = anchor[i] + cursor++;
             }
-            // 数据流边：每个 Scan 叶子 → 下一段；终端收最上游一层
+            // 数据流边：叶子（各数据来源）→ 中间层依次串联（Join ⇒ Window…）→ 终端
             int leafCount = 0;
             for (Group g : gs) if (g.producer) leafCount++;
             List<List<Integer>> childLocal = new ArrayList<>(gs.size());
@@ -361,11 +365,13 @@ public final class UiQueryMonitor implements QueryMonitor {
                 // 无中间层（纯 join / 单聚合）：所有 Scan 叶子直接喂终端
                 for (int l = 0; l < leafCount; l++) childLocal.get(termLocal).add(l);
             } else {
-                // 有且仅一个中间层：叶子 → 中间层 → 终端
-                int midLocal = termLocal - 1;
-                for (int l = 0; l < leafCount; l++) childLocal.get(midLocal).add(l);
-                childLocal.get(termLocal).add(midLocal);
+                // 线性流水线：叶子 → 首个中间层 → 逐级中间层 → 终端
+                for (int l = 0; l < leafCount; l++) childLocal.get(leafCount).add(l);
+                for (int j = leafCount + 1; j < termLocal; j++) childLocal.get(j).add(j - 1);
+                childLocal.get(termLocal).add(termLocal - 1);
             }
+            // 上游各段已归属的溢写：终端段 = 算子总溢写 - 上游各段，保证「各段相加 = 总量」且不双计
+            long upstreamSpilled = 0L;
             for (int j = 0; j < gs.size(); j++) {
                 Group g = gs.get(j);
                 List<Integer> children = new ArrayList<>(childLocal.get(j).size());
@@ -376,21 +382,24 @@ public final class UiQueryMonitor implements QueryMonitor {
                             gidx[j], children, now,
                             o.rowsIn(), o.rowsOut(), o.inputBytes(), o.outputBytes(),
                             o.elapsedMs(), o.cpuMs(),
-                            o.currentMemBytes(), o.peakMemBytes(), o.spilledBytes(),
+                            o.currentMemBytes(), o.peakMemBytes(),
+                            Math.max(0L, o.spilledBytes() - upstreamSpilled),
                             o.avgRowsPerSec(), o.instantBytesPerSec(), o.avgBytesPerSec(),
                             o.failureMessage()));
                 } else {
                     long upRows = sumTaskRows(g.tasks);
                     long upBytesIn = sumTaskBytesIn(g.tasks);
                     long upBytesOut = sumTaskBytesOut(g.tasks);
+                    long upSpilled = sumTaskSpilled(g.tasks);
+                    upstreamSpilled += upSpilled;
                     long upElapsed = maxTaskElapsedMs(g.tasks, now);
                     String suffix = g.producer
                             ? "#scan:" + (g.source == null ? "" : g.source)
-                            : "#mid";
+                            : "#mid:" + (g.kind == null ? "" : g.kind.replace("→", "_"));
                     operators.add(stageNode(o, o.operatorId() + suffix, g.kind, g.tasks,
                             gidx[j], children, now,
                             0L, upRows, upBytesIn, upBytesOut,
-                            upElapsed, 0L, 0L, 0L, 0L,
+                            upElapsed, 0L, 0L, 0L, upSpilled,
                             avgRate(upRows, upElapsed), 0L, avgRate(upBytesOut, upElapsed),
                             firstTaskFailure(g.tasks)));
                 }
@@ -411,11 +420,15 @@ public final class UiQueryMonitor implements QueryMonitor {
     }
 
     /**
-     * 把叶子分布式算子的片段任务按「数据来源 / 任务类别」排成阶段组
-     * （[Scan 叶子 × 来源数] + [中间层 ≤1] + [终端恰 1]）。
+     * 把叶子分布式算子的片段任务按「数据来源 / 执行阶段」排成阶段组
+     * （[Scan 叶子 × 来源数] + [中间层按 Join ⇒ Aggregate ⇒ Window 排序] + [终端恰 1]）。
      *
-     * <p>不满足下列条件的算子返回 {@code null}（保持单节点，不误连边）：非分布式计算算子、
-     * 无 producer 片段、中间层多于 1 种（多级 join 打散链）、终端种类不是恰好 1 个。</p>
+     * <p>任务的三分类取自片段自身的 {@link OperatorSnapshot.Task#terminal()} 标志，不再靠任务类别
+     * 文本推断 —— join 与窗口压在同一 Worker 片段时，片段已被拆成 {@code Join} 中间段 + 窗口/聚合
+     * 段（见 core {@code fragmentTasks()}），各段都有独立行数/溢写/完成状态。</p>
+     *
+     * <p>不满足条件的算子返回 {@code null}（保持单节点，不误连边）：非分布式计算算子、
+     * 无 producer 片段、终端种类不是恰好 1 个。</p>
      */
     private static List<Group> planStages(OperatorSnapshot o) {
         List<OperatorSnapshot.Task> tasks = o.tasks();
@@ -428,26 +441,37 @@ public final class UiQueryMonitor implements QueryMonitor {
             if (t.producer()) {
                 String key = (t.source() == null || t.source().isEmpty()) ? "?" : t.source();
                 leaves.computeIfAbsent(key, k -> new ArrayList<>()).add(t);
-            } else if (t.kind() != null && t.kind().contains("Shuffle")) {
+            } else if (!t.terminal()) {
                 mids.computeIfAbsent(t.kind(), k -> new ArrayList<>()).add(t);
             } else {
                 terms.computeIfAbsent(t.kind(), k -> new ArrayList<>()).add(t);
             }
         }
-        if (leaves.isEmpty()) return null;      // 无来源片段：不是可拆的两段流水线
-        if (mids.size() > 1) return null;       // 多级打散链：展开易错连来源
+        if (leaves.isEmpty()) return null;      // 无来源片段：不是可拆的流水线
         if (terms.size() != 1) return null;     // 需恰好一个终端计算段承载权威输出
         List<Group> out = new ArrayList<>();
         for (Map.Entry<String, List<OperatorSnapshot.Task>> e : leaves.entrySet()) {
             out.add(new Group("Scan→Shuffle", e.getKey(), true, false, e.getValue()));
         }
-        for (Map.Entry<String, List<OperatorSnapshot.Task>> e : mids.entrySet()) {
+        // 中间层按阶段先后排序（Join → Aggregate → Window），同类保持片段派发顺序
+        List<Map.Entry<String, List<OperatorSnapshot.Task>>> midList =
+                new ArrayList<>(mids.entrySet());
+        midList.sort(Comparator.comparingInt(e -> stageRank(e.getKey())));
+        for (Map.Entry<String, List<OperatorSnapshot.Task>> e : midList) {
             out.add(new Group(e.getKey(), null, false, false, e.getValue()));
         }
         for (Map.Entry<String, List<OperatorSnapshot.Task>> e : terms.entrySet()) {
             out.add(new Group(e.getKey(), null, false, true, e.getValue()));
         }
         return out;
+    }
+
+    /** 中间层阶段先后：Join 先于 Aggregate，Aggregate 先于 Window（同一片段的执行顺序）。 */
+    private static int stageRank(String kind) {
+        if (kind == null) return 2;
+        if (kind.startsWith("Join")) return 0;
+        if (kind.startsWith("Aggregate")) return 1;
+        return 2;
     }
 
     /** 片段可拆分为多来源 Scan 叶子的分布式计算算子（write/scan/未知类型不拆）。 */
@@ -547,6 +571,13 @@ public final class UiQueryMonitor implements QueryMonitor {
     private static long sumTaskRows(List<OperatorSnapshot.Task> tasks) {
         long sum = 0L;
         for (OperatorSnapshot.Task t : tasks) sum += t.rowsOut();
+        return sum;
+    }
+
+    /** 阶段框的溢写 = 该段各任务（片段 / join 分区子任务）Worker 侧溢写之和。 */
+    private static long sumTaskSpilled(List<OperatorSnapshot.Task> tasks) {
+        long sum = 0L;
+        for (OperatorSnapshot.Task t : tasks) sum += t.spilledBytes();
         return sum;
     }
 

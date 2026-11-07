@@ -100,6 +100,18 @@ public final class Planner {
             new IdentityHashMap<>();
 
     /**
+     * 物化 CTE 的稳定哨兵 catalog 名（{@link MaterializedCteConnector#catalogFor}）—— 同一 Store
+     * 在本次规划内恒得同一名字，各引用点 / EXPLAIN / 日志可读；键按对象身份比较（与
+     * {@link #materializedCtes} 同构）。
+     */
+    private final Map<MaterializedCteScanOperator.Store, String> cteCatalogs = new IdentityHashMap<>();
+
+    /** 哨兵 catalog → 读取连接器（Store 形态；Worker 侧用 {@link MaterializedCteConnector#wire()}）。 */
+    private final Map<String, MaterializedCteConnector> cteConnectors = new java.util.HashMap<>();
+
+    private long cteCatalogSequence;
+
+    /**
      * 待生效的多维聚合展开（{@code ROLLUP/CUBE/GROUPING SETS}）。
      *
      * <p>{@link #buildGroupingSetsUnion} 选定「一趟扫描」形态后把展开描述放在这里，紧接着
@@ -210,10 +222,36 @@ public final class Planner {
         }
         // 估算行数自下而上传播（EXPLAIN 用）：叶子 / join 已有估算，透传型节点沿链继承
         root = propagateEstimates(root);
+        // 数据来源可见性：把分布式节点折叠掉的基表 Scan 展开成仅展示的来源节点（不参与优化 / 执行）
+        root = attachDataSources(root);
         // 列裁剪审计（保险丝）：让漏传列集的分布式扫描在规划期告警 / 报错，而非运行期静默读全表
         ColumnPruningAudit.audit(root);
+        // 计划完整性审计（保险丝）：逻辑计划里的窗口在物理计划里必须一个不少；窗口阶段字段必须自洽。
+        // 物化 CTE 的查询体独立惰性规划、不在主计划树内，跳过计数以免误报。
+        PlanAudit.audit(logicalPlan, root, materializedCtes);
         String explain = PhysicalPlanPrinter.print(root);
-        return new PhysicalPlan(root, explain);
+        // 物化 CTE 的落盘目录 / wire 载荷随查询生命周期回收：分布式路径不创建
+        // MaterializedCteScanOperator，扫描算子 → Store 的关闭链路不成立，必须在计划收尾释放。
+        return new PhysicalPlan(root, explain, this::releaseMaterializedCtes);
+    }
+
+    /**
+     * 回收本次规划产生的全部物化 CTE 资源（落盘目录 + 缓存载荷），并清空规划期映射。
+     * 幂等：由 {@link PhysicalPlan#close()} 在算子链关闭后调用，失败 / 取消路径同样调用。
+     */
+    public void releaseMaterializedCtes() {
+        List<MaterializedCteScanOperator.Store> stores = new ArrayList<>();
+        for (MaterializedCteScanOperator.Store store : materializedCtes.values()) {
+            if (!stores.contains(store)) {
+                stores.add(store);
+            }
+        }
+        materializedCtes.clear();
+        cteCatalogs.clear();
+        cteConnectors.clear();
+        for (MaterializedCteScanOperator.Store store : stores) {
+            store.release();
+        }
     }
 
     // ==================== 顶层 ORDER BY / LIMIT / OFFSET ====================
@@ -820,7 +858,15 @@ public final class Planner {
         return plan;
     }
 
-    /** 内联 Select 的 FROM 关系（CTE 引用 → 派生表），并在派生表内递归展开嵌套 WITH。 */
+    /**
+     * 内联 Select 的 FROM 关系（CTE 引用 → 派生表），并递归展开：
+     * <ul>
+     *   <li>派生表内部的嵌套 WITH / CTE 引用；</li>
+     *   <li>标量子查询 / EXISTS / IN 子查询的内层计划（其中 FROM 也可能引用外层 CTE，
+     *       并可能自带 WITH —— 旧实现只看 fromRelations，这些位置原样留着一个空
+     *       catalog 的「表引用」，规划时被当作空表扫描 ⇒ 静默少行）。</li>
+     * </ul>
+     */
     private static LogicalPlan inlineSelect(LogicalPlan.Select s, Map<String, LogicalPlan.CteDef> ctes) {
         List<LogicalPlan.ResolvedRelation> rels = new ArrayList<>(s.fromRelations().size());
         boolean changed = false;
@@ -829,11 +875,30 @@ public final class Planner {
             if (out != rel) changed = true;
             rels.add(out);
         }
+        List<Expression.ScalarSubquery> subs = s.scalarSubqueries();
+        if (!subs.isEmpty()) {
+            List<Expression.ScalarSubquery> inlined = new ArrayList<>(subs.size());
+            boolean subChanged = false;
+            for (Expression.ScalarSubquery sub : subs) {
+                LogicalPlan inner = inlineCtes(sub.inner(), ctes);
+                if (inner == sub.inner()) {
+                    inlined.add(sub);
+                    continue;
+                }
+                subChanged = true;
+                inlined.add(new Expression.ScalarSubquery(
+                        inner, sub.originalText(), sub.exists(), sub.negated()));
+            }
+            if (subChanged) {
+                subs = inlined;
+                changed = true;
+            }
+        }
         if (!changed) {
             return s;
         }
         return new LogicalPlan.Select(s.selectItems(), rels, s.joins(), s.where(),
-                s.groupBy(), s.having(), s.scalarSubqueries(), s.orderBy(), s.limit(), s.offset(),
+                s.groupBy(), s.having(), subs, s.orderBy(), s.limit(), s.offset(),
                 s.distinct());
     }
 
@@ -886,6 +951,11 @@ public final class Planner {
                     countCteRefs(body, counts);
                 }
             }
+            // 标量子查询 / EXISTS / IN 子查询的内层同样可能引用 CTE（内联后同一 body 对象）——
+            // 漏统计会退化成「每个引用各规划一次」。
+            for (Expression.ScalarSubquery sub : s.scalarSubqueries()) {
+                countCteRefs(sub.inner(), counts);
+            }
         } else if (plan instanceof LogicalPlan.SetOperation so) {
             countCteRefs(so.left(), counts);
             countCteRefs(so.right(), counts);
@@ -895,6 +965,8 @@ public final class Planner {
             countCteRefs(ins.query(), counts);
         } else if (plan instanceof LogicalPlan.CreateTableAsSelect ctas) {
             countCteRefs(ctas.query(), counts);
+        } else if (plan instanceof LogicalPlan.CreateView cv) {
+            countCteRefs(cv.query(), counts);
         }
     }
 
@@ -914,6 +986,9 @@ public final class Planner {
                 }
                 registerSharedBodies(body, counts);
             }
+            for (Expression.ScalarSubquery sub : s.scalarSubqueries()) {
+                registerSharedBodies(sub.inner(), counts);
+            }
         } else if (plan instanceof LogicalPlan.SetOperation so) {
             registerSharedBodies(so.left(), counts);
             registerSharedBodies(so.right(), counts);
@@ -923,6 +998,8 @@ public final class Planner {
             registerSharedBodies(ins.query(), counts);
         } else if (plan instanceof LogicalPlan.CreateTableAsSelect ctas) {
             registerSharedBodies(ctas.query(), counts);
+        } else if (plan instanceof LogicalPlan.CreateView cv) {
+            registerSharedBodies(cv.query(), counts);
         }
     }
 
@@ -942,16 +1019,67 @@ public final class Planner {
                 node.operator(), node.outputColumns(), explain);
     }
 
-    /** 物化 CTE 引用点的扫描叶子（普通叶子：列裁剪会在上层按需插 Project）。 */
+    /**
+     * 物化 CTE 引用点的本地扫描叶子（无 Worker / 本地扫描时；列裁剪会在上层按需插 Project）。
+     *
+     * <p>谓词来源与基表扫描同口径：{@code rel.filter()}(关系自带谓词，展平派生表 / 内联 CTE 时
+     * 合并进来) + {@code extraPredicate}(单表 WHERE 下推)。两者都必须应用 —— 只认后者会让
+     * 「CTE 引用 + 展平进来的 WHERE」静默丢过滤条件（多返回行）。</p>
+     */
     private PhysicalNode buildMaterializedCteScan(MaterializedCteScanOperator.Store store,
                                                   LogicalPlan.ResolvedRelation rel,
                                                   Optional<String> extraPredicate) {
         PhysicalNode node = new PhysicalNode("MaterializedCte[" + rel.table() + "]",
                 new MaterializedCteScanOperator(store), store.columns(), List.of());
-        if (extraPredicate.isPresent()) {
-            node = applyFilterIfSimple(node, extraPredicate.get(), "物化 CTE 外层 WHERE");
+        List<String> parts = new ArrayList<>(2);
+        rel.filter().ifPresent(f -> parts.add(SqlTextUtil.stripQualifiers(f.text())));
+        extraPredicate.ifPresent(parts::add);
+        if (!parts.isEmpty()) {
+            node = applyFilterIfSimple(node, String.join(" AND ", parts), "物化 CTE 谓词");
         }
         return node;
+    }
+
+    /**
+     * 物化 CTE 引用点 → <b>哨兵基表关系</b>（subquery 清空、catalog 换成
+     * {@code __dojao_cte__<n>_<名>}）。这样它和普通基表一样参与展平 / 分布式 join / 分布式聚合 /
+     * 分布式扫描 —— 物化结果随切片载荷下发 Worker，不再因为「引用点不是基表」整条链回退 Master。
+     *
+     * <p>列集 / 别名 / 外层谓词原样保留；参数不变（非物化 CTE）时原样返回。</p>
+     */
+    private LogicalPlan.ResolvedRelation asCteBase(LogicalPlan.ResolvedRelation rel) {
+        MaterializedCteScanOperator.Store store = materializedCtes.get(rel.subquery().get());
+        if (store == null) {
+            return rel;
+        }
+        String catalog = cteCatalogs.get(store);
+        if (catalog == null) {
+            catalog = MaterializedCteConnector.catalogFor(store.name(), ++cteCatalogSequence);
+            cteCatalogs.put(store, catalog);
+            cteConnectors.put(catalog, new MaterializedCteConnector(store));
+        }
+        return new LogicalPlan.ResolvedRelation(catalog, "cte", rel.table(), rel.alias(),
+                rel.columns(), rel.filter(), Optional.empty());
+    }
+
+    /** 哨兵 catalog 的读取连接器（Store 形态）；非哨兵 / 未登记 → {@code null}。 */
+    private MaterializedCteConnector cteConnectorOf(String catalog) {
+        return MaterializedCteConnector.isCteCatalog(catalog) ? cteConnectors.get(catalog) : null;
+    }
+
+    /**
+     * 按 catalog 取连接器：物化 CTE 的哨兵 catalog 走 {@link MaterializedCteConnector}（不经过
+     * catalog 注册表 —— Worker 不认识该名字，且 Master 侧连接器必须持有 Store），其余照旧。
+     */
+    private DojaoConnector connectorFor(String catalog) {
+        MaterializedCteConnector cte = cteConnectorOf(catalog);
+        if (cte != null) {
+            return cte;
+        }
+        if (MaterializedCteConnector.isCteCatalog(catalog)) {
+            throw new IllegalStateException("未登记的物化 CTE catalog: " + catalog);
+        }
+        return context.connectorProvider().get(catalog);
     }
 
     /** INSERT INTO ... SELECT：内层 SELECT 读链 → TableSink 写目标表。INSERT OVERWRITE 走 buildOverwriteInsert。 */
@@ -1468,13 +1596,13 @@ public final class Planner {
     private PhysicalNode buildScan(LogicalPlan.ResolvedRelation rel,
                                    Optional<String> extraPredicate,
                                    Set<String> requiredCols) {
+        // 多引用 CTE：查询体已由共享 Store 物化一次 → 正文按基表形态走常规扫描路径
+        // （有 Worker 即分布式扫描，物化切片随载荷下发；否则本地重放叶子），不再整链回退 Master。
+        if (rel.subquery().isPresent() && materializedCtes.containsKey(rel.subquery().get())) {
+            rel = asCteBase(rel);
+        }
         // 派生表（FROM 子查询）：递归规划内层查询，外层 WHERE 无法下推 → 转成 Filter
         if (rel.subquery().isPresent()) {
-            // 多引用 CTE：查询体已由共享 Store 物化一次 → 这里只挂重放叶子
-            MaterializedCteScanOperator.Store materialized = materializedCtes.get(rel.subquery().get());
-            if (materialized != null) {
-                return buildMaterializedCteScan(materialized, rel, extraPredicate);
-            }
             // 表函数（FROM TABLE(fn(常量))）：表生成器语义，独立切片，无 LATERAL / 列引用
             if (rel.subquery().get() instanceof LogicalPlan.TableFunction tf) {
                 return buildTableFunction(tf);
@@ -1528,10 +1656,16 @@ public final class Planner {
             }
         }
 
+        // 本地回退：物化 CTE 引用点用重放叶子（保留 Store 的扫描实例计数 → 查询结束删溢写目录）
+        MaterializedCteConnector cte = cteConnectorOf(rel.catalog());
+        if (cte != null) {
+            return buildMaterializedCteScan(cte.store(), rel, extraPredicate);
+        }
+
         // 统一使用 ParallelTableScanOperator：并行度 = 1 即等价旧 TableScanOperator（整表串行扫描）
         List<DojaoConnector> conns = new ArrayList<>(parallelism);
         for (int i = 0; i < parallelism; i++) {
-            conns.add(context.connectorProvider().get(rel.catalog()));
+            conns.add(connectorFor(rel.catalog()));
         }
         ParallelTableScanOperator scan = new ParallelTableScanOperator(conns, req, parallelism);
         scan.setFetchLimit(scanFetchRows);   // 顶层 LIMIT 下推（0 = 不下推）
@@ -1705,14 +1839,15 @@ public final class Planner {
                                List<AggregationSpec> aggregations, List<CaseProjection> caseProjections,
                                String havingFilter, List<String> outputColumns,
                                List<StageScheduler.DerivedProjection> projections,
-                               StageScheduler.DerivedWindow window) {
+                               StageScheduler.DerivedWindow window,
+                               List<String> outerKeys, List<AggregationSpec> outerAggregations) {
 
         /** 聚合型派生源的便捷构造（无投影列）。 */
         DerivedPlan(ReadRequest innerRequest, List<String> innerKeys,
                     List<AggregationSpec> aggregations, List<CaseProjection> caseProjections,
                     String havingFilter, List<String> outputColumns) {
             this(innerRequest, innerKeys, aggregations, caseProjections, havingFilter, outputColumns,
-                    List.of(), null);
+                    List.of(), null, List.of(), List.of());
         }
 
         /** 投影型派生源的便捷构造（无窗口）。 */
@@ -1721,7 +1856,17 @@ public final class Planner {
                     String havingFilter, List<String> outputColumns,
                     List<StageScheduler.DerivedProjection> projections) {
             this(innerRequest, innerKeys, aggregations, caseProjections, havingFilter, outputColumns,
-                    projections, null);
+                    projections, null, List.of(), List.of());
+        }
+
+        /** 窗口型派生源的便捷构造（无二级聚合）。 */
+        DerivedPlan(ReadRequest innerRequest, List<String> innerKeys,
+                    List<AggregationSpec> aggregations, List<CaseProjection> caseProjections,
+                    String havingFilter, List<String> outputColumns,
+                    List<StageScheduler.DerivedProjection> projections,
+                    StageScheduler.DerivedWindow window) {
+            this(innerRequest, innerKeys, aggregations, caseProjections, havingFilter, outputColumns,
+                    projections, window, List.of(), List.of());
         }
 
         /** true = 投影型派生源（无聚合，逐行表达式投影）。 */
@@ -1732,6 +1877,11 @@ public final class Planner {
         /** true = 窗口型派生源（无聚合，单窗口组窗口函数）。 */
         boolean isWindow() {
             return window != null;
+        }
+
+        /** true = 两级聚合派生体（{@code max(sum(x))}）：inner 聚合后再跑 outer 聚合。 */
+        boolean isTwoLevel() {
+            return outerAggregations != null && !outerAggregations.isEmpty();
         }
     }
 
@@ -1902,7 +2052,7 @@ public final class Planner {
         String schema = rel.schema(), table = rel.table();
         List<String> outCols = new ArrayList<>(rel.columns());
         int parallelism = Math.max(1, context.parallelism());
-        DojaoConnector probeConn = context.connectorProvider().get(rel.catalog());
+        DojaoConnector probeConn = connectorFor(rel.catalog());
         DistributedScanOperator scan = new DistributedScanOperator(
                 req, parallelism, probeConn, context.workerGateway(), rel.catalog(), workers);
         scan.setFetchLimit(scanFetchRows);   // 顶层 LIMIT 下推（0 = 不下推）
@@ -1976,9 +2126,10 @@ public final class Planner {
         if (rel.subquery().isEmpty()) {
             return rel;
         }
-        // 物化的多引用 CTE 不得展平：展平会把「只执行一次」退化成每个引用各扫一遍基表。
+        // 物化的多引用 CTE 不得展平（展平会把「只执行一次」退化成每个引用各扫一遍基表），
+        // 但可以换成等价的「哨兵基表」：物化结果随切片载荷下发，join / 聚合 / 窗口照常分布式。
         if (materializedCtes.containsKey(rel.subquery().get())) {
-            return rel;
+            return asCteBase(rel);
         }
         LogicalPlan inner = rel.subquery().get();
         if (!(inner instanceof LogicalPlan.Select s)) {
@@ -2129,7 +2280,12 @@ public final class Planner {
                 if (distributed != null) {
                     return distributed;
                 }
+                reportFallback("JOIN（" + (joins.size() + 1) + " 表）无法分布式执行，已回退 Master 单机 join");
+            } else {
+                reportFallback("JOIN（" + (joins.size() + 1) + " 表）无健康 Worker");
             }
+        } else if (hasUnnest && context.distributedExecution()) {
+            reportFallback("JOIN 含 UNNEST 关系（需 Master 逐页展开 LATERAL 结果），join 不下沉");
         }
 
         Map<String, PhysicalNode> scans = new LinkedHashMap<>();
@@ -2180,7 +2336,7 @@ public final class Planner {
     private List<Field> declaredRightFields(LogicalPlan.ResolvedRelation rel) {
         if (rel == null) return null;
         if (rel.subquery().isPresent()) return declaredDerivedFields(rel);
-        DojaoConnector connector = context.connectorProvider().get(rel.catalog());
+        DojaoConnector connector = connectorFor(rel.catalog());
         if (connector == null) return null;
         try {
             List<Field> fields = connector.sourceFields(rel.catalog(), rel.schema(), rel.table(),
@@ -2206,8 +2362,19 @@ public final class Planner {
         if (cols.isEmpty()) return null;
         Map<String, Field> baseFields = new HashMap<>();
         for (LogicalPlan.ResolvedRelation r : s.fromRelations()) {
-            if (r.subquery().isPresent()) return null;   // 嵌套派生 → 不做静态推断
-            DojaoConnector connector = context.connectorProvider().get(r.catalog());
+            if (r.subquery().isPresent()) {
+                // 嵌套派生 / 已内联的 CTE：递归推它的声明列，作为本层的基础类型来源。
+                // 旧实现在此直接 return null —— 只要内层 from 是派生表（CTE 内联后必然如此），
+                // 空 build 侧的 join 就退化成「只有左列」的短 schema，上层谓词找不到
+                // __subq_val（EXISTS / IN 去相关）而报错。
+                List<Field> nested = declaredDerivedFields(r);
+                if (nested == null) return null;
+                for (Field f : nested) {
+                    baseFields.putIfAbsent(f.getName().toLowerCase(Locale.ROOT), f);
+                }
+                continue;
+            }
+            DojaoConnector connector = connectorFor(r.catalog());
             if (connector == null) return null;
             try {
                 List<Field> fs = connector.sourceFields(r.catalog(), r.schema(), r.table(), r.columns());
@@ -2268,36 +2435,10 @@ public final class Planner {
 
         JoinType jt = mapJoinType(ji.joinType());
 
-        List<String> leftKeys = new ArrayList<>();
-        List<String> rightKeys = new ArrayList<>();
-
-        String cond = SqlTextUtil.stripQualifiers(ji.condition().text());
-        List<String> conjuncts = SqlTextUtil.splitTopLevelKeyword(cond, "AND");
-        for (String c : conjuncts) {
-            if (c.isBlank()) continue;
-            List<String> sides = SqlTextUtil.splitTopLevelEquals(c);
-            if (sides.size() != 2) {
-                throw unsupported("非等值 JOIN 条件: " + c);
-            }
-            String a = SqlTextUtil.stripQualifier(sides.get(0));
-            String b = SqlTextUtil.stripQualifier(sides.get(1));
-            boolean aInLeft = left.hasColumn(a), aInRight = right.hasColumn(a);
-            boolean bInLeft = left.hasColumn(b), bInRight = right.hasColumn(b);
-            if (aInLeft && bInRight) {
-                leftKeys.add(a);
-                rightKeys.add(b);
-            } else if (bInLeft && aInRight) {
-                leftKeys.add(b);
-                rightKeys.add(a);
-            } else {
-                // 带出两侧实际可见的列：键名对不上时，最常见的原因是某一侧的输出列集不合预期
-                // （典型 = 派生表 select * 未展开真实列名）—— 只报键名等于让用户靠猜。
-                throw unsupported(joinKeyError(ji, c, left.outputColumns(), right.outputColumns()));
-            }
-        }
-        if (leftKeys.isEmpty()) {
-            throw unsupported("未找到等值 JOIN 键: " + cond);
-        }
+        JoinKeys keys = parseJoinKeys(new ArrayList<>(left.outputColumns()),
+                new ArrayList<>(right.outputColumns()), ji);
+        List<String> leftKeys = keys.leftKeys();
+        List<String> rightKeys = keys.rightKeys();
 
         // 恒定并行 HashJoin：两侧各一个 HashPartitionOperator（每分区有界队列 + 后台分发线程），
         // N 个 join 工作线程按分区号各跑各的 build/probe/send。相同 join key 必然落到同一分区号，
@@ -2315,7 +2456,8 @@ public final class Planner {
                 rightPart, right.outputColumns(), right);
         HashJoinOperator join = new HashJoinOperator(
                 leftPart, rightPart, leftKeys, rightKeys, jt,
-                context.memoryLimit(), partitions, declaredRightFields(rightRel));
+                context.memoryLimit(), partitions, declaredRightFields(rightRel), null, false,
+                keys.onLeftFilter(), keys.onRightFilter());
         List<String> outCols = joinOutputColumns(jt, left.outputColumns(), right.outputColumns(),
                 leftKeys, rightKeys);
         String name = "HashJoin[" + jt + ", " + leftKeys + "=" + rightKeys + "]";
@@ -2356,8 +2498,8 @@ public final class Planner {
         JoinType jt = mapJoinType(ji.joinType());
         int partitions = Math.max(1, context.parallelism());
         String queryId = "query-" + Long.toHexString(System.nanoTime());
-        DojaoConnector leftProbe = context.connectorProvider().get(leftRel.catalog());
-        DojaoConnector rightProbe = context.connectorProvider().get(rightRel.catalog());
+        DojaoConnector leftProbe = connectorFor(leftRel.catalog());
+        DojaoConnector rightProbe = connectorFor(rightRel.catalog());
         // 单表 WHERE 下推进 Worker 扫描：两侧过滤在扫描端执行，join 输入 / 回传数据量骤减。
         // 含数据源不认识的函数谓词 → 回退单机，由本地扫描后的 Filter 承接。
         if (!distributedFilterSupported(leftRel) || !distributedFilterSupported(rightRel)) {
@@ -2370,6 +2512,10 @@ public final class Planner {
                 leftRel.catalog(), leftRel.schema(), leftRel.table(), leftProbe, leftFilter,
                 rightRel.catalog(), rightRel.schema(), rightRel.table(), rightProbe, rightFilter,
                 jt, workers);
+        // ON 单侧残差谓词只在 HashJoinOperator 内实现（匹配阶段求值 + 孤儿行语义）→ 强制哈希。
+        if (keys.hasOnFilters()) {
+            algorithm = FragmentSpec.JoinAlgorithm.HASH;
+        }
         // 列裁剪下推到两侧扫描：列集 = 语法层 ColumnPruning 已裁剪的 relation 列（join 键必在其中）。
         // join 输出列序 = 「左扫描列 + 右扫描列」，与该列表严格一致（outputFields / 声明字段同源）。
         List<String> leftColumns = scanColumns(new ArrayList<>(leftRel.columns()), leftProbe, leftFilter);
@@ -2380,7 +2526,7 @@ public final class Planner {
                 rightRel.catalog(), rightRel.schema(), rightRel.table(), keys.rightKeys(),
                 jt, context.memoryLimit(), partitions,
                 context.workerGateway(), leftProbe, rightProbe, workers, leftFilter, rightFilter,
-                algorithm, leftColumns, rightColumns);
+                algorithm, leftColumns, rightColumns, keys.onLeftFilter(), keys.onRightFilter());
 
         List<String> outCols = joinOutputColumns(jt, new ArrayList<>(leftRel.columns()),
                 new ArrayList<>(rightRel.columns()), keys.leftKeys(), keys.rightKeys());
@@ -2460,8 +2606,8 @@ public final class Planner {
             // 投影型 / 窗口型派生源的分组键同样为空，但它们各有自己的派生体通道，不受此限。
             return null;
         }
-        DojaoConnector innerProbe = context.connectorProvider().get(dp.innerRequest().catalog());
-        DojaoConnector peerProbe = context.connectorProvider().get(peerRel.catalog());
+        DojaoConnector innerProbe = connectorFor(dp.innerRequest().catalog());
+        DojaoConnector peerProbe = connectorFor(peerRel.catalog());
         if (!distributedFilterSupported(peerRel)) {
             return null;   // peer 侧过滤含引擎函数 → 回退单机（本地 Filter 承接，结果正确）
         }
@@ -2477,6 +2623,10 @@ public final class Planner {
                     : parseJoinKeys(peerCols, dp.outputColumns(), ji);
         } catch (RuntimeException e) {
             return null;   // 无法解析等值键 → 回退单机
+        }
+        if (jk.hasOnFilters()) {
+            // 分布式派生 join 的 JoinStep 通道尚未携带 ON 残差谓词 → 回退单机（语义完整，本地支持）。
+            return null;
         }
         List<String> derivedKeys = leftIsDerived ? jk.leftKeys() : jk.rightKeys();
         List<String> peerKeys = leftIsDerived ? jk.rightKeys() : jk.leftKeys();
@@ -2496,7 +2646,7 @@ public final class Planner {
                 relScanFilter(peerRel),
                 jt, context.memoryLimit(), partitions,
                 context.workerGateway(), innerProbe, peerProbe, workers, dp.projections(), dp.window(),
-                joinAlgorithm);
+                dp.outerKeys(), dp.outerAggregations(), joinAlgorithm);
 
         List<String> outCols = leftIsDerived
                 ? joinOutputColumns(jt, dp.outputColumns(), peerCols, derivedKeys, peerKeys)
@@ -2504,6 +2654,7 @@ public final class Planner {
         String name = "DistributedDerivedJoin[" + jt + (leftIsDerived ? ", derived=L" : ", derived=R")
                 + (dp.isProjection() ? ", projection=" + dp.projections().size() : "")
                 + (dp.isWindow() ? ", window=" + dp.window().functions().size() : "")
+                + (dp.isTwoLevel() ? ", twoLevel=true" : "")
                 + (dp.isProjection() || dp.isWindow() ? "" : ", groupBy=" + dp.innerKeys())
                 + (dp.havingFilter() != null ? ", having=" + dp.havingFilter() : "")
                 + ", " + derivedKeys + "=" + peerKeys + ", algo=" + JoinExplain.label(joinAlgorithm)
@@ -2610,7 +2761,18 @@ public final class Planner {
         }
         LogicalPlan.ResolvedRelation baseRel = inner.fromRelations().get(0);
         if (baseRel.subquery().isPresent()) {
-            return null;   // 派生基表须为裸表（嵌套派生后置）
+            // 嵌套派生基表（多层子查询 / 多层 CTE）：内层若是「单裸表 + 裸列投影 + WHERE」等价形态，
+            // 先按 buildJoins 同款展平再继续 —— 展平是语义等价变换，让派生聚合仍能下沉，
+            // 而不是把整条 join 链压回 Master 本地执行。内层展平不了（聚合 / 窗口 / 改名 /
+            // 表达式投影 …）才保持原样返回 null。
+            LogicalPlan.ResolvedRelation flattened = tryFlattenSimpleDerived(baseRel);
+            if (flattened.subquery().isPresent()) {
+                // 两级聚合派生体（max(sum(x))）：内层自身是「单裸表 + GROUP BY」，与外层分组键相同
+                // ⇒ 分区键 = 分组键，两级都能在分区内算成终态（DA 中间层跑两段聚合）。
+                DerivedPlan twoLevel = planDerivedTwoLevel(derivedRel, inner, flattened);
+                return twoLevel;   // 不支持的形态 → null（回退单机）
+            }
+            baseRel = flattened;
         }
 
         // 分组键（裸列，groupBy 顺序去重）—— 与 buildAggregation 同一解析
@@ -2734,7 +2896,7 @@ public final class Planner {
 
         // 派生内层 WHERE（扩展①）：inner.where() + baseRel.filter()（优化器可能把谓词挂基表）合并为
         // 单一谓词再拆下推/承接。
-        DojaoConnector innerProbe = context.connectorProvider().get(baseRel.catalog());
+        DojaoConnector innerProbe = connectorFor(baseRel.catalog());
         String innerFilter = null;
         List<String> whereParts = new ArrayList<>(2);
         inner.where().ifPresent(e -> whereParts.add(SqlTextUtil.stripQualifiers(e.text())));
@@ -2809,6 +2971,159 @@ public final class Planner {
     }
 
     /**
+     * 解析<b>两级聚合</b>派生体 ——
+     * {@code (SELECT k, max(total) FROM (SELECT k, sum(x) AS total FROM 单裸基表 WHERE p GROUP BY k) t
+     *        WHERE … GROUP BY k)}（相关标量子查询 {@code (SELECT max(t.total) FROM t WHERE t.k = o.k)}
+     * 去相关后的典型形态）。
+     *
+     * <p><b>为什么能每分区算成终态</b>：派生流按<b>分组键 k</b>哈希分区（{@code innerKeys}），且
+     * 外层分组键与内层<b>相同</b>（{@code outerKeys == innerKeys}）⇒ 每个内层分组整组落在一个分区，
+     * 外层分组（由内层分组组成）也整组落在同一分区。于是 DA 中间层可以顺序执行
+     * 「内层聚合 → 外层聚合」，两级都是该分区的终态结果，与单机语义一致。</p>
+     *
+     * <p><b>保守条件</b>（任一不满足即回退单机）：内层须是既有单级聚合形态（复用 {@link #planDerived}）、
+     * 内层无 HAVING / 关系级谓词、外层无 WHERE / HAVING / 关系级谓词、外层分组键与内层不同、
+     * 外层聚合非内置五函数或输入列不在内层输出列中。</p>
+     */
+    private DerivedPlan planDerivedTwoLevel(LogicalPlan.ResolvedRelation derivedRel,
+                                            LogicalPlan.Select outer,
+                                            LogicalPlan.ResolvedRelation innerRel) {
+        // 外层谓词/HAVING 需要「外层聚合之后」求值，本路径只下沉两级聚合本身 ⇒ 保持回退。
+        if (outer.where().isPresent() || outer.having().isPresent()
+                || derivedRel.filter().isPresent()) {
+            return null;
+        }
+        DerivedPlan innerPlan = planDerived(unwrapPassThroughDerived(innerRel));
+        if (innerPlan == null || innerPlan.isProjection() || innerPlan.isWindow()
+                || innerPlan.isTwoLevel() || innerPlan.innerKeys().isEmpty()
+                || innerPlan.havingFilter() != null) {
+            return null;
+        }
+        // 外层分组键：裸列、∈ 内层输出列、且与内层分组键<b>同集合</b>（协分区不变量）。
+        List<String> outerKeys = new ArrayList<>();
+        for (Expression gb : outer.groupBy()) {
+            String col = SqlTextUtil.stripQualifier(gb.text().trim());
+            if (!SqlTextUtil.isSingleIdentifier(col)
+                    || !containsIgnoreCase(innerPlan.outputColumns(), col)) {
+                return null;
+            }
+            if (!containsIgnoreCase(outerKeys, col)) {
+                outerKeys.add(col);
+            }
+        }
+        if (outerKeys.isEmpty() || outerKeys.size() != innerPlan.innerKeys().size()) {
+            return null;
+        }
+        for (String k : innerPlan.innerKeys()) {
+            if (!containsIgnoreCase(outerKeys, k)) {
+                return null;
+            }
+        }
+
+        List<String> outerCols = new ArrayList<>(outerKeys);
+        List<AggregationSpec> outerAggs = new ArrayList<>();
+        boolean[] keySelected = new boolean[outerKeys.size()];
+        Set<String> builtinAggs = Set.of("COUNT", "SUM", "AVG", "MIN", "MAX");
+        for (LogicalPlan.SelectItem item : outer.selectItems()) {
+            String text = item.expression().text().trim();
+            Optional<SqlTextUtil.AggInfo> info = SqlTextUtil.parseAggregate(text);
+            if (info.isEmpty()) {
+                String col = SqlTextUtil.stripQualifier(text);
+                if (!SqlTextUtil.isSingleIdentifier(col)) {
+                    return null;
+                }
+                int ki = indexOfIgnoreCase(outerKeys, col);
+                if (ki < 0 || (item.alias().isPresent() && !item.alias().get().equals(col))) {
+                    return null;
+                }
+                keySelected[ki] = true;
+                continue;
+            }
+            SqlTextUtil.AggInfo a = info.get();
+            String fn = a.function().toUpperCase(Locale.ROOT);
+            if (!builtinAggs.contains(fn) || (a.star() && !"COUNT".equals(fn))) {
+                return null;
+            }
+            String outName = item.alias().orElse(aggOutputName(text));
+            String inputCol = null;
+            if (!a.star()) {
+                if (!SqlTextUtil.isColumnRef(a.arg())) {
+                    return null;
+                }
+                inputCol = SqlTextUtil.stripQualifier(a.arg());
+                if (!containsIgnoreCase(innerPlan.outputColumns(), inputCol)) {
+                    return null;
+                }
+            }
+            AggregationSpec spec = switch (fn) {
+                case "COUNT" -> a.star()
+                        ? AggregationSpec.count(outName)
+                        : AggregationSpec.count(inputCol, outName);
+                case "SUM" -> AggregationSpec.sum(inputCol, outName);
+                case "AVG" -> AggregationSpec.avg(inputCol, outName);
+                case "MIN" -> AggregationSpec.min(inputCol, outName);
+                default -> AggregationSpec.max(inputCol, outName);
+            };
+            outerAggs.add(spec);
+            outerCols.add(outName);
+        }
+        if (outerAggs.isEmpty()) {
+            return null;
+        }
+        for (boolean sel : keySelected) {
+            if (!sel) {
+                return null;   // 外层分组键未全部投影 → 派生体可见列与聚合输出不一致
+            }
+        }
+        return new DerivedPlan(innerPlan.innerRequest(), innerPlan.innerKeys(),
+                innerPlan.aggregations(), innerPlan.caseProjections(),
+                null, outerCols, List.of(), null, outerKeys, outerAggs);
+    }
+
+    /**
+     * 剥掉<b>纯透传</b>派生层（{@code c AS (SELECT k, v FROM <派生体>)}）：选择项全是裸列、无别名 /
+     * 分组 / 聚合 / 谓词 / DISTINCT / 排序 / LIMIT，且投影列集合与内层声明列集合同 → 语义等价于内层，
+     * 直接以最内层关系继续解析。两层聚合之间夹一层透传 CTE（如
+     * {@code WITH a AS (...) , c AS (SELECT region, mx FROM a)}）不应阻断两级聚合识别。
+     *
+     * <p>透传层内层是<b>裸表</b>时由 {@link #tryFlattenSimpleDerived} 负责；本方法只处理
+     * 「透传层套在派生体（聚合）之上」—— 循环剥离任意深度。物化 CTE 不剥（避免重复执行语义）。</p>
+     */
+    private LogicalPlan.ResolvedRelation unwrapPassThroughDerived(LogicalPlan.ResolvedRelation rel) {
+        LogicalPlan.ResolvedRelation cur = rel;
+        while (cur.subquery().isPresent()
+                && !materializedCtes.containsKey(cur.subquery().get())
+                && cur.filter().isEmpty()
+                && cur.subquery().get() instanceof LogicalPlan.Select s
+                && s.fromRelations().size() == 1 && s.joins().isEmpty()
+                && s.scalarSubqueries().isEmpty()
+                && s.groupBy().isEmpty() && s.having().isEmpty()
+                && !s.distinct() && s.orderBy().isEmpty()
+                && s.limit().isEmpty() && s.offset().isEmpty()) {
+            LogicalPlan.ResolvedRelation base = s.fromRelations().get(0);
+            if (base.subquery().isEmpty() || materializedCtes.containsKey(base.subquery().get())) {
+                break;   // 裸表 / 物化 CTE：交给 tryFlattenSimpleDerived 或保持回退
+            }
+            List<String> projected = new ArrayList<>();
+            boolean bare = true;
+            for (LogicalPlan.SelectItem item : s.selectItems()) {
+                String text = item.expression().text().trim();
+                if (item.alias().isPresent() || !SqlTextUtil.isColumnRef(text)) {
+                    bare = false;
+                    break;
+                }
+                projected.add(SqlTextUtil.stripQualifier(text));
+            }
+            if (!bare || projected.isEmpty()
+                    || !lowerSet(projected).equals(lowerSet(base.columns()))) {
+                break;
+            }
+            cur = base;
+        }
+        return cur;
+    }
+
+    /**
      * 解析<b>投影型</b>派生表 —— {@code (SELECT 裸列…, 表达式 AS 别名… FROM 单裸基表 WHERE p)}：无分组、
      * 无聚合，仅逐行物化表达式派生列。语义等价于「基表扫描 + 投影 + 过滤」，但派生列在 Worker
      * <b>Producer 侧、哈希分区之前</b>物化（{@code ExpressionProjectOperator}），随后按该层 join 键
@@ -2839,7 +3154,7 @@ public final class Planner {
         if (baseRel.subquery().isPresent()) {
             return null;   // 嵌套派生：应由 tryFlattenSimpleDerived 逐层展平（不在此重复）
         }
-        DojaoConnector probe = context.connectorProvider().get(baseRel.catalog());
+        DojaoConnector probe = connectorFor(baseRel.catalog());
         if (probe == null) {
             return null;
         }
@@ -2994,7 +3309,7 @@ public final class Planner {
         if (baseRel.subquery().isPresent()) {
             return null;   // 嵌套派生：应由 tryFlattenSimpleDerived 逐层展平（不在此重复）
         }
-        DojaoConnector probe = context.connectorProvider().get(baseRel.catalog());
+        DojaoConnector probe = connectorFor(baseRel.catalog());
         if (probe == null) {
             return null;
         }
@@ -3327,14 +3642,12 @@ public final class Planner {
         if (joins.isEmpty()) {
             return null;   // 无 join（单表）不走链式
         }
-        // CROSS 环节只允许出现在<b>最末层</b>，且其右表必须是<b>全局聚合派生源</b>（恒 1 行）——
-        // 「非相关标量子查询」去相关后的形状（build 侧单值广播到全部 join 分区，末层本机空键哈希 join）。
+        // CROSS 环节可出现在<b>任意层</b>，但其右表必须是<b>全局聚合派生源</b>（恒 1 行）——
+        // 「非相关标量子查询」去相关后的形状（build 侧单值广播到全部 join 分区，本机空键哈希 join）。
+        // 中间层 CROSS 同样成立：该层输出按<b>下一层左键</b>重哈希（StageScheduler 的
+        // MiddleJoinConsumer），而下一层左键在 CROSS 层是「本层左表全列」，行去向确定、build 侧
+        // 已 REPLICATE 到全部桶 ⇒ 每行都能在所属桶找到它那份单行副本。
         // 其余 CROSS（逗号连接 = 左深链左端不唯一、右表是普通基表要整份广播）仍后置回退单机。
-        for (int i = 0; i < joins.size(); i++) {
-            if (joins.get(i).joinType() == LogicalPlan.JoinType.CROSS && i != joins.size() - 1) {
-                return null;   // 中间层 CROSS 后置
-            }
-        }
 
         // 关系定位：键 = alias(rel)（已 normalize，与 buildJoins 一致）
         Map<String, LogicalPlan.ResolvedRelation> byAlias = new LinkedHashMap<>();
@@ -3362,8 +3675,8 @@ public final class Planner {
                 ? new ArrayList<>(firstLeft.columns()) : firstPlan.outputColumns();
         // 派生源无连接器元数据 → 探针取派生基表的连接器；累加体量不可知 → UNKNOWN
         DojaoConnector firstProbe = firstPlan == null
-                ? context.connectorProvider().get(firstLeft.catalog())
-                : context.connectorProvider().get(firstPlan.innerRequest().catalog());
+                ? connectorFor(firstLeft.catalog())
+                : connectorFor(firstPlan.innerRequest().catalog());
         sources.add(firstPlan == null ? null : derivedSource(firstPlan, firstProbe));
         String firstFilter = firstPlan == null ? relScanFilter(firstLeft) : null;
         // 左表（probe 侧）累计估算 —— 末层选型用它 + 右表体量跑完整决策（P1-a：可给出 BROADCAST）。
@@ -3403,8 +3716,8 @@ public final class Planner {
                 List<String> rightCols = rightPlan == null
                         ? new ArrayList<>(rightRel.columns()) : rightPlan.outputColumns();
                 DojaoConnector rightProbe = rightPlan == null
-                        ? context.connectorProvider().get(rightRel.catalog())
-                        : context.connectorProvider().get(rightPlan.innerRequest().catalog());
+                        ? connectorFor(rightRel.catalog())
+                        : connectorFor(rightPlan.innerRequest().catalog());
                 sources.add(rightPlan == null ? null : derivedSource(rightPlan, rightProbe));
                 // CROSS 环节（末层 + 右表是全局聚合派生源，恒 1 行）：无 join 键 —— build 侧整份
                 // 复制到每个分区（单值广播），probe 侧按<b>左表全列</b>打散。仅此形状可分布式。
@@ -3454,7 +3767,8 @@ public final class Planner {
                         rightFilter, algorithm,
                         rightPlan == null ? scanColumns(rightCols, rightProbe, rightFilter) : null,
                         // CROSS 环节的左（probe）侧分区键 = 本层左表的全列（见 StageScheduler.JoinLink）
-                        cross ? new ArrayList<>(accumCols) : null));
+                        cross ? new ArrayList<>(accumCols) : null,
+                        keys.onLeftFilter(), keys.onRightFilter()));
                 // 本层输出估算（EXPLAIN 末层行数 / 非末层累计下推）：左表的 join 键 ndv 拿不到
                 // （是上一层 join 的输出，连接器没有它的列统计）→ 传 UNKNOWN，由估算器按「维表报 pk、
                 // 事实表无统计」的形态用右侧 ndv 兜底；两侧都拿不到则退回外键假设（输出 ≈ 大的一侧）。
@@ -3548,7 +3862,7 @@ public final class Planner {
             kids.add(propagateEstimates(child));
         }
         PhysicalNode rebuilt = new PhysicalNode(node.name(), node.operator(),
-                node.outputColumns(), kids, node.estimatedRows());
+                node.outputColumns(), kids, node.estimatedRows(), node.sources());
         if (rebuilt.estimatedRows() >= 0L) {
             return rebuilt;
         }
@@ -3586,6 +3900,41 @@ public final class Planner {
             }
         }
         return est >= 0L ? rebuilt.withEstimate(est) : rebuilt;
+    }
+
+    /**
+     * 把分布式节点折叠掉的基表扫描展开为<b>仅展示</b>的来源节点（{@link PhysicalNode#sources()}）。
+     *
+     * <p>分布式 join / 窗口 / 聚合把「两侧扫描 → 分区 → join → 后续计算」整条链折叠成一个算子节点，
+     * EXPLAIN 里只剩 `DistributedChained[...]` 一行，用户看不到数据从哪张表来。这里用算子自述的
+     * {@link ScanColumnAware#scanColumnSets()}（列裁剪审计同一数据源）为每条基表扫描建一个 Scan 展示节点；
+     * 派生源（子查询 / CTE 流水线）标注为 {@code <pipeline>}。</p>
+     *
+     * <p>这些节点<b>不进入</b> {@link PhysicalNode#children()}，不参与列裁剪 / 估算 / 审计 / 执行。</p>
+     */
+    private static PhysicalNode attachDataSources(PhysicalNode node) {
+        if (node == null) return node;
+        List<PhysicalNode> kids = new ArrayList<>(node.children().size());
+        boolean kidsChanged = false;
+        for (PhysicalNode child : node.children()) {
+            PhysicalNode processed = attachDataSources(child);
+            kids.add(processed);
+            if (processed != child) kidsChanged = true;
+        }
+        List<PhysicalNode> sources = node.sources();
+        if (sources.isEmpty() && node.operator() instanceof ScanColumnAware aware) {
+            List<PhysicalNode> built = new ArrayList<>();
+            for (ScanColumnAware.ScanColumn scan : aware.scanColumnSets()) {
+                String name = "Scan[" + scan.relation() + "]"
+                        + (scan.derived() ? " <pipeline>" : "");
+                built.add(PhysicalNode.leaf(name, null,
+                        scan.columns() == null ? List.<String>of() : scan.columns()));
+            }
+            if (!built.isEmpty()) sources = built;
+        }
+        if (!kidsChanged && sources == node.sources()) return node;
+        return new PhysicalNode(node.name(), node.operator(), node.outputColumns(),
+                kids, node.estimatedRows(), sources);
     }
 
     /** 从 {@code Limit[offset=..., limit=...]} 显示名里取 limit；无该字段（如全量 Limit 节点）→ null。 */
@@ -3696,68 +4045,183 @@ public final class Planner {
         return min;
     }
 
-    /** 等值 join 键对：左键列名 + 右键列名（按 ON 条件顶层 AND 逐个合取解析）。 */
-    private record JoinKeys(List<String> leftKeys, List<String> rightKeys) {
+    /**
+     * 等值 join 键对 + ON 单侧残差谓词（按 ON 顶层 AND 逐个合取解析）。
+     *
+     * <p>残差谓词只引用一侧的列（如 {@code FULL JOIN ... ON l.k = r.k AND l.dt = '...'}）。它们
+     * <b>不能</b>下推到扫描：OUTER JOIN 的 ON 谓词为假时行不是被过滤掉，而是「未匹配」——
+     * 保留侧仍须 NULL 扩展输出。因此随 join 片段下发，由 Worker 内 {@code HashJoinOperator}
+     * 在匹配阶段求值（谓词为假的左行不参与探测、为假的右行不参与匹配，随后按孤儿行规则输出）。</p>
+     */
+    private record JoinKeys(List<String> leftKeys, List<String> rightKeys,
+                            String onLeftFilter, String onRightFilter) {
+        JoinKeys(List<String> leftKeys, List<String> rightKeys) {
+            this(leftKeys, rightKeys, null, null);
+        }
+
+        boolean hasOnFilters() {
+            return onLeftFilter != null || onRightFilter != null;
+        }
     }
 
-    /** 解析 ON 条件的等值 join 键（与 {@link #buildJoin} 同一逻辑，供分布式路径复用）。 */
+    /** 解析 ON 条件的等值 join 键 + 单侧残差谓词（单机 {@link #buildJoin} 与分布式路径共用）。 */
     private JoinKeys parseJoinKeys(List<String> leftCols, List<String> rightCols, LogicalPlan.JoinInfo ji) {
-        String cond = SqlTextUtil.stripQualifiers(ji.condition().text());
+        String cond = ji.condition().text();
         List<String> leftKeys = new ArrayList<>();
         List<String> rightKeys = new ArrayList<>();
-        for (String c : SqlTextUtil.splitTopLevelKeyword(cond, "AND")) {
-            if (c.isBlank()) continue;
+        List<String> leftResiduals = new ArrayList<>();
+        List<String> rightResiduals = new ArrayList<>();
+        for (String rawConjunct : SqlTextUtil.splitTopLevelKeyword(cond, "AND")) {
+            if (rawConjunct.isBlank()) continue;
+            String c = SqlTextUtil.stripQualifiers(rawConjunct);
             List<String> sides = SqlTextUtil.splitTopLevelEquals(c);
-            if (sides.size() != 2) {
-                throw unsupported("非等值 JOIN 条件: " + c);
-            }
-            String a = SqlTextUtil.stripQualifier(sides.get(0));
-            String b = SqlTextUtil.stripQualifier(sides.get(1));
-            boolean aInLeft = leftCols.contains(a), aInRight = rightCols.contains(a);
-            boolean bInLeft = leftCols.contains(b), bInRight = rightCols.contains(b);
-            if (aInLeft && bInRight) {
-                leftKeys.add(a);
-                rightKeys.add(b);
-            } else if (bInLeft && aInRight) {
-                leftKeys.add(b);
-                rightKeys.add(a);
-            } else {
+            if (sides.size() == 2) {
+                String a = SqlTextUtil.stripQualifier(sides.get(0));
+                String b = SqlTextUtil.stripQualifier(sides.get(1));
+                // 限定符优先（两侧有同名列时唯一的消歧依据）：h.id = u.uid 这类必须按别名定向。
+                List<String> rawSides = SqlTextUtil.splitTopLevelEquals(rawConjunct);
+                Integer sa = rawSides.size() == 2
+                        ? sideFromQualifiers(rawSides.get(0), ji.leftAlias(), ji.rightAlias()) : null;
+                Integer sb = rawSides.size() == 2
+                        ? sideFromQualifiers(rawSides.get(1), ji.leftAlias(), ji.rightAlias()) : null;
+                if (sa != null && sb != null && !sa.equals(sb)) {
+                    if (sa == 0) { leftKeys.add(a); rightKeys.add(b); }
+                    else { leftKeys.add(b); rightKeys.add(a); }
+                    continue;
+                }
+                boolean aInLeft = leftCols.contains(a), aInRight = rightCols.contains(a);
+                boolean bInLeft = leftCols.contains(b), bInRight = rightCols.contains(b);
+                if (aInLeft && bInRight) {
+                    leftKeys.add(a);
+                    rightKeys.add(b);
+                    continue;
+                }
+                if (bInLeft && aInRight) {
+                    leftKeys.add(b);
+                    rightKeys.add(a);
+                    continue;
+                }
+                // 不是跨侧等值键 —— 若只引用一侧，就是 ON 残差谓词（如 l.dt = '2026-08-23'）。
+                String side = residualSide(rawConjunct, c, leftCols, rightCols,
+                        ji.leftAlias(), ji.rightAlias());
+                if ("L".equals(side)) { leftResiduals.add(c); continue; }
+                if ("R".equals(side)) { rightResiduals.add(c); continue; }
                 throw unsupported(joinKeyError(ji, c, leftCols, rightCols));
             }
+            String side = residualSide(rawConjunct, c, leftCols, rightCols,
+                    ji.leftAlias(), ji.rightAlias());
+            if ("L".equals(side)) { leftResiduals.add(c); continue; }
+            if ("R".equals(side)) { rightResiduals.add(c); continue; }
+            throw unsupported("非等值 JOIN 条件（且不是单侧过滤，无法作为哈希匹配残差）: " + c);
         }
         if (leftKeys.isEmpty()) {
-            throw unsupported("未找到等值 JOIN 键: " + cond);
+            throw unsupported("未找到等值 JOIN 键: " + SqlTextUtil.stripQualifiers(cond));
         }
-        return new JoinKeys(leftKeys, rightKeys);
+        return new JoinKeys(leftKeys, rightKeys,
+                leftResiduals.isEmpty() ? null : String.join(" AND ", leftResiduals),
+                rightResiduals.isEmpty() ? null : String.join(" AND ", rightResiduals));
     }
 
     /**
-     * JOIN 键解析失败的报错文本。
+     * 判断一个非等值键的 ON 合取项是否「只引用一侧」的残差谓词，返回所在侧（{@code "L"}/{@code "R"}），
+     * 无法判定返回 null。
      *
-     * <p>{@code col = 字面量} 这类<b>单侧过滤</b>是压测里最常见的形态：INNER JOIN 会被优化器
-     * （{@code PredicatePushdown}）提前搬进扫描；外连接的<b>保留侧</b>不能提前过滤（未匹配行
-     * 仍须输出），所以会走到这里 —— 必须明确告诉用户该搬到 WHERE，而不是笼统的「无法解析」。</p>
+     * <p>先看原始文本的 {@code 限定符.列}（两侧有同名列、或无其它线索时唯一可靠的依据），
+     * 再看列归属（全部只属于一侧）。列在两侧都存在且无限定符 → 判不了（交给报错）。</p>
+     */
+    private static String residualSide(String rawConjunct, String strippedConjunct,
+                                       List<String> leftCols, List<String> rightCols,
+                                       String leftAlias, String rightAlias) {
+        java.util.Set<String> cols;
+        try {
+            cols = new ExprEvaluator(ExprParser.parse(strippedConjunct)).columnArgs();
+        } catch (RuntimeException e) {
+            return null;   // 表达式本身解析不了 → 让调用方报错
+        }
+        if (cols.isEmpty()) return null;
+        Integer qualifierSide = sideFromQualifiers(rawConjunct, leftAlias, rightAlias);
+        if (qualifierSide != null) {
+            List<String> sideCols = qualifierSide == 0 ? leftCols : rightCols;
+            for (String col : cols) {
+                if (!sideCols.contains(col)) return null;   // 限定符与列存在性矛盾 → 判不了
+            }
+            return qualifierSide == 0 ? "L" : "R";
+        }
+        boolean allLeft = true;
+        boolean allRight = true;
+        for (String col : cols) {
+            boolean inLeft = leftCols.contains(col);
+            boolean inRight = rightCols.contains(col);
+            if (!inLeft || inRight) allLeft = false;
+            if (!inRight || inLeft) allRight = false;
+        }
+        if (allLeft) return "L";
+        if (allRight) return "R";
+        return null;
+    }
+
+    /**
+     * 扫描原始 ON 合取项里所有 {@code 限定符.列} 的限定符，判定其指向哪一侧：
+     * 全指向左 → 0，全指向右 → 1；无/冲突/认不出 → null（调用方退回列归属判断）。
+     */
+    private static Integer sideFromQualifiers(String rawExpr, String leftAlias, String rightAlias) {
+        if (leftAlias == null || rightAlias == null) return null;
+        java.util.Set<String> qualifiers = new java.util.LinkedHashSet<>();
+        char quote = 0;
+        int i = 0;
+        while (i < rawExpr.length()) {
+            char ch = rawExpr.charAt(i);
+            if (quote != 0) {
+                if (ch == quote) quote = 0;
+                i++;
+                continue;
+            }
+            if (ch == '\'' || ch == '"') {
+                quote = ch;
+                i++;
+                continue;
+            }
+            if (Character.isLetter(ch) || ch == '_') {
+                int j = i;
+                while (j < rawExpr.length()
+                        && (Character.isLetterOrDigit(rawExpr.charAt(j))
+                            || rawExpr.charAt(j) == '_' || rawExpr.charAt(j) == '$')) {
+                    j++;
+                }
+                int k = j;
+                while (k < rawExpr.length() && Character.isWhitespace(rawExpr.charAt(k))) k++;
+                if (k < rawExpr.length() && rawExpr.charAt(k) == '.') {
+                    qualifiers.add(rawExpr.substring(i, j));
+                }
+                i = j;
+                continue;
+            }
+            i++;
+        }
+        boolean left = false;
+        boolean right = false;
+        for (String q : qualifiers) {
+            if (matchesAlias(q, leftAlias)) left = true;
+            else if (matchesAlias(q, rightAlias)) right = true;
+        }
+        if (left == right) return null;   // 都没认出来 / 两侧都有
+        return left ? 0 : 1;
+    }
+
+    /** 限定符与别名匹配：直接相等，或别名是全限定名时末段相等（{@code hive.db.tbl} ↔ {@code tbl}）。 */
+    private static boolean matchesAlias(String qualifier, String alias) {
+        if (qualifier.equalsIgnoreCase(alias)) return true;
+        int dot = alias.lastIndexOf('.');
+        return dot >= 0 && qualifier.equalsIgnoreCase(alias.substring(dot + 1).replace("`", ""));
+    }
+
+    /**
+     * JOIN 键解析失败的报错文本（带出两侧实际可见的列 —— 键名对不上时最常见的原因是某一侧
+     * 输出列集不合预期，只报键名等于让用户靠猜）。
      */
     private static String joinKeyError(LogicalPlan.JoinInfo ji, String conjunct,
                                        List<String> leftCols, List<String> rightCols) {
-        List<String> sides = SqlTextUtil.splitTopLevelEquals(conjunct);
-        if (sides.size() == 2) {
-            boolean leftLiteral = isLiteralToken(sides.get(0));
-            boolean rightLiteral = isLiteralToken(sides.get(1));
-            if (leftLiteral != rightLiteral) {
-                String column = SqlTextUtil.stripQualifier(leftLiteral ? sides.get(1) : sides.get(0));
-                if (leftCols.contains(column) || rightCols.contains(column)) {
-                    if (ji.joinType() == LogicalPlan.JoinType.INNER) {
-                        return "JOIN ON 中的单侧过滤条件不是连接键: " + conjunct.trim()
-                                + "（INNER JOIN 应由谓词下推提前过滤，请确认优化器已开启）";
-                    }
-                    return "JOIN ON 中的单侧过滤条件无法提前下推: " + conjunct.trim()
-                            + "。" + ji.joinType() + " JOIN 的保留侧不能用 ON 条件过滤"
-                            + "（未匹配行仍须输出），请将该条件移到 WHERE；INNER JOIN 可直接写在 ON 中。";
-                }
-            }
-        }
-        return "无法解析 JOIN 键: " + conjunct
+        return "无法解析 JOIN 键: " + conjunct.trim()
                 + "（左: " + leftCols + " / 右: " + rightCols + "）";
     }
 
@@ -4330,14 +4794,22 @@ public final class Planner {
             throw unsupported(kind + "不支持嵌套 EXISTS / 内层标量子查询: " + sub.originalText());
         }
         LogicalPlan.ResolvedRelation innerRel = inner.fromRelations().get(0);
-        if (innerRel.subquery().isPresent()) {
-            throw unsupported(kind + "不支持内层 FROM 派生表。"
-                    + "可改写为：JOIN (SELECT <键> FROM <表> GROUP BY <键>) v"
-                    + " ON <外层键> = v.<键>: " + sub.originalText());
+        // 内层 FROM 可以是派生表 / 已内联的 CTE（subquery 槽）：相关键与聚合列按该关系的
+        // 声明列解析，派生查询本身交给 buildQuery 正常规划（含分布式派生 join）。
+        // 仅 UNNEST / 表函数这类非查询派生关系仍拒绝 —— 它们不是可 GROUP BY 的行集。
+        if (innerRel.subquery().isPresent()
+                && !(innerRel.subquery().get() instanceof LogicalPlan.Select)
+                && !(innerRel.subquery().get() instanceof LogicalPlan.SetOperation)) {
+            throw unsupported(kind + "内层 FROM 仅支持表 / 派生查询: " + sub.originalText());
         }
         String aggText = inner.selectItems().get(0).expression().text().trim();
         if (SqlTextUtil.parseAggregate(aggText).isEmpty()) {
-            throw unsupported("标量子查询须为聚合函数（count/sum/avg/min/max）: " + aggText);
+            // 内层投影是裸列（典型：WITH t AS (SELECT k, max(v) AS mx ...) SELECT t.mx FROM t
+            // WHERE t.k = o.k）。内层派生表已按相关键分组、每键单行，裸列对该键是函数依赖的；
+            // 去相关生成的是「按相关键 GROUP BY」的派生聚合，裸列本身不是聚合项，必须显式聚合成
+            // 单值。用 max 取该键下的唯一值：单行时与直接取值等价；万一内层每键多行（SQL 本应
+            // 报「子查询返回多行」），也给出确定值而非静默错乱或整条查询失败。
+            aggText = "max(" + aggText + ")";
         }
 
         String innerAlias = alias(innerRel);
@@ -4486,23 +4958,21 @@ public final class Planner {
             winNode = winNode.children().get(0);
         }
 
-        // 分布式窗口（含 join→窗口链）：条件下推进 WindowStep，Worker 侧 WindowSort 就地裁剪，
-        // 避免整组窗口结果回传 Master 再过滤。等值覆写在 Worker 侧由配置重建（FragmentExecutor）。
-        if (winNode.operator() instanceof DistributedWindowOperator dwin) {
-            WindowFilterConfig cfg = buildWindowFilterConfig(dwin.functions(), dwin.orderBy().isEmpty(),
-                    name -> indexOfColumn(dwin.projection(), name), expr);
-            if (cfg == null) return node;
-            dwin.setFilterConfig(cfg);
-            return child; // Filter 已下推，消除 Filter 节点
-        }
-        if (winNode.operator() instanceof DistributedChainedOperator dchain) {
-            final List<String> chainOutputs = winNode.outputColumns();
-            WindowFilterConfig cfg = buildWindowFilterConfig(dchain.windowFunctions(),
-                    dchain.windowOrderBy().isEmpty(),
-                    name -> indexOfColumn(chainOutputs, name), expr);
-            if (cfg == null) return node;
-            dchain.setWindowFilter(cfg);
-            return child;
+        // 分布式窗口（基表扫描 / 单 join 链 / 多 join 链 / 派生源 join / 聚合 → 窗口）：
+        // 只要算子实现 WindowChainCarrier 就自动获得下推能力 —— 不再逐个 instanceof 分支维护
+        // （漏接分支 = 下推静默失效，历史上已多次发生）。
+        if (winNode.operator() instanceof WindowChainCarrier carrier) {
+            List<FragmentSpec.WindowStep> chain = carrier.windowSteps();
+            if (chain != null && !chain.isEmpty()) {
+                // 安全边界：只允许终端组承接外层过滤（中间组输出还要喂后续窗口，见 terminalChainFilter）。
+                WindowFilterConfig cfg = terminalChainFilter(chain, windowColumns(winNode, chain), expr);
+                if (cfg == null) return node;   // 未命中 / 命中中间组：Filter 留在 Master
+                List<FragmentSpec.WindowStep> rebuilt = new ArrayList<>(chain);
+                int last = rebuilt.size() - 1;
+                rebuilt.set(last, rebuilt.get(last).withFilter(cfg));
+                carrier.replaceWindowSteps(rebuilt);
+                return child; // Filter 已下推，消除 Filter 节点
+            }
         }
 
         if (!(winNode.operator() instanceof WindowFunctionOperator winFunc)) return node;
@@ -4565,6 +5035,40 @@ public final class Planner {
             //   会让「有 ORDER BY 的 row_number()」被误当成全量窗口 ⇒ WindowSortOperator.pruneKeepRows()
             //   的门（!noOrderBy）永远关着 ⇒ Phase 1 预裁剪失效 ⇒ 整组全量溢写、Phase 1.5 反复归并卡死。
             return new WindowFilterConfig(type, pf.targetValue, -1, noOrderBy, pf.op);
+        }
+        return null;
+    }
+
+    /**
+     * 解析窗口过滤聚合输入列索引用的列序（页内列序）。
+     *
+     * <p>优先用末组 {@code outputColumns}（= 上游列前缀 + 窗口输出列，索引对输入列指向正确位置）。
+     * 为空时：单表窗口算子退回其<b>扫描投影</b>（{@code visibleColumns} 可能少带「只为过滤」的引擎
+     * 列，按投影解析才与 Worker 收到的页内列序一致）；其余算子退回节点声明输出列。</p>
+     */
+    private static List<String> windowColumns(PhysicalNode winNode, List<FragmentSpec.WindowStep> chain) {
+        List<String> declared = chain.get(chain.size() - 1).outputColumns();
+        if (!declared.isEmpty()) return declared;
+        if (winNode.operator() instanceof DistributedWindowOperator dwin) return dwin.projection();
+        return winNode.outputColumns();
+    }
+
+    /**
+     * 多窗口组链的终端过滤下推：外层过滤条件只允许命中<b>末组</b>窗口函数。
+     *
+     * <p>末组输出即整条链的最终输出（不再被任何窗口消费），就地裁剪等价于 Master 过滤；
+     * 中间组的输出还会喂给后续窗口组，提前删行会改变后续 {@code RANK} / 聚合结果 —— 此时返回
+     * {@code null}，Filter 留在 Master（结果仍正确）。</p>
+     */
+    private static WindowFilterConfig terminalChainFilter(List<FragmentSpec.WindowStep> chain,
+                                                          List<String> chainOutputs, String expr) {
+        if (chain == null || chain.isEmpty()) return null;
+        for (int i = 0; i < chain.size(); i++) {
+            FragmentSpec.WindowStep step = chain.get(i);
+            WindowFilterConfig cfg = buildWindowFilterConfig(step.functions(), step.orderBy().isEmpty(),
+                    name -> indexOfColumn(chainOutputs, name), expr);
+            if (cfg == null) continue;
+            return i == chain.size() - 1 ? cfg : null;
         }
         return null;
     }
@@ -4721,10 +5225,24 @@ public final class Planner {
         //   到各 Worker（每分区只回传 1 行），Master 只做 N 行 partial 合并。否则内层全部结果行
         //   回传 Master、由单机 HashAggregation 逐行扫 —— 线上表现为「Agg 完成后 505 行/秒」卡死。
         //   必须放在下面的 CaseProject 包装之前：CASE 派生列随二级聚合一起下发（Worker 侧先算再聚合）。
-        if (context.distributedExecution() && keys.isEmpty() && groupKeyExpressions.isEmpty()) {
-            PhysicalNode overAgg = tryBuildChainedAggregationOverAggregation(upstream, aggs, caseProjections);
-            if (overAgg != null) {
-                return overAgg;
+        if (context.distributedExecution() && groupKeyExpressions.isEmpty()) {
+            if (keys.isEmpty()) {
+                PhysicalNode overAgg = tryBuildChainedAggregationOverAggregation(upstream, aggs, caseProjections);
+                if (overAgg != null) {
+                    return overAgg;
+                }
+            }
+            // join 载体之上的分组聚合（join → [Filter] → 投影 → 聚合）：协分区成立时
+            // 过滤 + 终态聚合一起下沉到终端 join 片段。
+            PhysicalNode overJoin = tryBuildAggregationOverJoin(upstream, keys, aggs, caseProjections);
+            if (overJoin != null) {
+                return overJoin;
+            }
+            // 窗口链载体之上的聚合（窗口 → 投影 → 聚合）：聚合段留在窗口链终端；
+            // 分组聚合仅在协分区成立时下沉（见方法注释）。
+            PhysicalNode overWindow = tryBuildAggregationOverWindowChain(upstream, keys, aggs, caseProjections);
+            if (overWindow != null) {
+                return overWindow;
             }
         }
 
@@ -4774,28 +5292,31 @@ public final class Planner {
                 if (distributed != null) {
                     return distributed;
                 }
-                // GROUP BY 表达式（派生分区键）v1 不支持 join 上游的分布式路径：派生列随裸表扫描的
-                // Producer 物化，join 输出的 Worker 侧重建无从接入 → 直接回退 Master 单机聚合
-                // （正确性保留：join 结果流回 Master 后仍先 ExpressionProject 再 HashAggregation）。
-                if (groupKeyExpressions.isEmpty()) {
-                    // 链式零交换要求「分组键 == join 键」，展开后键里多了 __grouping_id ⇒ 不成立
-                    if (expand == null) {
-                        PhysicalNode chained = tryBuildChainedAggregation(upstream, keys, aggs, healthy);
-                        if (chained != null) {
-                            return chained;
-                        }
-                        PhysicalNode chainedMulti = tryBuildChainedMultiJoinAggregation(upstream, keys, aggs, caseProjections, healthy);
-                        if (chainedMulti != null) {
-                            return chainedMulti;
-                        }
+                // 链式零交换要求「分组键 == join 键」，展开后键里多了 __grouping_id ⇒ 不成立；
+                // GROUP BY 表达式派生键也不适用（派生列须在最末层 join 输出上物化，链式算子无该通道）。
+                if (expand == null && groupKeyExpressions.isEmpty()) {
+                    PhysicalNode chained = tryBuildChainedAggregation(upstream, keys, aggs, healthy);
+                    if (chained != null) {
+                        return chained;
                     }
-                    // join 输出上的 GROUP BY，但分组键与 join 键不共分区（≠ / 未覆盖最末层分区键）：
-                    // 走二次 shuffle 最终聚合 —— join 留在 worker，按分组键重哈希，每分区最终聚合后回传。
-                    PhysicalNode shuffled = tryBuildShuffledJoinAggregation(upstream, keys, aggs, caseProjections, healthy, expand);
-                    if (shuffled != null) {
-                        return shuffled;
+                    PhysicalNode chainedMulti = tryBuildChainedMultiJoinAggregation(upstream, keys, aggs, caseProjections, healthy);
+                    if (chainedMulti != null) {
+                        return chainedMulti;
                     }
                 }
+                // join 输出上的 GROUP BY，但分组键与 join 键不共分区（≠ / 未覆盖最末层分区键）：
+                // 走二次 shuffle 最终聚合 —— join 留在 worker，按分组键重哈希，每分区最终聚合后回传。
+                // 表达式派生键由最末层 join 输出就地物化后再重哈希（发送端物化不变量）。
+                PhysicalNode shuffled = tryBuildShuffledJoinAggregation(upstream, keys, aggs, caseProjections,
+                        groupKeyExpressions, healthy, expand);
+                if (shuffled != null) {
+                    return shuffled;
+                }
+                reportFallback("聚合（GROUP BY " + keys
+                        + (expand == null ? "" : " + ROLLUP/CUBE") + "）无法分布式执行，上游 "
+                        + upstream.name());
+            } else {
+                reportFallback("聚合（GROUP BY " + keys + "）无健康 Worker，上游 " + upstream.name());
             }
         }
 
@@ -5121,19 +5642,191 @@ public final class Planner {
         }
         PhysicalNode distNode = extractDistributedAggregationNode(upstream);
         if (distNode == null) return null;
-        DistributedAggregationOperator dist = (DistributedAggregationOperator) distNode.operator();
-
-        // 二级聚合：无分组键 = 全局 partial（每分区聚出 1 行）；桶数与内层一致（pid 分槽）
-        FragmentSpec.AggregateStep step = new FragmentSpec.AggregateStep(
-                List.of(), aggs.stream().map(FragmentSpec.AggregationDto::of).toList(),
-                caseProjections, context.memoryLimit(), dist.numPartitions());
-        dist.setFollowUp(step);
 
         // 内层分布式聚合现在回传的列 = 二级聚合输出列（merge 节点的真实上游 schema）
         List<String> outCols = new ArrayList<>();
         for (AggregationSpec a : aggs) outCols.add(a.outputColumn());
-        PhysicalNode partialNode = new PhysicalNode(distNode.name(), dist, outCols, List.of());
-        PartialAggregationMergeOperator merge = new PartialAggregationMergeOperator(dist, aggs);
+        Operator inner = distNode.operator();
+        FragmentSpec.AggregateStep step;
+        if (inner instanceof DistributedAggregationOperator dist) {
+            // 二级聚合：无分组键 = 全局 partial（每分区聚出 1 行）；桶数与内层一致（pid 分槽）
+            step = new FragmentSpec.AggregateStep(
+                    List.of(), aggs.stream().map(FragmentSpec.AggregationDto::of).toList(),
+                    caseProjections, context.memoryLimit(), dist.numPartitions());
+            dist.setFollowUp(step);
+        } else if (inner instanceof DistributedJoinAggregationOperator djao) {
+            // 「分布式 join→聚合」之上再套外层全局聚合（三表 join 内外两层聚合）：AggregateConsumer
+            // 本地最终聚合后同 Worker 再跑一级全局 partial，每分区只回传 1 行 → Master 只合并 N 行，
+            // 不再把内层全部结果行搬回 Master 单机重扫（线上「Agg 完成后 505 行/秒」同源瓶颈）。
+            step = new FragmentSpec.AggregateStep(
+                    List.of(), aggs.stream().map(FragmentSpec.AggregationDto::of).toList(),
+                    caseProjections, context.memoryLimit(), djao.numPartitions());
+            djao.setFollowUp(step);
+        } else if (inner instanceof DistributedChainedOperator dco
+                && dco.followUp() instanceof FragmentSpec.AggregateStep) {
+            // 两表 join 链式聚合（DistributedChainedOperator）之上再套外层全局聚合。
+            step = new FragmentSpec.AggregateStep(
+                    List.of(), aggs.stream().map(FragmentSpec.AggregationDto::of).toList(),
+                    caseProjections, context.memoryLimit(), dco.numPartitions());
+            dco.setPartialFollowUp(step);
+        } else if (inner instanceof DistributedJoinOperator djo
+                && djo.followUp() instanceof FragmentSpec.AggregateStep) {
+            // 多 join 链式聚合（DistributedJoinOperator.withAggregate）之上再套外层全局聚合。
+            step = new FragmentSpec.AggregateStep(
+                    List.of(), aggs.stream().map(FragmentSpec.AggregationDto::of).toList(),
+                    caseProjections, context.memoryLimit(), djo.numPartitions());
+            djo.setPartialFollowUp(step);
+        } else {
+            return null;
+        }
+
+        PhysicalNode partialNode = new PhysicalNode(distNode.name(), inner, outCols, List.of());
+        PartialAggregationMergeOperator merge = new PartialAggregationMergeOperator(inner, aggs);
+        return new PhysicalNode("AggregationMerge", merge, outCols, partialNode);
+    }
+
+    /**
+     * 尝试把外层<b>分组聚合</b>压到<b>分布式 join 载体的终端</b>上（join → [Filter] → 投影 → 聚合）：
+     * join 输出已按 join 键哈希分区，若分组键<b>覆盖</b> join 分区键（{@code keys ⊇ 分区键}），
+     * 同一个分组的所有行必在同一分区 ⇒ 每分区内聚合即<b>终态</b>，无需 Master 合并；join 之上的
+     * Filter 谓词也一并下沉到同一片段，在本地 join 之后、聚合之前执行。
+     *
+     * <p><b>为什么需要</b>：{@code SELECT user_id, count(*) FROM (派生 join) t WHERE … GROUP BY user_id}
+     * 的旧路径把 join 输出的全量明细行回传 Master，再由单机 Filter + HashAggregation 逐行扫。
+     * join 已经是分布式的，仅仅因为「聚合上游是 Filter」就整段回退。</p>
+     *
+     * <p><b>保守条件</b>：分区键未知（载体未声明）、分组键不覆盖分区键、过滤列解析不到、
+     * CASE 派生列 / 不可合并聚合（avg、count(distinct)、collect…）→ 返回 null 回退。</p>
+     */
+    private PhysicalNode tryBuildAggregationOverJoin(PhysicalNode upstream,
+                                                     List<String> keys,
+                                                     List<AggregationSpec> aggs,
+                                                     List<CaseProjection> caseProjections) {
+        if (keys.isEmpty() || aggs.isEmpty() || !caseProjections.isEmpty()) return null;
+        if (!mergeableAggregates(aggs)) return null;
+
+        // 形态：Filter（可空）→ 纯列裁剪投影（可多层）→ 分布式 join 载体。
+        String filter = null;
+        PhysicalNode cur = upstream;
+        if (cur.operator() instanceof FilterOperator f && f.filterExpression() != null
+                && cur.children().size() == 1) {
+            filter = SqlTextUtil.stripQualifiers(f.filterExpression());
+            cur = cur.children().get(0);
+        }
+        while (cur.operator() instanceof ProjectOperator proj && !proj.isAliased()
+                && cur.children().size() == 1) {
+            PhysicalNode child = cur.children().get(0);
+            if (!child.outputColumns().containsAll(cur.outputColumns())) return null;
+            cur = child;
+        }
+        if (!(cur.operator() instanceof AbstractDistributedOperator dist)) return null;
+
+        // 协分区判定：分组键必须覆盖终端分区键（同一分组整组同分区 ⇒ 每分区终态聚合可并集）。
+        List<String> partKeys = dist.terminalPartitionKeys();
+        if (partKeys.isEmpty() || !keys.containsAll(partKeys)) return null;
+        if (!cur.outputColumns().containsAll(keys)) return null;
+        if (filter != null) {
+            List<String> refs = FilterOperator.referencedColumnsOf(filter);
+            // 空引用 = 无法解析（如残留子查询）或纯字面量谓词 —— 无法确认可编译，保守回退。
+            if (refs.isEmpty() || !cur.outputColumns().containsAll(refs)) return null;
+        }
+
+        FragmentSpec.AggregateStep step = new FragmentSpec.AggregateStep(
+                keys, aggs.stream().map(FragmentSpec.AggregationDto::of).toList(),
+                caseProjections, context.memoryLimit(), dist.partitionCount());
+        // 由 AbstractDistributedOperator.withTerminal 统一挂到终端片段（过滤先于聚合）。
+        dist.setTerminalPartialAggregate(step);
+        if (filter != null) {
+            dist.setTerminalJoinFilter(filter);
+        }
+
+        List<String> outCols = new ArrayList<>(keys);
+        for (AggregationSpec a : aggs) outCols.add(a.outputColumn());
+        return new PhysicalNode(cur.name(), cur.operator(), outCols, List.of());
+    }
+
+    /** 可下沉为「每分区终态 / partial」再合并的聚合函数（count / sum / min / max）。 */
+    private static boolean mergeableAggregates(List<AggregationSpec> aggs) {
+        for (AggregationSpec spec : aggs) {
+            if (spec.isCollect() || spec.aggregate() == null) return false;
+            String name = spec.aggregate().functionName();
+            if (!"count".equals(name) && !"sum".equals(name)
+                    && !"min".equals(name) && !"max".equals(name)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 尝试把外层聚合压到<b>窗口链载体的终端</b>上（窗口后聚合形状）：
+     * 窗口链末端每分区同 Worker 再跑一次聚合。
+     *
+     * <p><b>两种形态</b>：</p>
+     * <ul>
+     *   <li><b>全局聚合</b>（{@code keys} 为空）：每分区只回传 1 行 partial，Master 侧
+     *       {@link PartialAggregationMergeOperator} 合并；</li>
+     *   <li><b>分组聚合</b>（{@code keys} 非空）：要求<b>协分区</b> —— 窗口链末组的
+     *       {@code partitionBy} 必须是分组键的子集（同一个键的所有行落在同一分区），此时每分区内
+     *       的<b>终态</b>聚合直接就是结果，无需 Master 合并。否则返回 null 回退。</li>
+     * </ul>
+     *
+     * <p><b>为什么需要</b>：{@code SELECT count(*) FROM (join → 窗口) t} 的旧路径把窗口输出的
+     * <b>全部明细行</b>回传 Master 再由单机聚合逐行扫 —— 窗口已经分布式算完，却因为外层聚合
+     * 认不出「窗口链 + 列裁剪投影」形状整段回退。聚合结果按名引用窗口输出列，跳过纯列选择投影
+     * 不改变语义（与 {@link #extractDistributedAggregationNode} 同口径）。</p>
+     *
+     * <p><b>只下沉可合并的聚合</b>：avg（需要和+计数）、count(distinct) / collect / 自定义 UDAF
+     * 的 partial 不可合并 → 返回 null 回退（行为不变）。</p>
+     */
+    private PhysicalNode tryBuildAggregationOverWindowChain(PhysicalNode upstream,
+                                                            List<String> keys,
+                                                            List<AggregationSpec> aggs,
+                                                            List<CaseProjection> caseProjections) {
+        if (aggs.isEmpty()) return null;
+        // 分组键是 CASE 派生列时，派生列要在分区前物化 —— 与窗口链的 Worker 侧重分区冲突，保持回退。
+        if (!keys.isEmpty() && !caseProjections.isEmpty()) return null;
+        if (!mergeableAggregates(aggs)) return null;
+        // 穿透纯列选择投影（不改名、不新增列）直达窗口链载体；表达式 / CASE / 改名投影保持回退。
+        PhysicalNode cur = upstream;
+        while (cur.operator() instanceof ProjectOperator proj && !proj.isAliased()
+                && cur.children().size() == 1) {
+            PhysicalNode child = cur.children().get(0);
+            if (!child.outputColumns().containsAll(cur.outputColumns())) return null;
+            cur = child;
+        }
+        if (!(cur.operator() instanceof AbstractDistributedOperator dist)
+                || !(cur.operator() instanceof WindowChainCarrier carrier)) {
+            return null;
+        }
+        List<FragmentSpec.WindowStep> steps = carrier.windowSteps();
+        if (steps == null || steps.isEmpty()) return null;
+        FragmentSpec.WindowStep last = steps.get(steps.size() - 1);
+
+        // 分组聚合：协分区判定 —— 分组键必须覆盖末组窗口分区键（否则同一分组散落多分区，
+        // 每分区各出一行会重复）。分区键可能是合成列（__win_key_N），此时键集不含它 ⇒ 回退。
+        if (!keys.isEmpty()
+                && (!cur.outputColumns().containsAll(keys)
+                    || !keys.containsAll(last.partitionBy()))) {
+            return null;
+        }
+
+        // 二级聚合：桶数与窗口链末组一致（pid 分槽）。
+        int partitions = last.numPartitions();
+        FragmentSpec.AggregateStep step = new FragmentSpec.AggregateStep(
+                keys, aggs.stream().map(FragmentSpec.AggregationDto::of).toList(),
+                caseProjections, context.memoryLimit(), partitions);
+        // 由 AbstractDistributedOperator.withTerminal 统一挂到终端 WindowConsumer（所有载体共用）。
+        dist.setTerminalPartialAggregate(step);
+
+        List<String> outCols = new ArrayList<>(keys);
+        for (AggregationSpec a : aggs) outCols.add(a.outputColumn());
+        PhysicalNode partialNode = new PhysicalNode(cur.name(), cur.operator(), outCols, List.of());
+        if (!keys.isEmpty()) {
+            // 协分区终态聚合：各分区输出互不相交，直接并集即结果，无需 Master 合并。
+            return partialNode;
+        }
+        PartialAggregationMergeOperator merge = new PartialAggregationMergeOperator(cur.operator(), aggs);
         return new PhysicalNode("AggregationMerge", merge, outCols, partialNode);
     }
 
@@ -5147,10 +5840,23 @@ public final class Planner {
         while (true) {
             Operator op = cur.operator();
             if (op instanceof DistributedAggregationOperator) return cur;
+            if (op instanceof DistributedJoinAggregationOperator) return cur;
+            // 链式 join→聚合载体（同 key 零交换 / 多 join 链）：只有「聚合 followUp」才是
+            // 外层全局聚合的可压基座；窗口 followUp / 裸 join 不计。
+            if (op instanceof DistributedChainedOperator dco
+                    && dco.followUp() instanceof FragmentSpec.AggregateStep) {
+                return cur;
+            }
+            if (op instanceof DistributedJoinOperator djo
+                    && djo.followUp() instanceof FragmentSpec.AggregateStep) {
+                return cur;
+            }
             if (op instanceof ProjectOperator proj && !proj.isAliased() && cur.children().size() == 1) {
                 PhysicalNode child = cur.children().get(0);
-                // 只跳过「同列同名同序」的空投影；真裁剪/改名的投影跳过会改变输出 schema
-                if (!cur.outputColumns().equals(child.outputColumns())) return null;
+                // 纯列选择（含收窄子集）可跳过：二级聚合按列名解析输入列，跳过一个不改名的
+                // Project 不改变聚合语义（列裁剪常在上游聚合与下游全局聚合之间插入收窄投影）。
+                // 改名投影（isAliased）跳过会改变输出列名 → 保守返回 null。
+                if (!child.outputColumns().containsAll(cur.outputColumns())) return null;
                 cur = child;
                 continue;
             }
@@ -5182,7 +5888,7 @@ public final class Planner {
         int scanParallelism = Math.max(1, context.parallelism());
         int partitions = aggBuckets(keys, scanParallelism);
         String queryId = "query-" + Long.toHexString(System.nanoTime());
-        DojaoConnector probe = context.connectorProvider().get(base.catalog);
+        DojaoConnector probe = connectorFor(base.catalog);
 
         // ★ 列裁剪（分布式聚合必须在此做，不能依赖 optimizeColumns）：
         //   tryBuildDistributedAggregation 在 optimizeColumns（列裁剪）之前执行，且返回的物理节点
@@ -5446,6 +6152,10 @@ public final class Planner {
         if (djo == null || hasCrossLink(djo) || hasDerivedSource(djo)) {
             return null;
         }
+        // DistributedChainedOperator 的 JoinStep 通道尚未携带 ON 单侧残差谓词 → 回退单机（语义完整）。
+        if (hasOnResidual(djo)) {
+            return null;
+        }
         // 同 key 前置：GROUP BY 键必须与 join 一侧的 key 完全一致（顺序敏感 → 哈希输入一致 → 零交换）
         if (!keys.equals(djo.leftKeys()) && !keys.equals(djo.rightKeys())) {
             return null;
@@ -5486,10 +6196,28 @@ public final class Planner {
         }
         // 仅单 join（links.size()==1）走链式单 join 语义（DistributedChainedOperator 重建舞台）；
         // 多 join 链由 extractMultiJoin 走 withAggregate 路径，两个提取器按 links().size() 互斥。
-        if (op instanceof DistributedJoinOperator djo && djo.links().size() == 1) {
+        if (op instanceof DistributedJoinOperator djo && djo.links().size() == 1 && isBareJoin(djo)) {
             return djo;
         }
         return null;
+    }
+
+    /**
+     * 上游 join 算子是否仍是<b>纯 join</b>（无 followUp 聚合/窗口、无 windowChain）——
+     * 只有纯 join 才允许作为「重建舞台」的基。
+     *
+     * <p><b>设计不变量</b>：{@link DistributedJoinOperator} 同时承载裸 join、join+聚合、
+     * join+窗口、join+窗口链四种形态，而 {@code withAggregate} / {@code withWindowChain} /
+     * 重建 {@link DistributedChainedOperator} 的构造器都<b>只复制 join 描述</b>。携带后续阶段的
+     * 算子已是「后续计算边界」，再被上层聚合 / 窗口提取器当成 join 基重建，就会把内层阶段整段
+     * 静默丢弃 —— 历史缺陷：三表 join 下「聚合套聚合」内层聚合消失，外层 {@code sum(别名)} 恒
+     * NULL、{@code count(*)} 变成明细行数；「聚合后开窗」则窗口直接挂在明细上、引用不存在的列。
+     *
+     * <p>返回 false 时各提取器一律返回 null → 上层阶段走 Master 兜底（与单 / 双表的安全形态
+     * 一致：内层聚合 / 窗口仍在 Worker 分布式执行，Master 只做最终归约）。</p>
+     */
+    private static boolean isBareJoin(DistributedJoinOperator djo) {
+        return djo.followUp() == null && djo.windowChain().isEmpty();
     }
 
     /**
@@ -5544,7 +6272,7 @@ public final class Planner {
         if (op instanceof FilterOperator) {
             return null;
         }
-        if (op instanceof DistributedJoinOperator mjo && mjo.links().size() >= 2) {
+        if (op instanceof DistributedJoinOperator mjo && mjo.links().size() >= 2 && isBareJoin(mjo)) {
             return mjo;
         }
         return null;
@@ -5563,25 +6291,30 @@ public final class Planner {
      * 分区 / Worker → 本地聚合即最终结果，Master 零合并。整条 join 链被重建为新算子的舞台，
      * 原 {@code DistributedJoinOperator} 丢弃（不被 open），其探针连接器移交给新算子。</p>
      *
+     * <p><b>派生源 / CROSS</b>：{@code djo.sources()} 原样转交新算子（{@code DistributedJoinAggregationOperator}
+     * 持有 sources → StageScheduler 按派生流水线喂入各层，CROSS 的 build 侧单值广播同样生效），
+     * 不再因此回退 Master 单机聚合。GROUP BY 表达式派生键由最末层 join 输出就地物化。</p>
+     *
      * @return 新 {@code DistributedJoinAggregationOperator} 物理节点；上游非分布式 join / 中间有
      *         Filter（残余谓词须在 join 后执行）→ null → 回退 Master 单机聚合（行为不变）。
      */
     private PhysicalNode tryBuildShuffledJoinAggregation(PhysicalNode upstream,
                                                          List<String> keys, List<AggregationSpec> aggs,
                                                          List<CaseProjection> caseProjections,
+                                                         List<GroupKeyExpression> groupKeyExpressions,
                                                          List<WorkerRegistration> workers,
                                                          FragmentSpec.ExpandStep expand) {
-        DistributedJoinOperator djo = extractDistributedJoinAny(upstream);
+        // 穿投影 / CASE 派生列 / GROUP BY 表达式派生列 / <b>外连接同名列消歧（ColumnAlias）</b>
+        // 取分布式 join 基。别名必须随舞台转交：Worker 在本地 join 后、按分组键重哈希前套用
+        // （分组键常引用 __jk_<col>_<k>，否则重建后找不到列 → 只能回退 Master）。
+        WindowChainJoinBase probe = probeWindowChainJoinBase(upstream);
+        DistributedJoinOperator djo = probe == null ? null : probe.join();
         if (djo == null || djo.links().isEmpty()) {
             return null;
         }
-        // 链上含 CROSS 环节（非相关标量子查询的单值广播）或<b>派生源</b>（子查询 / CTE 的迷你聚合
-        // 流水线）：本路径重建 join 舞台时不带派生源（{@code DistributedJoinAggregationOperator}
-        // 无 sources 参数）⇒ 该层关系既无生产者也无扫描（firstTable 为 null）→ open 阶段 NPE。
-        // 回退 Master 本地聚合 —— join 仍在 Worker 执行、结果流回 Master 再聚合，正确但非分布式。
-        if (hasCrossLink(djo) || hasDerivedSource(djo)) {
-            return null;
-        }
+        List<FragmentSpec.JoinAlias> aliases = probe.outputAliases();
+        // 派生源（子查询 / CTE 的迷你流水线）由本算子原样转交 StageScheduler（sources 参数）——
+        // 链上 CROSS 环节的 build 侧单值广播同样随 sources 生效，不再回退 Master 单机聚合。
         int partitions = djo.numPartitions();
         String queryId = "query-" + Long.toHexString(System.nanoTime());
         DistributedJoinAggregationOperator op = new DistributedJoinAggregationOperator(
@@ -5592,7 +6325,8 @@ public final class Planner {
                 // 广播结论（probe 侧就地分桶）在此不成立，降级为哈希（只是标注，执行同为 HashJoin）
                 StageScheduler.downgradeBroadcast(djo.links()), djo.memoryLimit(),
                 keys, aggs, caseProjections, partitions,
-                djo.gateway(), djo.workers(), djo.firstColumns(), expand);
+                djo.gateway(), djo.workers(), djo.firstColumns(), expand,
+                groupKeyExpressions, djo.sources(), aliases);
 
         List<String> outCols = new ArrayList<>(keys);
         outCols.addAll(aggs.stream().map(AggregationSpec::outputColumn).toList());
@@ -5620,6 +6354,16 @@ public final class Planner {
     private static boolean hasCrossLink(DistributedJoinOperator djo) {
         for (StageScheduler.JoinLink link : djo.links()) {
             if (link.joinType() == JoinType.CROSS) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** join 各层是否带 ON 单侧残差谓词（这些语义只在 {@code HashJoinOperator} 内实现）。 */
+    private static boolean hasOnResidual(DistributedJoinOperator djo) {
+        for (StageScheduler.JoinLink link : djo.links()) {
+            if (link.onLeftFilter() != null || link.onRightFilter() != null) {
                 return true;
             }
         }
@@ -5659,11 +6403,37 @@ public final class Planner {
             if (node.children().size() == 1) return extractDistributedJoinAny(node.children().get(0));
             return null;
         }
+        // GROUP BY 表达式派生列（在聚合前包的一层 ExpressionProject）：派生键改由本算子在最末层
+        // join 输出上物化（发送端物化不变量），Master 侧这层投影被重建的舞台取代。
+        if (op instanceof ExpressionProjectOperator) {
+            if (node.children().size() == 1) return extractDistributedJoinAny(node.children().get(0));
+            return null;
+        }
         if (op instanceof FilterOperator) {
             return null;
         }
-        if (op instanceof DistributedJoinOperator djo) {
+        if (op instanceof DistributedJoinOperator djo && isBareJoin(djo)) {
             return djo;
+        }
+        return null;
+    }
+
+    /**
+     * 同 {@link #extractDistributedJoinAny}，但探测<b>派生表 join</b>算子
+     * （{@link DistributedDerivedJoinOperator}）：派生侧聚合/投影/窗口流水线 + peer 扫描全在 Worker，
+     * 其上的窗口链走 {@code withWindowChain}（不重建舞台 → 派生编排不丢）。
+     */
+    private DistributedDerivedJoinOperator extractDerivedJoinAny(PhysicalNode node) {
+        Operator op = node.operator();
+        if (op instanceof ProjectOperator || op instanceof CaseProjectOperator) {
+            if (node.children().size() == 1) return extractDerivedJoinAny(node.children().get(0));
+            return null;
+        }
+        if (op instanceof FilterOperator) {
+            return null;
+        }
+        if (op instanceof DistributedDerivedJoinOperator ddj) {
+            return ddj;
         }
         return null;
     }
@@ -6356,9 +7126,9 @@ public final class Planner {
         for (String col : currentOut) {
             if (needed.contains(col)) projectCols.add(col);
         }
-        System.err.printf("[ColumnPruning] %d → %d columns (dropped %d)%n",
+        System.err.printf("[ColumnPruning] %d → %d columns (dropped %d) from %s / kept %s%n",
                 currentOut.size(), projectCols.size(),
-                currentOut.size() - projectCols.size());
+                currentOut.size() - projectCols.size(), currentOut, projectCols);
         return wrapProject(upstream, projectCols);
     }
 
@@ -6377,264 +7147,607 @@ public final class Planner {
     }
 
     /**
-     * 尝试构建分布式窗口（最小切片）：扫描 → 按 PARTITION BY 哈希分区 → Worker 本地
-     * 排序 + 逐行计算 → 回传 Master。仅支持"单窗口组（相同 PARTITION BY + ORDER BY）且
-     * 上游是裸表扫描"；否则返回 null → 回退单机。
+     * 尝试构建分布式 <b>join→多窗口分组链</b>：上游是分布式 join（单 join / 多 join 链 / 含派生源）。
+     *
+     * <p>首组与 join 键不同也允许：Worker 内 join 完成后先按首组键重分区，再依次执行各组窗口；
+     * 组间只付一次交换，中间数据不回 Master。首组恰好等于 join 键时零二次交换起步。窗口键含表达式
+     * 时由发送端物化合成列（见 {@link #toDistributedWindowStep}），不退回单机。</p>
+     *
+     * <p>单 join 且无派生源 → 重建为 {@link DistributedChainedOperator}（既有路径）；多 join 链 /
+     * 含派生源 → 在 {@link DistributedJoinOperator} 上挂 {@code windowChain}（保留 links / sources /
+     * 各层过滤与列裁剪，流水线不丢）。</p>
      */
-    private PhysicalNode tryBuildDistributedWindow(PhysicalNode upstream,
-                                                   List<LogicalPlan.SelectItem> windowItems,
-                                                   List<WorkerRegistration> workers) {
-        BaseTable base = extractBaseTable(upstream);
+    /** 窗口链探测结果：分布式 join 基（直连 / 派生）+ 外连接同名列消歧规则（由内向外的套用顺序）。 */
+    private record WindowChainJoinBase(DistributedJoinOperator join,
+                                       DistributedDerivedJoinOperator derivedJoin,
+                                       List<FragmentSpec.JoinAlias> outputAliases) {
+    }
+
+    /**
+     * 探测窗口链上游的分布式 join 基，<b>穿透外连接消歧层</b>（{@link ColumnAliasOperator}）。
+     *
+     * <p>外连接（LEFT/RIGHT/FULL）同名列由 {@code aliasOuterJoinKeyRefs} 包一层
+     * {@code ColumnAliasOperator}；窗口键 / 值表达式已被改写为引用 {@code __jk_*} 副本。以前的探测
+     * 在 Project 后直接遇到该层 → 判定「上游形状无法重建」→ 回退 Master 单机窗口链。现在把别名规则
+     * 一并提取出来，交给 Worker 在本地 join 之后复现（见 {@code FragmentSpec.JoinStep.outputAliases}），
+     * join + 窗口链完整留在 Worker，不再回退。</p>
+     */
+    private WindowChainJoinBase probeWindowChainJoinBase(PhysicalNode node) {
+        Operator op = node.operator();
+        if (op instanceof ColumnAliasOperator ca) {
+            if (node.children().size() != 1) return null;
+            WindowChainJoinBase inner = probeWindowChainJoinBase(node.children().get(0));
+            if (inner == null) return null;
+            List<FragmentSpec.JoinAlias> all = new ArrayList<>(inner.outputAliases());
+            for (ColumnAliasOperator.Alias a : ca.aliases()) {
+                all.add(new FragmentSpec.JoinAlias(a.sourceName(), a.occurrence(), a.aliasName()));
+            }
+            return new WindowChainJoinBase(inner.join(), inner.derivedJoin(), all);
+        }
+        if (op instanceof ProjectOperator || op instanceof CaseProjectOperator
+                || op instanceof ExpressionProjectOperator) {
+            return node.children().size() == 1 ? probeWindowChainJoinBase(node.children().get(0)) : null;
+        }
+        // 残余谓词须在 join 之后执行，窗口前还有过滤 → 上游形状无法重建（保持既有回退口径）
+        if (op instanceof FilterOperator) {
+            return null;
+        }
+        // 携带后续阶段（聚合 / 窗口）的算子是不可再重建的边界：窗口链只能挂在纯 join 之上，
+        // 否则 withWindowChain 会把内层聚合 / 已有窗口整段顶掉（聚合后开窗 → 窗口挂在明细行上）。
+        if (op instanceof DistributedJoinOperator djo) {
+            return isBareJoin(djo) ? new WindowChainJoinBase(djo, null, new ArrayList<>()) : null;
+        }
+        if (op instanceof DistributedDerivedJoinOperator ddj) {
+            return ddj.windowChain().isEmpty() ? new WindowChainJoinBase(null, ddj, new ArrayList<>()) : null;
+        }
+        return null;
+    }
+
+    private PhysicalNode tryBuildChainedWindowChain(PhysicalNode upstream,
+                                                    List<List<WindowUnit>> groups,
+                                                    List<WorkerRegistration> workers) {
+        WindowChainJoinBase base = probeWindowChainJoinBase(upstream);
         if (base == null) {
             return null;
         }
-
-        // 单窗口组：所有窗口函数必须相同的 PARTITION BY + ORDER BY
-        List<Expression.WindowFunction> wfs = new ArrayList<>();
-        for (LogicalPlan.SelectItem item : windowItems) {
-            wfs.add((Expression.WindowFunction) item.expression());
+        List<FragmentSpec.JoinAlias> aliases = base.outputAliases();
+        DistributedJoinOperator djo = base.join();
+        if (djo == null) {
+            // 派生表 join（DistributedDerivedJoinOperator）：派生流水线 + peer 扫描全部下沉，
+            // 窗口链挂在最末 join 后（withWindowChain 保留派生/peer 编排）。
+            DistributedDerivedJoinOperator ddj = base.derivedJoin();
+            int partitions = ddj.numPartitions();
+            List<FragmentSpec.WindowStep> steps = new ArrayList<>();
+            List<String> inputColumns = new ArrayList<>(upstream.outputColumns());
+            for (List<WindowUnit> group : groups) {
+                FragmentSpec.WindowStep step = toDistributedWindowStep(
+                        inputColumns, group, context.memoryLimit(), partitions);
+                steps.add(step);
+                inputColumns = step.outputColumns();
+            }
+            Operator op = ddj.withWindowChain(steps, aliases);
+            String name = "DistributedJoinWindowChain[groups=" + steps.size()
+                    + ", workers=" + workers.size() + ", partitions=" + partitions + "]";
+            return new PhysicalNode(name, op, inputColumns, List.of());
         }
-        Expression.WindowFunction first = wfs.get(0);
-        // 窗口键含表达式（coalesce / CASE / 算术）→ 分布式窗口只认列名，回退单机物化合成列
-        if (hasWindowKeyExpression(wfs)) {
+        int partitions = djo.numPartitions();
+        if (hasOnResidual(djo) && djo.links().size() == 1 && !hasDerivedSource(djo)) {
+            // 单 join + 窗口链走 DistributedChainedOperator，其 JoinStep 通道尚未携带 ON 残差谓词
+            // （多 join / 派生源走 withWindowChain + planJoinChain，JoinLink 已带残差）→ 回退单机。
             return null;
         }
-        String groupKey = first.partitionBy() + "§" + first.orderBy();
-        for (Expression.WindowFunction wf : wfs) {
-            if (!(wf.partitionBy() + "§" + wf.orderBy()).equals(groupKey)) {
-                return null;
+        List<FragmentSpec.WindowStep> steps = new ArrayList<>();
+        List<String> inputColumns = new ArrayList<>(upstream.outputColumns());
+        for (List<WindowUnit> group : groups) {
+            FragmentSpec.WindowStep step = toDistributedWindowStep(
+                    inputColumns, group, context.memoryLimit(), partitions);
+            steps.add(step);
+            inputColumns = step.outputColumns();
+        }
+
+        String queryId = "query-" + Long.toHexString(System.nanoTime());
+        Operator op;
+        if (djo.links().size() > 1 || hasDerivedSource(djo)) {
+            // 多 join / 派生源：沿用原算子（links + sources 原样），挂窗口链
+            op = djo.withWindowChain(steps, aliases);
+        } else {
+            op = new DistributedChainedOperator(
+                    queryId,
+                    djo.leftCatalog(), djo.leftSchema(), djo.leftTable(), djo.leftKeys(),
+                    djo.rightCatalog(), djo.rightSchema(), djo.rightTable(), djo.rightKeys(),
+                    djo.joinType(), djo.memoryLimit(), partitions,
+                    djo.gateway(), djo.leftProbe(), djo.rightProbe(), djo.workers(), null, steps,
+                    djo.leftFilter(), djo.rightFilter(),
+                    djo.firstColumns(), djo.links().get(0).rightColumns(), aliases);
+        }
+
+        String name = "DistributedJoinWindowChain[groups=" + steps.size()
+                + ", workers=" + workers.size() + ", partitions=" + partitions + "]";
+        return new PhysicalNode(name, op, inputColumns, List.of());
+    }
+
+    /**
+     * 尝试把本层窗口组<b>追加到既有窗口链载体的尾部</b>（窗口 → 投影 → 窗口 形状）。
+     *
+     * <p>病根：上一层的窗口已经下沉成 {@code DistributedWindowChain / DistributedJoinWindowChain}，
+     * 下游只有列裁剪投影时，{@code probeWindowChainJoinBase} 若要求「纯 join 基座」就会判定形状无法
+     * 重建 → 外层窗口回退 Master（嵌套窗口 / 窗口后聚合的常见形状）。这里不再重建载体：取既有整条
+     * {@link FragmentSpec.WindowStep} 链（整体传递，不拆字段），尾部追加本层各组，交给既有调度器
+     * 做组间重分区 —— 内层窗口一段不丢，外层窗口留在 Worker。</p>
+     *
+     * <p>只穿透<b>纯列选择投影</b>（不改名、不新增列）：表达式 / CASE / 改名投影会改变列语义，
+     * 跳过会算错，保持既有回退口径。</p>
+     */
+    private PhysicalNode tryExtendWindowChain(PhysicalNode upstream,
+                                              List<List<WindowUnit>> groups,
+                                              List<WorkerRegistration> workers) {
+        PhysicalNode cur = upstream;
+        // 被穿透投影的吸收项：改名（uid ← user_id）与表达式（amt2 ← amount*2）都改写成
+        // GroupKeyExpression，由窗口链的发送端在重分区前<b>单遍</b>物化（与窗口键合成列同一机制）。
+        List<GroupKeyExpression> absorbed = new ArrayList<>();
+        while (cur.children().size() == 1) {
+            Operator op = cur.operator();
+            PhysicalNode child = cur.children().get(0);
+            if (op instanceof ProjectOperator proj) {
+                if (!proj.isAliased()) {
+                    List<String> out = cur.outputColumns();
+                    // 纯列选择（含收窄子集）—— 只读、不改名、不新增列，可以跳过；列集取上游全部列更保守。
+                    if (!child.outputColumns().containsAll(out)) return null;
+                    cur = child;
+                    continue;
+                }
+                // 改名投影：源列 → 输出列，逐项改写为恒等表达式；同名多副本靠“出现序号”选中，
+                // 单遍表达式无法表达（occurrence > 1）→ 保持回退。
+                for (ProjectOperator.ColumnRef r : proj.refs()) {
+                    if (r.occurrence() != 1) return null;
+                    if (r.sourceName().equals(r.outputName())) continue;
+                    absorbed.add(new GroupKeyExpression(r.outputName(), r.sourceName()));
+                }
+                cur = child;
+                continue;
+            }
+            if (op instanceof ScalarProjectOperator sp) {
+                // 表达式投影：表达式文本原样透传（去限定符 —— Worker ExprParser 不接受 '.'）。
+                for (ScalarProjectOperator.Projection p : sp.projections()) {
+                    absorbed.add(new GroupKeyExpression(p.outputName(),
+                            SqlTextUtil.stripQualifiers(p.exprText())));
+                }
+                cur = child;
+                continue;
+            }
+            break;
+        }
+        if (!(cur.operator() instanceof WindowChainCarrier carrier)) return null;
+        List<FragmentSpec.WindowStep> existing = carrier.windowSteps();
+        if (existing == null || existing.isEmpty()) return null;
+        // DistributedChainedOperator 的单组窗口 followUp 没有独立链字段（replaceWindowSteps 只取末组），
+        // 追加会静默丢掉既有组 —— 这类形状不在此扩展（保持回退口径）。
+        if (carrier instanceof DistributedChainedOperator dco && !dco.hasWindowChain()) return null;
+
+        // 吸收项与窗口键合成列由<b>同一个</b> ExpressionProjectOperator 在发送端一次求值：
+        // 因此每个表达式只能引用载体既有列，且不得引用彼此的输出（不能链式求值）。
+        Set<String> absorbedNames = new HashSet<>();
+        if (!absorbed.isEmpty()) {
+            Set<String> carrierCols = new HashSet<>();
+            for (String c : cur.outputColumns()) carrierCols.add(c.toLowerCase(Locale.ROOT));
+            for (GroupKeyExpression g : absorbed) {
+                String name = g.derivedColumn().toLowerCase(Locale.ROOT);
+                if (!absorbedNames.add(name)) return null;
+                if (carrierCols.contains(name)) return null;   // 与载体列重名 → 语义二义
+                for (String ref : referencedColumnsOfExpr(g.exprText())) {
+                    if (!carrierCols.contains(ref.toLowerCase(Locale.ROOT))) return null;
+                }
+                validateProjectionExpr(cur, g.exprText(), "窗口前投影表达式列");
             }
         }
 
-        List<String> partitionBy = new ArrayList<>();
-        for (String p : first.partitionBy()) {
-            String col = SqlTextUtil.stripQualifier(p);
-            requireWindowColumn(upstream, col, "PARTITION BY 列", p);
-            partitionBy.add(col);
+        int partitions = existing.get(existing.size() - 1).numPartitions();
+        List<FragmentSpec.WindowStep> merged = new ArrayList<>(existing);
+        // 有吸收投影时按投影后的列序（外层窗口引用的就是这些列名）；纯列裁剪时沿用载体全部列更保守。
+        List<String> inputColumns = new ArrayList<>(
+                absorbed.isEmpty() ? cur.outputColumns() : upstream.outputColumns());
+        boolean firstAppended = true;
+        for (List<WindowUnit> group : groups) {
+            FragmentSpec.WindowStep step = toDistributedWindowStep(
+                    inputColumns, group, context.memoryLimit(), partitions);
+            if (firstAppended && !absorbed.isEmpty()) {
+                // 窗口键 / 参数表达式若引用被吸收的投影列，单遍求值不可达 → 保持回退口径。
+                for (GroupKeyExpression g : step.computed()) {
+                    for (String ref : referencedColumnsOfExpr(g.exprText())) {
+                        if (absorbedNames.contains(ref.toLowerCase(Locale.ROOT))) return null;
+                    }
+                }
+                List<GroupKeyExpression> computed = new ArrayList<>(step.computed());
+                computed.addAll(absorbed);
+                step = step.withComputed(computed);
+            }
+            firstAppended = false;
+            merged.add(step);
+            inputColumns = step.outputColumns();
         }
+        // 整链替换（既有组原样保留 + 尾部追加），其余载体状态（links/sources/别名/聚合段）不动。
+        carrier.replaceWindowSteps(merged);
 
-        List<String> orderBy = new ArrayList<>();
-        List<Boolean> ascending = new ArrayList<>();
-        for (String o : first.orderBy()) {
-            SqlTextUtil.OrderKey ok = SqlTextUtil.parseOrderKey(o);
-            requireWindowColumn(upstream, ok.column(), "ORDER BY 列", o);
-            orderBy.add(ok.column());
-            ascending.add(ok.ascending());
+        String name = "DistributedWindowChain[groups=" + merged.size()
+                + ", workers=" + workers.size() + ", partitions=" + partitions + ", extended]";
+        PhysicalNode chainNode = new PhysicalNode(name, cur.operator(), inputColumns, List.of());
+        // 被穿透的投影收窄列要在 Master 侧恢复（执行只走返回的算子链，这里仅重新套一层列选择）。
+        List<String> outCols = new ArrayList<>(upstream.outputColumns());
+        for (String c : inputColumns) {
+            if (!outCols.contains(c)) outCols.add(c);
         }
+        if (outCols.equals(inputColumns)) return chainNode;
+        ProjectOperator proj = new ProjectOperator(cur.operator(), outCols);
+        return new PhysicalNode("Project", proj, outCols, chainNode);
+    }
 
-        List<WindowFunctionSpec> specs = new ArrayList<>();
-        List<String> winOutCols = new ArrayList<>();
-        for (LogicalPlan.SelectItem item : windowItems) {
-            Expression.WindowFunction wf = (Expression.WindowFunction) item.expression();
-            String out = windowOutputName(item, wf);
-            specs.add(toWindowSpec(wf, out));
-            winOutCols.add(out);
-        }
+    /**
+     * 尝试构建分布式 <b>裸表扫描→多窗口分组链</b>：上游为基表扫描。Worker 扫描一次，按首组键
+     * 分区后依次执行各组窗口，组间按下一组键重分区；键表达式由发送端在重分区前物化。
+     */
+    private PhysicalNode tryBuildDistributedWindowChain(PhysicalNode upstream,
+                                                        List<List<WindowUnit>> groups,
+                                                        List<WorkerRegistration> workers) {
+        BaseTable base = extractBaseTable(upstream);
+        if (base == null) return null;
 
         int partitions = Math.max(1, context.parallelism());
-        String queryId = "query-" + Long.toHexString(System.nanoTime());
-        DojaoConnector probe = context.connectorProvider().get(base.catalog);
-        // 生产者扫描只取窗口前的输出列（projection），保证 Worker 输出 schema 与下游声明一致。
-        // 连接器不兑现下推时，filterExpression 由 Worker 侧引擎 Filter 求值 → 谓词引用的列必须在
-        // 扫描时就取回来，否则 Filter 找不到列（恒假 / 报错）。多取的列由上游 Project 裁掉，无害。
+        List<FragmentSpec.WindowStep> steps = new ArrayList<>();
+        List<String> inputColumns = new ArrayList<>(upstream.outputColumns());
+        for (List<WindowUnit> group : groups) {
+            FragmentSpec.WindowStep step = toDistributedWindowStep(
+                    inputColumns, group, context.memoryLimit(), partitions);
+            steps.add(step);
+            inputColumns = step.outputColumns();
+        }
+        List<String> winOutCols = inputColumns.subList(upstream.outputColumns().size(), inputColumns.size());
+
+        DojaoConnector probe = connectorFor(base.catalog);
+        // 生产者扫描只取窗口前的输出列；连接器不兑现下推时把引擎过滤列并进扫描投影。
         List<String> projection = new ArrayList<>(upstream.outputColumns());
         if (probe != null && !probe.supportsPredicatePushdown()) {
             for (String c : engineFilterColumns(base.predicates)) {
                 if (!projection.contains(c)) projection.add(c);
             }
         }
+
+        String queryId = "query-" + Long.toHexString(System.nanoTime());
         DistributedWindowOperator op = new DistributedWindowOperator(
-                queryId, base.baseRequest, base.predicates, projection,
-                partitionBy, orderBy, ascending, specs,
+                queryId, base.baseRequest, base.predicates, projection, steps,
                 context.memoryLimit(), partitions, context.workerGateway(), probe, workers);
-        // 对外输出列 = 上游输出列（不含引擎过滤列）。扫描投影 projection 多带的过滤列（不兑现下推
-        // 时引擎要在 Worker 侧求值谓词）只用于 Filter，不能出现在回传页 / CTAS 建表里。
         op.setVisibleColumns(upstream.outputColumns());
 
         List<String> outCols = new ArrayList<>(upstream.outputColumns());
         outCols.addAll(winOutCols);
-        String name = "DistributedWindow[partitionBy=" + partitionBy
+        String name = "DistributedWindowChain[groups=" + steps.size()
                 + ", workers=" + workers.size() + ", partitions=" + partitions + "]";
         return new PhysicalNode(name, op, outCols, List.of());
     }
 
     /**
-     * 尝试构建分布式 <b>join→窗口</b> 链（Phase 2，零二次交换）：上游是分布式单 join 且
-     * 单窗口组的 PARTITION BY == join 一侧的 key → join 输出已在归属 Worker 上按 key 分布，
-     * 窗口直接在本地 join 输出上排序 + 逐行计算。否则返回 null → 回退单机。
-     */
-    private PhysicalNode tryBuildChainedWindow(PhysicalNode upstream,
-                                               List<LogicalPlan.SelectItem> windowItems,
-                                               List<WorkerRegistration> workers) {
-        DistributedJoinOperator djo = extractDistributedJoin(upstream);
-        // 派生源链不能重建为 DistributedChainedOperator（无 sources 参数 → 流水线丢失）→ Master 本地窗口兜底
-        if (djo == null || hasDerivedSource(djo)) {
-            return null;
-        }
-
-        // 单窗口组：所有窗口函数必须相同的 PARTITION BY + ORDER BY
-        List<Expression.WindowFunction> wfs = new ArrayList<>();
-        for (LogicalPlan.SelectItem item : windowItems) {
-            wfs.add((Expression.WindowFunction) item.expression());
-        }
-        Expression.WindowFunction first = wfs.get(0);
-        // 窗口键含表达式（coalesce / CASE / 算术）→ 分布式窗口只认列名，回退单机物化合成列
-        if (hasWindowKeyExpression(wfs)) {
-            return null;
-        }
-        String groupKey = first.partitionBy() + "§" + first.orderBy();
-        for (Expression.WindowFunction wf : wfs) {
-            if (!(wf.partitionBy() + "§" + wf.orderBy()).equals(groupKey)) {
-                return null;
-            }
-        }
-
-        List<String> partitionBy = new ArrayList<>();
-        for (String p : first.partitionBy()) {
-            String col = SqlTextUtil.stripQualifier(p);
-            requireWindowColumn(upstream, col, "PARTITION BY 列", p);
-            partitionBy.add(col);
-        }
-
-        // 同 key 前置：PARTITION BY 必须与 join 一侧的 key 完全一致（顺序敏感 → 哈希输入一致 → 零交换）
-        if (!partitionBy.equals(djo.leftKeys()) && !partitionBy.equals(djo.rightKeys())) {
-            return null;
-        }
-
-        List<String> orderBy = new ArrayList<>();
-        List<Boolean> ascending = new ArrayList<>();
-        for (String o : first.orderBy()) {
-            SqlTextUtil.OrderKey ok = SqlTextUtil.parseOrderKey(o);
-            requireWindowColumn(upstream, ok.column(), "ORDER BY 列", o);
-            orderBy.add(ok.column());
-            ascending.add(ok.ascending());
-        }
-
-        List<WindowFunctionSpec> specs = new ArrayList<>();
-        List<String> winOutCols = new ArrayList<>();
-        for (LogicalPlan.SelectItem item : windowItems) {
-            Expression.WindowFunction wf = (Expression.WindowFunction) item.expression();
-            String out = windowOutputName(item, wf);
-            specs.add(toWindowSpec(wf, out));
-            winOutCols.add(out);
-        }
-
-        int partitions = djo.numPartitions();
-        String queryId = "query-" + Long.toHexString(System.nanoTime());
-        FragmentSpec.WindowStep step = new FragmentSpec.WindowStep(
-                partitionBy, orderBy, ascending, specs, context.memoryLimit(), partitions);
-        DistributedChainedOperator op = new DistributedChainedOperator(
-                queryId,
-                djo.leftCatalog(), djo.leftSchema(), djo.leftTable(), djo.leftKeys(),
-                djo.rightCatalog(), djo.rightSchema(), djo.rightTable(), djo.rightKeys(),
-                djo.joinType(), djo.memoryLimit(), partitions,
-                djo.gateway(), djo.leftProbe(), djo.rightProbe(), djo.workers(), step,
-                djo.leftFilter(), djo.rightFilter(),
-                djo.firstColumns(), djo.links().get(0).rightColumns());
-
-        List<String> outCols = new ArrayList<>(upstream.outputColumns());
-        outCols.addAll(winOutCols);
-        String name = "DistributedJoinWindow[partitionBy=" + partitionBy
-                + ", workers=" + workers.size() + ", partitions=" + partitions + "]";
-        return new PhysicalNode(name, op, outCols, List.of());
-    }
-
-    /**
-     * 尝试构建分布式 <b>聚合→窗口</b>（两级全下沉 Worker）：上游恰为分布式聚合算子
-     * （{@link DistributedJoinAggregationOperator} join 二次 shuffle 聚合 / {@link DistributedAggregationOperator}
-     * 裸表聚合）且单窗口组时命中 —— 把聚合段重建为 {@code MiddleAggregateConsumer}（非终端，聚合后按
-     * 窗口键重哈希推窗口交换）+ 每 Worker 一个终端 {@code WindowConsumer}（本地窗口 → sink / 回传），
-     * 两级都留在 Worker（数据不回 Master）。写形态（CTAS / INSERT INTO / INSERT OVERWRITE）因新算子
-     * 是 {@code AbstractDistributedOperator} 而自动全分布式（{@code setSink} / {@code setOverwriteLifecycle}
-     * / {@code outputFields} 全部继承自基类）。否则返回 null → 回退单机（或 OVERWRITE 报暂不支持）。
+     * 同组窗口单元 → 分布式 {@link FragmentSpec.WindowStep}。
      *
-     * <p>窗口键（PARTITION BY / ORDER BY / 输入列）须 ∈ 聚合输出列（分组键 + 聚合结果列，requireColumn
-     * 校验）；全局窗口（空 PARTITION BY）→ 聚合输出全落 pid 0 → worker 0 单分区全局排序（已知边界）。</p>
+     * <p>窗口键 / 值参数可以是<b>任意表达式</b>（coalesce / CASE / 算术 / CAST）：与单机路径同法，
+     * 先把表达式物化成合成列（{@code __win_key_N} / {@code __win_arg_N}），窗口定义改写为引用合成列。
+     * 合成列由<b>发送端</b>（Producer / 中间层 / join 消费者）在重分区前计算并登记在
+     * {@link FragmentSpec.WindowStep#computed()}；接收端窗口只看裸列名，因此表达式键同样全分布式。</p>
+     *
+     * <p>输出列 = 本步输入列 + 本组窗口函数输出列（{@link FragmentSpec.WindowStep#outputColumns()}），
+     * Worker 端窗口算完即收窄到该清单，丢掉临时合成列。</p>
+     *
+     * @param inputColumns 本步窗口输入页的列序（首组 = 上游输出列；后续组 = 前一组窗口输出列）
      */
-    private PhysicalNode tryBuildAggregateWindow(PhysicalNode upstream,
-                                                 List<LogicalPlan.SelectItem> windowItems,
-                                                 List<WorkerRegistration> workers) {
-        Operator up = upstream.operator();
-        if (!(up instanceof DistributedJoinAggregationOperator)
-                && !(up instanceof DistributedAggregationOperator)) {
-            return null;
-        }
-        // GROUP BY 表达式派生键：聚合→窗口的两级下沉重建无法在聚合 Producer 上重放派生列
-        // （planAggregateWindow 不承载 groupKeyExpressions）→ 回退，窗口在 Master 侧对该聚合
-        // 输出执行（聚合输出页含派生键列，Master 窗口按名解析仍正确，只是不过 Worker）。
-        if (up instanceof DistributedAggregationOperator dao
-                && !dao.groupKeyExpressions().isEmpty()) {
-            return null;
-        }
+    private FragmentSpec.WindowStep toDistributedWindowStep(List<String> inputColumns,
+                                                            List<WindowUnit> group,
+                                                            long memoryLimit, int numPartitions) {
+        Expression.WindowFunction first = group.get(0).wf();
 
-        // 单窗口组：所有窗口函数必须相同的 PARTITION BY + ORDER BY
-        List<Expression.WindowFunction> wfs = new ArrayList<>();
-        for (LogicalPlan.SelectItem item : windowItems) {
-            wfs.add((Expression.WindowFunction) item.expression());
-        }
-        Expression.WindowFunction first = wfs.get(0);
-        // 窗口键含表达式（coalesce / CASE / 算术）→ 分布式窗口只认列名，回退单机物化合成列
-        if (hasWindowKeyExpression(wfs)) {
-            return null;
-        }
-        String groupKey = first.partitionBy() + "§" + first.orderBy();
-        for (Expression.WindowFunction wf : wfs) {
-            if (!(wf.partitionBy() + "§" + wf.orderBy()).equals(groupKey)) {
-                return null;
+        // 键 / 值表达式 → 合成列（与单机 buildWindows 同口径）
+        Map<String, String> keyExprCols = new LinkedHashMap<>();
+        for (WindowUnit u : group) {
+            Expression.WindowFunction wf = u.wf();
+            for (String p : wf.partitionBy()) {
+                String t = windowKeyText(p);
+                if (!SqlTextUtil.isSingleIdentifier(t)) {
+                    keyExprCols.putIfAbsent(t, WINDOW_KEY_ALIAS_PREFIX + keyExprCols.size());
+                }
             }
+            for (String o : wf.orderBy()) {
+                String t = windowKeyText(o);
+                if (!SqlTextUtil.isSingleIdentifier(t)) {
+                    keyExprCols.putIfAbsent(t, WINDOW_KEY_ALIAS_PREFIX + keyExprCols.size());
+                }
+            }
+            if (!wf.args().isEmpty()) {
+                String a = wf.args().get(0).trim();
+                if (!a.isEmpty() && !a.equals("*")
+                        && !SqlTextUtil.isSingleIdentifier(SqlTextUtil.stripQualifier(a))) {
+                    keyExprCols.putIfAbsent(a, WINDOW_ARG_ALIAS_PREFIX + keyExprCols.size());
+                }
+            }
+        }
+        List<GroupKeyExpression> computed = new ArrayList<>();
+        for (Map.Entry<String, String> e : keyExprCols.entrySet()) {
+            // Worker 侧 ExprParser 不接受限定符 → 物化表达式先去限定符（跳过字符串字面量）
+            String exprText = SqlTextUtil.stripQualifiers(e.getKey());
+            requireWindowInputColumns(inputColumns, referencedColumnsOfExpr(exprText),
+                    "键表达式列", e.getKey());
+            computed.add(new GroupKeyExpression(e.getValue(), exprText));
         }
 
         List<String> partitionBy = new ArrayList<>();
         for (String p : first.partitionBy()) {
-            String col = SqlTextUtil.stripQualifier(p);
-            requireWindowColumn(upstream, col, "PARTITION BY 列", p);
+            String t = windowKeyText(p);
+            String col = keyExprCols.getOrDefault(t, t);
+            if (keyExprCols.containsKey(t)) {
+                requireWindowInputColumns(inputColumns, referencedColumnsOfExpr(t), "PARTITION BY 列", p);
+            } else {
+                requireWindowInputColumn(inputColumns, col, "PARTITION BY 列", p);
+            }
             partitionBy.add(col);
         }
 
         List<String> orderBy = new ArrayList<>();
         List<Boolean> ascending = new ArrayList<>();
         for (String o : first.orderBy()) {
-            SqlTextUtil.OrderKey ok = SqlTextUtil.parseOrderKey(o);
-            requireWindowColumn(upstream, ok.column(), "ORDER BY 列", o);
-            orderBy.add(ok.column());
+            SqlTextUtil.OrderKey ok = SqlTextUtil.parseOrderKey(SqlTextUtil.stripQualifiers(o));
+            String col = keyExprCols.getOrDefault(ok.column(), ok.column());
+            if (keyExprCols.containsKey(ok.column())) {
+                requireWindowInputColumns(inputColumns, referencedColumnsOfExpr(ok.column()), "ORDER BY 列", o);
+            } else {
+                requireWindowInputColumn(inputColumns, col, "ORDER BY 列", o);
+            }
+            orderBy.add(col);
             ascending.add(ok.ascending());
         }
 
         List<WindowFunctionSpec> specs = new ArrayList<>();
-        List<String> winOutCols = new ArrayList<>();
-        for (LogicalPlan.SelectItem item : windowItems) {
-            Expression.WindowFunction wf = (Expression.WindowFunction) item.expression();
-            String out = windowOutputName(item, wf);
-            specs.add(toWindowSpec(wf, out));
-            winOutCols.add(out);
+        List<String> outColumns = new ArrayList<>(inputColumns);
+        for (WindowUnit u : group) {
+            specs.add(toWindowSpec(u.wf(), u.out(), keyExprCols));
+            outColumns.add(u.out());
         }
+        return new FragmentSpec.WindowStep(partitionBy, orderBy, ascending, specs,
+                memoryLimit, Math.max(1, numPartitions), null, computed, outColumns);
+    }
+
+    /** 裸列键：必须在本步窗口输入列中（大小写不敏感）；否则计划期响亮报错。 */
+    private static void requireWindowInputColumn(List<String> inputColumns, String col,
+                                                 String what, String original) {
+        for (String c : inputColumns) {
+            if (c.equalsIgnoreCase(col)) return;
+        }
+        throw new UnsupportedOperationException(
+                "Dojao 物理规划: 窗口 " + what + " 别名解析失败: '" + original.trim()
+                        + "'（解析为列 '" + col + "'，窗口输入可用列: " + inputColumns + "）");
+    }
+
+    /** 表达式键：引用的每一列都必须在窗口输入列中（大小写不敏感）。 */
+    private static void requireWindowInputColumns(List<String> inputColumns, Set<String> referenced,
+                                                  String what, String original) {
+        for (String ref : referenced) {
+            requireWindowInputColumn(inputColumns, ref, what, original);
+        }
+    }
+
+    /**
+     * 尝试构建分布式 <b>聚合→多窗口分组链</b>：上游恰为分布式聚合算子
+     * （{@link DistributedJoinAggregationOperator} join 二次 shuffle 聚合 / {@link DistributedAggregationOperator}
+     * 裸表聚合）且窗口分成多组时命中。聚合段重建为 {@code MiddleAggregateConsumer}（非终端，聚合后按
+     * 首组窗口键重哈希推窗口交换），各组窗口依次在 Worker 上执行、组间按下一组键重分区 ——
+     * 聚合结果与中间窗口结果都不回 Master。
+     *
+     * <p>按分组顺序串起任意组数（顺序 = SELECT 中首次出现顺序）；窗口键含表达式时由发送端物化
+     * 合成列（见 {@link #toDistributedWindowStep}），不退回单机。</p>
+     */
+    private PhysicalNode tryBuildAggregateWindowChain(PhysicalNode upstream,
+                                                      List<List<WindowUnit>> groups,
+                                                      List<WorkerRegistration> workers) {
+        // 「多 join 链 → 同 key 聚合」之上再开窗：上游已是 DistributedJoinOperator + followUp
+        // 聚合（它是后续计算边界，不能再被当成裸 join 重建），但整条 join+聚合+窗口仍可交给
+        // DistributedAggregateWindowOperator（join 源）——聚合按分组键二次 shuffle 后留在 Worker，
+        // 窗口就地叠加。否则外层窗口只能回退 Master，把全部分组行拉回单机。
+        PhysicalNode overChainedJoin = tryBuildAggregateWindowOverChainedJoin(upstream, groups, workers);
+        if (overChainedJoin != null) {
+            return overChainedJoin;
+        }
+        AggWindowBase base = extractAggWindowBase(upstream);
+        if (base == null) {
+            return null;
+        }
+        Operator up = base.operator();
+        // ROLLUP / CUBE / GROUPING SETS（expand）：DistributedAggregateWindowOperator 的聚合段
+        // 没有 expand 通道，就地重建会把 grouping-set 组合静默丢掉 → 显式回退（上游聚合仍是分布式，
+        // 只有窗口回到 Master 单机，结果正确）。宁可少下沉，也不能静默算错。
+        FragmentSpec.ExpandStep expand = up instanceof DistributedJoinAggregationOperator djao
+                ? djao.expand() : ((DistributedAggregationOperator) up).expand();
+        if (expand != null) {
+            reportFallback("聚合→窗口：上游含 ROLLUP/CUBE/GROUPING SETS（expand），窗口不下沉");
+            return null;
+        }
+        // join 聚合 + 派生源（子查询 / CTE 流水线）：DistributedAggregateWindowOperator 无 sources
+        // 通道，重建会丢派生流水线 → 此时窗口回退（建在已是分布式、且只回传最终分组的小结果上）。
+        if (up instanceof DistributedJoinAggregationOperator djao && hasDerivedSource(djao.sources())) {
+            reportFallback("聚合→窗口：上游含派生源（子查询 / CTE），窗口不下沉");
+            return null;
+        }
+        String havingFilter = base.having();
 
         int partitions = Math.max(1, context.parallelism());
+        long memoryLimit = context.memoryLimit();
+        List<FragmentSpec.WindowStep> steps = new ArrayList<>();
+        List<String> aggColumns = base.inputColumns();
+        List<String> inputColumns = new ArrayList<>(aggColumns);
+        for (List<WindowUnit> group : groups) {
+            FragmentSpec.WindowStep step = toDistributedWindowStep(
+                    inputColumns, group, memoryLimit, partitions);
+            steps.add(step);
+            inputColumns = step.outputColumns();
+        }
+        List<String> winOutCols = inputColumns.subList(aggColumns.size(), inputColumns.size());
+
         String queryId = "query-" + Long.toHexString(System.nanoTime());
-        // 两类聚合源重建「聚合 → 窗口」两级下沉：join 源（links）重建 join 链（原算子丢弃，探针连接器
-        // 移交给新算子统一释放）；scan 源重建裸表聚合链。
         AbstractDistributedOperator op;
         if (up instanceof DistributedJoinAggregationOperator djao) {
             op = new DistributedAggregateWindowOperator(queryId,
                     djao.firstCatalog(), djao.firstSchema(), djao.firstTable(), djao.firstLeftKeys(),
                     djao.firstProbe(), djao.firstFilter(), djao.links(),
-                    djao.groupKeys(), djao.aggregations(), djao.caseProjections(), djao.memoryLimit(),
-                    partitionBy, orderBy, ascending, specs, partitions,
-                    context.workerGateway(), workers, djao.firstColumns());
+                    djao.groupKeys(), djao.aggregations(), djao.caseProjections(),
+                    djao.groupKeyExpressions(), havingFilter, djao.memoryLimit(),
+                    partitions, context.workerGateway(), workers, djao.firstColumns(), steps);
         } else {
             DistributedAggregationOperator dao = (DistributedAggregationOperator) up;
             op = new DistributedAggregateWindowOperator(queryId,
                     dao.baseRequest(), dao.predicates(), dao.probe(),
-                    dao.keyColumns(), dao.aggregations(), dao.caseProjections(), dao.memoryLimit(),
-                    partitionBy, orderBy, ascending, specs, partitions,
-                    context.workerGateway(), workers);
+                    dao.keyColumns(), dao.aggregations(), dao.caseProjections(),
+                    dao.groupKeyExpressions(), havingFilter, dao.memoryLimit(),
+                    partitions, context.workerGateway(), workers, steps);
         }
 
-        List<String> outCols = new ArrayList<>(upstream.outputColumns());
+        List<String> outCols = new ArrayList<>(aggColumns);
         outCols.addAll(winOutCols);
-        String name = "DistributedAggregateWindow[partitionBy=" + partitionBy
-                + ", workers=" + workers.size() + ", partitions=" + partitions + "]";
+        String name = "DistributedAggregateWindowChain[groups=" + steps.size()
+                + ", workers=" + workers.size() + ", partitions=" + partitions
+                + (havingFilter == null ? "" : ", having") + "]";
         return new PhysicalNode(name, op, outCols, List.of());
+    }
+
+    /**
+     * 「多 join 链 → 同 key 聚合 → 窗口」整体下沉：上游是携带 {@code followUp} 聚合的
+     * {@link DistributedJoinOperator}（多 join 链的零二次交换聚合）。它已成后续计算边界，
+     * 不能再被当作裸 join 重建；但可把它整条重建为 join 源的
+     * {@link DistributedAggregateWindowOperator}：
+     *
+     * <pre>
+     * 扫 T0/T1/… ─► join ─► 按分组键重哈希 ─► 聚合 ─► 按窗口键重哈希 ─► 窗口链 ─► Master/sink
+     * </pre>
+     *
+     * <p>重建约束（与 {@code tryBuildChainedMultiJoinAggregation} 同口径）：不支持 CROSS 链 /
+     * 派生源（AWO 无 {@code sources} 通道）/ 外连接消歧别名（AWO 无 aliases 通道）；不满足时返回
+     * null，外层窗口仍走 Master（内层 join+聚合仍分布式）。</p>
+     */
+    private PhysicalNode tryBuildAggregateWindowOverChainedJoin(PhysicalNode upstream,
+                                                                 List<List<WindowUnit>> groups,
+                                                                 List<WorkerRegistration> workers) {
+        Operator op = upstream.operator();
+        if (!(op instanceof DistributedJoinOperator djo)
+                || !(djo.followUp() instanceof FragmentSpec.AggregateStep agg)
+                || !djo.windowChain().isEmpty()
+                || djo.links().isEmpty()
+                || hasCrossLink(djo)
+                || hasDerivedSource(djo)
+                || !djo.outputAliases().isEmpty()) {
+            return null;
+        }
+        List<AggregationSpec> aggs = new ArrayList<>(agg.aggregations().size());
+        for (FragmentSpec.AggregationDto dto : agg.aggregations()) {
+            aggs.add(aggregationSpecFromDto(dto));
+        }
+
+        int partitions = Math.max(1, context.parallelism());
+        long memoryLimit = context.memoryLimit();
+        List<String> aggColumns = List.copyOf(upstream.outputColumns());
+        List<String> inputColumns = new ArrayList<>(aggColumns);
+        List<FragmentSpec.WindowStep> steps = new ArrayList<>();
+        for (List<WindowUnit> group : groups) {
+            FragmentSpec.WindowStep step = toDistributedWindowStep(
+                    inputColumns, group, memoryLimit, partitions);
+            steps.add(step);
+            inputColumns = step.outputColumns();
+        }
+
+        String queryId = "query-" + Long.toHexString(System.nanoTime());
+        Operator rebuilt = new DistributedAggregateWindowOperator(queryId,
+                djo.leftCatalog(), djo.leftSchema(), djo.leftTable(), djo.leftKeys(),
+                djo.leftProbe(), djo.leftFilter(), djo.links(),
+                agg.keyColumns(), aggs, agg.caseProjections(), memoryLimit,
+                partitions, context.workerGateway(), workers, djo.firstColumns(), steps);
+
+        List<String> outCols = new ArrayList<>(aggColumns);
+        outCols.addAll(inputColumns.subList(aggColumns.size(), inputColumns.size()));
+        String name = "DistributedAggregateWindowChain[groups=" + steps.size()
+                + ", workers=" + workers.size() + ", partitions=" + partitions + ", join]";
+        return new PhysicalNode(name, rebuilt, outCols, List.of());
+    }
+
+    /**
+     * {@link FragmentSpec.AggregationDto} → 运行期 {@link AggregationSpec}（重建舞台时需要）。
+     * 口径与 Worker 侧 {@code FragmentExecutor.aggregationSpecFor} 一致：collect-evaluate 型先查
+     * {@link CollectAggregateRegistry}，增量型内置优先、再查全局注册表。
+     */
+    private static AggregationSpec aggregationSpecFromDto(FragmentSpec.AggregationDto dto) {
+        CollectAggregateFunction collectFn = CollectAggregateRegistry.getGlobal(dto.aggregateName());
+        if (collectFn != null) {
+            return AggregationSpec.collect(dto.outputColumn(), collectFn, dto.collectInputColumns());
+        }
+        String out = dto.outputColumn();
+        String in = dto.inputColumn();
+        return switch (dto.aggregateName().toLowerCase(java.util.Locale.ROOT)) {
+            case "count" -> in == null ? AggregationSpec.count(out) : AggregationSpec.count(in, out);
+            case "count_distinct" -> AggregationSpec.countDistinct(in, out);
+            case "sum" -> AggregationSpec.sum(in, out);
+            case "sum_int64" -> AggregationSpec.sumInt64(in, out);
+            case "avg" -> AggregationSpec.avg(in, out);
+            case "min" -> AggregationSpec.min(in, out);
+            case "max" -> AggregationSpec.max(in, out);
+            default -> {
+                AggregateFunction<?> custom = AggregateFunctionRegistry.getGlobal(dto.aggregateName());
+                if (custom == null) {
+                    throw unsupported("分布式聚合不支持的函数: " + dto.aggregateName());
+                }
+                yield AggregationSpec.aggregate(in, out, custom);
+            }
+        };
+    }
+
+    /**
+     * 聚合→窗口重建的基座：下方的聚合算子 + 其输出列 + 可下沉的 HAVING 谓词。
+     *
+     * <p>HAVING 在 {@code buildSelect} 里落在聚合之上的 {@link FilterOperator}（形态① =
+     * 单个简单谓词，{@link FilterOperator#filterExpression()} 可取原文）；窗口前的纯投影
+     * （列裁剪）/ CASE 派生列包装可穿透。形态②/③（一般布尔求值的 ScalarProject、
+     * 非标识符列名改名的 ColumnAlias）不在此识别 → 返回 null，窗口仍按原路径在 Master 过滤。</p>
+     *
+     * <p>下沉的安全性：聚合在 Worker 上按分组键 co-partition，本地聚合即最终聚合，
+     * 聚合之后的过滤与 Master 侧 HAVING 逐行等价；重建的舞台取代整条
+     * {@code Project→Filter→Agg} 链，Master 不会二次过滤。</p>
+     */
+    private record AggWindowBase(Operator operator, List<String> inputColumns, String having) {}
+
+    private AggWindowBase extractAggWindowBase(PhysicalNode node) {
+        Operator op = node.operator();
+        if (op instanceof DistributedJoinAggregationOperator
+                || op instanceof DistributedAggregationOperator) {
+            return new AggWindowBase(op, node.outputColumns(), null);
+        }
+        if (node.children().size() != 1) {
+            return null;
+        }
+        PhysicalNode child = node.children().get(0);
+        // 窗口前的纯投影（列裁剪）/ CASE 派生列包装：列集取聚合算子自身（被替换后重新放宽），可穿透。
+        if (op instanceof ProjectOperator || op instanceof CaseProjectOperator) {
+            return extractAggWindowBase(child);
+        }
+        // HAVING（形态①）：只认直接 Filter，且只允许一层 —— 多层叠加语义不明，保持 Master 过滤。
+        if (op instanceof FilterOperator f && f.filterExpression() != null) {
+            AggWindowBase below = extractAggWindowBase(child);
+            return (below == null || below.having() != null) ? null
+                    : new AggWindowBase(below.operator(), below.inputColumns(), f.filterExpression());
+        }
+        return null;
+    }
+
+    /** {@code sources} 列表是否含任何派生源（null 列表 / 全 null = 纯基表链）。 */
+    private static boolean hasDerivedSource(List<StageScheduler.DerivedSource> sources) {
+        if (sources == null) {
+            return false;
+        }
+        for (StageScheduler.DerivedSource ds : sources) {
+            if (ds != null) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** 一个待计算的窗口值：{@code wf} + 输出列（根窗口 = 别名/默认名，嵌套窗口 = 合成列）。 */
@@ -6661,43 +7774,63 @@ public final class Planner {
         return units;
     }
 
+    /**
+     * 集中回退出口：分布式计划无法覆盖某一段时，该段退回 Master 单机执行。
+     *
+     * <p>所有「认不出形状 → 单机」的路径都必须经过这里，禁止静默回退。默认只打印带原因的
+     * 告警；开启 {@code -Dplanner.distributed.strict=true} 后直接抛错，把残余缺口在 CI/探针中
+     * 逼出来（用于确认哪些 SQL 形状仍未分布式化）。</p>
+     */
+    private static void reportFallback(String reason) {
+        if (Boolean.getBoolean("planner.distributed.strict")) {
+            throw new IllegalStateException("[Planner] 分发回退（strict）：" + reason);
+        }
+        System.err.printf("[Planner] 分发回退：%s —— 该段将在 Master 单机执行，失去分布式并行度%n", reason);
+    }
+
     private PhysicalNode buildWindows(PhysicalNode upstream, List<LogicalPlan.SelectItem> windowItems,
                                       LogicalPlan.Select select) {
-        // 「窗口嵌在表达式里」（gmv / sum(gmv) OVER ()）只走单机物化：分布式窗口把「整项窗口」
-        // 当输出列回传，外层算术只能在 Master 的标量投影里求值，没有对应的下发格式。
-        boolean hasNested = windowItems.stream().anyMatch(it -> !it.windowCalls().isEmpty());
-        // 分布式执行（开关默认关）：单窗口组 + 上游为裸表扫描时，把窗口整条链路派发到 Worker
-        // 执行（扫描 → 按 PARTITION BY 哈希分区 → Worker 本地排序 + 逐行计算 → 回传 Master）；
-        // 上游为分布式 join 且 PARTITION BY == join 键时，链式窗口零二次交换（Phase 2）。
-        // 其余情况静默回退单机路径（行为不变）。
-        if (context.distributedExecution() && !hasNested) {
-            List<WorkerRegistration> healthy = WorkerRegistry.get().healthy(context.workerHealthTimeoutMs());
-            if (!healthy.isEmpty()) {
-                PhysicalNode distributed = tryBuildDistributedWindow(upstream, windowItems, healthy);
-                if (distributed != null) {
-                    return distributed;
-                }
-                PhysicalNode chained = tryBuildChainedWindow(upstream, windowItems, healthy);
-                if (chained != null) {
-                    return chained;
-                }
-                // 聚合→窗口（两级全下沉 Worker）：上游恰为分布式聚合算子（join 二次 shuffle / 裸表聚合）
-                // → 聚合段重建为 MiddleAggregateConsumer（非终端）+ 终端 WindowConsumer，窗口输出就地写 / 回传
-                PhysicalNode aggregateWindow = tryBuildAggregateWindow(upstream, windowItems, healthy);
-                if (aggregateWindow != null) {
-                    return aggregateWindow;
-                }
-            }
-        }
-
         // 归一化成窗口单元：整项窗口的 output 列名 = 别名 / 默认窗口名；嵌在表达式里的窗口
         // 输出到合成列 __win_expr_<SELECT 项序号>_<窗口序号>，最终投影再把引用回写进表达式。
+        // 嵌套窗口同样走分布式：下发格式就是「普通窗口输出列」，外层算术由 Master 的最终投影求值。
         List<WindowUnit> units = windowUnits(windowItems, select);
 
+        // 按「PARTITION BY + ORDER BY」分组；顺序即 SELECT 中首次出现顺序。
         Map<String, List<WindowUnit>> groups = new LinkedHashMap<>();
         for (WindowUnit u : units) {
             String key = u.wf().partitionBy() + "§" + u.wf().orderBy();
             groups.computeIfAbsent(key, k -> new ArrayList<>()).add(u);
+        }
+        List<List<WindowUnit>> groupList = new ArrayList<>(groups.values());
+
+        // 分布式执行（开关默认关）：所有窗口分组统一走 Worker 侧窗口链 ——
+        // join→窗口→重分区→窗口… / 扫描→窗口→重分区→窗口… / 聚合→窗口→…，组间数据不回 Master。
+        // 单组、键 != join 键、键含表达式、嵌套窗口都在此下沉；只有上游形状完全无法重建时才回退
+        // 单机（并显式告警，不再静默）。
+        if (context.distributedExecution()) {
+            List<WorkerRegistration> healthy = WorkerRegistry.get().healthy(context.workerHealthTimeoutMs());
+            if (!healthy.isEmpty()) {
+                // join→窗口（单 join / 多 join 链 / 含派生源）；首组与 join 键不同时 Worker 内重分区
+                PhysicalNode chain = tryBuildChainedWindowChain(upstream, groupList, healthy);
+                // 裸表扫描→窗口链
+                if (chain == null) {
+                    chain = tryBuildDistributedWindowChain(upstream, groupList, healthy);
+                }
+                // 聚合→窗口链（聚合结果就地喂窗口，不回 Master）
+                if (chain == null) {
+                    chain = tryBuildAggregateWindowChain(upstream, groupList, healthy);
+                }
+                // 既有窗口链→窗口（窗口后仅列裁剪投影）：把本层各组追加到链尾，组间 Worker 内重分区
+                if (chain == null) {
+                    chain = tryExtendWindowChain(upstream, groupList, healthy);
+                }
+                if (chain != null) {
+                    return chain;
+                }
+                reportFallback("窗口（" + groupList.size() + " 组）无法全分布式执行，上游 " + upstream.name());
+            } else {
+                reportFallback("窗口（" + groupList.size() + " 组）无健康 Worker，上游 " + upstream.name());
+            }
         }
 
         // ★窗口键表达式：PARTITION BY / ORDER BY 里允许函数 / 算术（如 coalesce(province,'__NA__')）。
@@ -6878,15 +8011,28 @@ public final class Planner {
         return t;
     }
 
-    /** 表达式文本引用的列（供列裁剪；标量函数走 ScalarExpr，其余走通用表达式解析）。解析失败返回空集。 */
+    /**
+     * 表达式文本引用的列（供列裁剪；标量函数走 ScalarExpr，其余走通用表达式解析）。解析失败返回空集。
+     *
+     * <p>★{@code ScalarExpr} 快路径必须同时收 {@link ScalarExpr.ScalarArg.ComparisonArg}：IF / CASE
+     * 的条件参数（{@code if(event_type &lt;&gt; 'app_launch', amount, 0)}）只以比较参数形式出现，
+     * 只收 {@code ColumnArg} 会把 {@code event_type} 漏掉 → 窗口参数物化（{@code __win_arg_N}）前
+     * 被列裁剪掉 → 规划期「找不到窗口键表达式列」。参数非简单形态时再走通用解析补全。</p>
+     */
     private static Set<String> referencedColumnsOfExpr(String text) {
         Set<String> cols = new LinkedHashSet<>();
         Optional<ScalarExpr> fn = ScalarExpr.tryParse(text);
         if (fn.isPresent()) {
             for (ScalarExpr.ScalarArg arg : fn.get().args()) {
-                if (arg instanceof ScalarExpr.ScalarArg.ColumnArg c) cols.add(c.column());
+                if (arg instanceof ScalarExpr.ScalarArg.ColumnArg c) {
+                    cols.add(c.column());
+                } else if (arg instanceof ScalarExpr.ScalarArg.ComparisonArg ca) {
+                    addIfColumnRef(cols, ca.left());
+                    addIfColumnRef(cols, ca.right());
+                }
             }
-            return cols;
+            if (ScalarExpr.isSimpleArgs(fn.get())) return cols;
+            // 非简单参数（比较左侧是表达式 / 比较两侧都是列）：通用表达式再收一遍补全
         }
         try {
             for (String c : new ExprEvaluator(ExprParser.parse(text)).columnArgs()) cols.add(c);
@@ -6894,6 +8040,13 @@ public final class Planner {
             // 解析失败：保守为空（不裁剪列本身已经由 isUnprunable 等兜底）
         }
         return cols;
+    }
+
+    /** 文本是裸列引用（可带表限定）时取列名加入集合；否则忽略。 */
+    private static void addIfColumnRef(Set<String> cols, String text) {
+        if (text == null) return;
+        String col = SqlTextUtil.stripQualifier(text.trim());
+        if (SqlTextUtil.isSingleIdentifier(col)) cols.add(col);
     }
 
     /**
@@ -7241,6 +8394,75 @@ public final class Planner {
     /** 聚合输出列名：别名优先，否则取归一化文本（如 "count(*)"）。 */
     private static String aggOutputName(String exprText) {
         return SqlTextUtil.normalize(exprText);
+    }
+
+    /**
+     * 逻辑计划中<b>聚合调用个数</b>（供 {@link PlanAudit} 做聚合阶段守恒审计）。
+     *
+     * <p>与 {@link #buildAggregation} 的建规格规则逐条对应：整项聚合每项 1 个；
+     * 表达式内聚合按归一化文本跨项去重（与 {@link #nestedAggregates} 一致）；
+     * HAVING 补建聚合按 {@link #havingExtraAggs} 计。这里刻意<b>只计数不比对列名</b>：
+     * 标量子查询 / 派生表规划时会把输出列改名为 {@code __subq_val} 等，
+     * 列名在重写后并不可靠，计数则不受影响。</p>
+     *
+     * <p>SELECT 项文本里含标量子查询（{@code (SELECT ...)}）时跳过其文本扫描 ——
+     * 子查询体内的聚合由递归进入子查询自己的 Select 统计，避免同一调用被算两次。</p>
+     *
+     * @param skip 不参与计数的查询体（物化 CTE：物理计划独立惰性规划，从主根统计不到）
+     */
+    static int logicalAggregateCount(LogicalPlan plan, Map<LogicalPlan, ?> skip) {
+        int[] n = {0};
+        collectAggregateCount(plan, skip, new IdentityHashMap<>(), n);
+        return n[0];
+    }
+
+    private static void collectAggregateCount(LogicalPlan plan, Map<LogicalPlan, ?> skip,
+                                              Map<LogicalPlan, Boolean> seen, int[] n) {
+        if (plan == null || skip.containsKey(plan) || seen.put(plan, Boolean.TRUE) != null) return;
+        if (plan instanceof LogicalPlan.Select s) {
+            int whole = 0;
+            Set<String> nestedCalls = new HashSet<>();
+            for (LogicalPlan.SelectItem item : s.selectItems()) {
+                if (item.expression() instanceof Expression.WindowFunction) continue;
+                String text = item.expression().text().trim();
+                if (SqlTextUtil.parseAggregate(text).isPresent()) {
+                    whole++;
+                    continue;
+                }
+                if (SqlTextUtil.normalize(text).contains("(select")) continue;   // 子查询体单独递归
+                for (String call : SqlTextUtil.findAggregateCalls(text)) {
+                    nestedCalls.add(SqlTextUtil.normalize(call));
+                }
+            }
+            n[0] += whole + nestedCalls.size() + havingExtraAggs(s).size();
+            for (LogicalPlan.ResolvedRelation rel : s.fromRelations()) {
+                rel.subquery().ifPresent(sub -> collectAggregateCount(sub, skip, seen, n));
+            }
+            for (Expression.ScalarSubquery sq : s.scalarSubqueries()) {
+                collectAggregateCount(sq.inner(), skip, seen, n);
+            }
+            return;
+        }
+        if (plan instanceof LogicalPlan.SetOperation so) {
+            collectAggregateCount(so.left(), skip, seen, n);
+            collectAggregateCount(so.right(), skip, seen, n);
+            return;
+        }
+        if (plan instanceof LogicalPlan.Insert ins) {
+            collectAggregateCount(ins.query(), skip, seen, n);
+            return;
+        }
+        if (plan instanceof LogicalPlan.CreateTableAsSelect ctas) {
+            collectAggregateCount(ctas.query(), skip, seen, n);
+            return;
+        }
+        if (plan instanceof LogicalPlan.CreateView cv) {
+            collectAggregateCount(cv.query(), skip, seen, n);
+            return;
+        }
+        if (plan instanceof LogicalPlan.Explain e) {
+            collectAggregateCount(e.statement(), skip, seen, n);
+        }
     }
 
     /** 标量输出列名：别名优先，否则由函数名 + 首列参生成（如 cosine_similarity_embedding）。 */
@@ -7606,6 +8828,9 @@ public final class Planner {
             // join key 列必须保留
             for (String k : ((HashJoinOperator) op).getLeftKeyColumns()) leftNeed.add(k);
             for (String k : ((HashJoinOperator) op).getRightKeyColumns()) rightNeed.add(k);
+            // ON 单侧残差谓词引用的列必须保留（在 join 内求值，缺列即运行期「表达式列不存在」）
+            leftNeed.addAll(((HashJoinOperator) op).onLeftFilterColumns());
+            rightNeed.addAll(((HashJoinOperator) op).onRightFilterColumns());
             return List.of(leftNeed, rightNeed);
         }
 

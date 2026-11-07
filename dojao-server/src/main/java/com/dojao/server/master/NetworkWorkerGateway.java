@@ -287,6 +287,11 @@ public final class NetworkWorkerGateway implements WorkerGateway {
         if (names.isEmpty()) return List.of();
         List<CatalogDefMsg> out = new ArrayList<>(names.size());
         for (String name : names) {
+            // 物化 CTE 的哨兵 catalog 不是注册表里的数据源：Worker 用切片载荷自带的无状态解码
+            // 连接器读取（MaterializedCteConnector.wire()），无需（也无法）下发连接定义。
+            if (com.dojao.core.operator.MaterializedCteConnector.isCteCatalog(name)) {
+                continue;
+            }
             Catalog def = metaStore.getRegisteredCatalog(name).orElseThrow(() ->
                     new IllegalStateException("catalog '" + name + "' 未注册，无法随任务派发其定义"
                             + "（规划期应已确认存在，此处不一致属内部错误）"));

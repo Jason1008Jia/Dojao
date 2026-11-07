@@ -13,7 +13,26 @@ import java.util.List;
  * @version 1.0
  * @date 2026/8/2
  */
-public record PhysicalPlan(PhysicalNode root, String explainText) {
+public record PhysicalPlan(PhysicalNode root, String explainText, Runnable cleanup) {
+
+    /** 无附加资源的计划（测试 / 手工构造）。 */
+    public PhysicalPlan(PhysicalNode root, String explainText) {
+        this(root, explainText, () -> { });
+    }
+
+    /**
+     * 释放规划期申请、需随查询生命周期回收的资源（当前为物化 CTE 的落盘目录与 wire 载荷）。
+     *
+     * <p>幂等，由执行入口在算子链 {@code close()} 之后调用；规划失败 / 取消路径也必须调用，
+     * 否则物化文件只能等 JVM 退出时由 {@code SpillDirs} 兜底清理。</p>
+     */
+    public void close() {
+        try {
+            cleanup.run();
+        } catch (Throwable ignored) {
+            // 资源回收失败不应掩盖查询本身的结果 / 异常
+        }
+    }
 
     /**
      * 物理计划根节点（即最顶层的算子）。

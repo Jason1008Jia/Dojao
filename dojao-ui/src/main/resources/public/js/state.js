@@ -120,9 +120,11 @@ var liveOps = [];              // liveSnapshot.operators（按下标/idx 顺序�
 var dagPollTimer = null;       // DAG 轮询定时器
 
 // ---- SQL 页预览 ----
+// 注意：下面这些是「当前显示中」那个控制台的镜像；真实状态存在每个控制台的
+// preview 模型里（sql-console.js），轮询句柄存在 dashboard.js 的 sqlPreviewPolls。
 var sqlQueryId = null;         // 当前结果预览的 queryId
-var sqlPollTimer = null;       // 结果轮询定时器
-var sqlTickTimer = null;       // 「计算中」计时器（100ms 刷新耗时）
+var sqlPollTimer = null;       // 已废弃（轮询按控制台保存于 sqlPreviewPolls），保留以兼容旧引用
+var sqlTickTimer = null;       // 「计算中」计时器（100ms 刷新耗时；仅当前显示的控制台需要）
 var sqlStartMs = 0;            // 本次查询提交时刻（Date.now()）
 var sqlElapsedMs = 0;          // 查询结束时的最终耗时
 var sqlRunning = false;        // 是否处于「正在跑」状态（提交那一刻就置位，不等 POST 往返）
@@ -135,4 +137,5 @@ var aiInputGrow = null;        // AI 输入框自适应高度函数（切到 AI 
 // 结果表格头排序（纯前端，只排「预览到的这些行」；每次新查询重置）
 var sqlSortCol = -1;           // 当前排序列下标（-1 = 不排序，保持引擎返回顺序）
 var sqlSortDir = 0;            // 0 取消 / 1 升序 / -1 降序
+var sqlTransposed = false;     // 结果区「列转行」开关（在结果表上按 Tab 切换，纯前端展示）
 var sqlLastResult = null;      // 最近一次 renderSqlTable 的结果快照（点表头就地重排，不等下一拍轮询）

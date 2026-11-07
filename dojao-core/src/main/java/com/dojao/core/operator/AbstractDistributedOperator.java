@@ -2,6 +2,8 @@ package com.dojao.core.operator;
 
 import com.dojao.common.data.Page;
 import com.dojao.core.config.ResourceConfig;
+import com.dojao.core.operator.expr.ExprNode;
+import com.dojao.core.operator.expr.ExprParser;
 import com.dojao.core.operator.expr.ExprTypeInference;
 import com.dojao.core.runtime.master.StageScheduler;
 import com.dojao.core.runtime.master.WorkerRegistration;
@@ -101,6 +103,12 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
     /** 片内 top-N 截断尾（可空，Planner 命中下推 gate 时设置）：非 null → 终端 Consumer 本地
      *  按 ORDER BY 键排序 + 截断到 offset+limit 行后再回传候选集。 */
     protected volatile FragmentSpec.SortLimitStep tail;
+    /** 终端二级聚合（可空，外层全局聚合下沉）：非 null → 终端窗口片段窗口输出后再本地聚合，
+     *  每分区只回传 1 行 partial。 */
+    protected volatile FragmentSpec.AggregateStep terminalPartialAggregate;
+    /** join 之上的行级谓词（可空，join → Filter → 外层聚合下沉）：非 null → 终端 join 片段
+     *  在本地 join 之后先过滤再聚合。 */
+    protected volatile String terminalJoinFilter;
     /** 分布式写总行数：各分区 FragmentFinished.rowCount 求和（响应 rows_inserted）。 */
     protected final AtomicLong totalOutputRows = new AtomicLong();
     /** 片段任务跟踪：taskId → 运行态（监控用；生命周期 RUNNING → FINISHED / FAILED）。 */
@@ -339,6 +347,87 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
         return out;
     }
 
+    /**
+     * 窗口链输出列 Field（复刻 Worker 终端页 schema，供 CTAS 建表）。
+     *
+     * <p>逐步按 {@link FragmentSpec.WindowStep#outputColumns()} 的<b>前缀</b>解析输入列再追加
+     * 本组窗口函数列。前缀里可能是窗口之间被吸收的投影列（K 形状：窗口 → 投影 → 窗口，
+     * 如 {@code uid ← user_id}、{@code amt2 ← amount*2}）—— 它们不在扫描 / join 的 wire 里，
+     * 由该步 {@code computed} 的表达式经 {@link ExprTypeInference} 静态推断类型；推断不出
+     * （函数调用等）→ 响亮报错，建表不静默错型。</p>
+     *
+     * @param wire  链输入列（扫描 / join / 聚合的产出）
+     * @param steps 窗口链（至少 1 组）
+     */
+    protected static List<Field> windowChainOutputFields(List<Field> wire,
+                                                         List<FragmentSpec.WindowStep> steps) {
+        List<Field> out = wire;
+        if (steps == null) return out;
+        for (FragmentSpec.WindowStep step : steps) {
+            List<String> outCols = step.outputColumns();
+            if (outCols == null || outCols.isEmpty()) {
+                // 旧构造（未声明输出列）：直接在输入后追加函数列
+                final List<Field> in = out;
+                List<Field> next = new ArrayList<>(in);
+                for (WindowFunctionSpec spec : step.functions()) {
+                    next.add(windowFunctionField(spec, name -> fieldOf(in, name)));
+                }
+                out = next;
+                continue;
+            }
+            int baseCount = Math.max(0, outCols.size() - step.functions().size());
+            List<Field> base = new ArrayList<>(baseCount);
+            for (String name : outCols.subList(0, baseCount)) {
+                Field f = fieldOf(out, name);
+                if (f == null) {
+                    f = derivedFieldOf(step, name, out);
+                }
+                base.add(f);
+            }
+            List<Field> next = new ArrayList<>(base);
+            for (WindowFunctionSpec spec : step.functions()) {
+                next.add(windowFunctionField(spec, name -> fieldOf(base, name)));
+            }
+            out = next;
+        }
+        return out;
+    }
+
+    /** 派生投影列（链步 {@code computed} 中按 outputColumns 前缀命中的项）→ 静态推断的 Field。 */
+    private static Field derivedFieldOf(FragmentSpec.WindowStep step, String name, List<Field> input) {
+        GroupKeyExpression target = null;
+        for (GroupKeyExpression c : step.computed()) {
+            if (c.derivedColumn().equalsIgnoreCase(name)) { target = c; break; }
+        }
+        if (target == null) {
+            throw new UnsupportedOperationException("CTAS 输出列推导：窗口链输出列 '" + name
+                    + "' 既不在上游列 " + fieldNames(input) + " 中，也没有对应的投影表达式");
+        }
+        Map<String, Field> byName = new LinkedHashMap<>();
+        for (Field f : input) {
+            byName.putIfAbsent(f.getName(), f);
+            byName.putIfAbsent(f.getName().toLowerCase(java.util.Locale.ROOT), f);
+        }
+        ArrowType type;
+        try {
+            ExprNode node = ExprParser.parse(target.exprText());
+            type = ExprTypeInference.infer(node, byName);
+        } catch (RuntimeException e) {
+            type = null;
+        }
+        if (type == null) {
+            throw new UnsupportedOperationException("CTAS 输出列推导：窗口链投影列 '" + name
+                    + "' = " + target.exprText() + " 无法静态推断类型");
+        }
+        return new Field(name, FieldType.nullable(type), null);
+    }
+
+    private static List<String> fieldNames(List<Field> fields) {
+        List<String> out = new ArrayList<>(fields.size());
+        for (Field f : fields) out.add(f.getName());
+        return out;
+    }
+
     /** 窗口函数结果列 Field（复刻 WindowFunctionOperator.buildOutputSchema；LAG/LEAD 镜像输入列）。 */
     protected static Field windowFunctionField(WindowFunctionSpec spec,
                                                Function<String, Field> inputFieldOf) {
@@ -467,12 +556,60 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
      */
     protected List<FragmentSpec> withTerminal(List<FragmentSpec> frags) {
         List<FragmentSpec> out = withSink(frags);
-        return tail == null ? out : StageScheduler.attachTail(out, tail);
+        if (tail != null) out = StageScheduler.attachTail(out, tail);
+        if (terminalJoinFilter != null && !terminalJoinFilter.isBlank()) {
+            out = StageScheduler.attachJoinFilter(out, terminalJoinFilter);
+        }
+        if (terminalPartialAggregate != null) {
+            out = StageScheduler.attachPartialAggregate(out, terminalPartialAggregate);
+        }
+        return out;
     }
 
     /** 设置片内 top-N 截断尾（Planner 命中下推 gate 时在 doOpen 前调用；null = 不下推）。 */
     public void setTail(FragmentSpec.SortLimitStep t) {
         this.tail = t;
+    }
+
+    /**
+     * 终端<b>二级聚合</b>（外层全局聚合下沉；null = 无）：窗口链末端每分区再跑一次本地全局聚合，
+     * 只回传 1 行 partial。由 {@link #withTerminal} 统一挂到终端 {@code WindowConsumer} 上 ——
+     * 所有窗口链载体（扫描 / join / 派生 join / 聚合→窗口）共用这一条挂载路径，无需各自实现。
+     */
+    public void setTerminalPartialAggregate(FragmentSpec.AggregateStep step) {
+        this.terminalPartialAggregate = step;
+    }
+
+    /** 已设置的终端二级聚合（可空；审计 / EXPLAIN 只读）。 */
+    public FragmentSpec.AggregateStep terminalPartialAggregate() {
+        return terminalPartialAggregate;
+    }
+
+    /**
+     * 设置 join 之上的行级谓词（join → Filter → 外层聚合下沉；null = 不下推）。
+     * 由 {@link #withTerminal} 统一挂到终端 join 片段（本地 join 之后、二级聚合之前）。
+     */
+    public void setTerminalJoinFilter(String filter) {
+        this.terminalJoinFilter = filter;
+    }
+
+    /** 已设置的终端 join 过滤（可空；审计 / EXPLAIN 只读）。 */
+    public String terminalJoinFilter() {
+        return terminalJoinFilter;
+    }
+
+    /**
+     * 终端片段输出的<b>哈希分区键</b>（空 = 未知 / 不保证协分区）。外层按分组键下沉
+     * 「终态聚合」时必须满足 {@code 分组键 ⊇ 分区键} —— 同一分组才能整组落在同一分区。
+     * 各载体按自己的 join / 窗口键覆写；未知即拒绝下沉（保守正确）。
+     */
+    public List<String> terminalPartitionKeys() {
+        return List.of();
+    }
+
+    /** 哈希分区数（供 Planner 构建片段 DTO；只读）。 */
+    public int partitionCount() {
+        return numPartitions;
     }
 
     /** 分布式写总行数（各分区回传行数之和；SELECT 回传形态恒 0）。 */
@@ -510,6 +647,14 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
             return;
         }
         numConsumers = dispatchStage();
+        // 完成契约：派发了片段就必须有终端片段回传 FragmentFinished。
+        // 0 = 算子把「会回传的片段数」算错了（历史上多组窗口链曾按 consumers.size() 数进中间层，
+        // 导致 Master 永远等不满）；返回 0 时 doNext 会立刻 EOF → 静默丢光全部结果。
+        if (numConsumers <= 0) {
+            throw new IllegalStateException(getClass().getSimpleName()
+                    + " dispatchStage 返回终端完成数 " + numConsumers + "（query=" + queryId
+                    + "）：已派发片段但无终端回传，查询会静默丢行");
+        }
         System.err.printf("[%s] query=%s workers=%d partitions=%d consumers=%d%n",
                 getClass().getSimpleName(), queryId, workers.size(), numPartitions, numConsumers);
     }
@@ -675,6 +820,11 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
     public List<DistributedTask> fragmentTasks() {
         List<DistributedTask> out = new ArrayList<>(taskStates.size());
         for (FragmentTaskState st : taskStates.values()) {
+            // 链式片段 → 拆成 Join + Window/Aggregate 两个阶段任务（同一片段生命周期，行数各走各的
+            // 遥测通道）。监控据此呈现「Join ⇒ Window」两级，而不是一坨 fused 框。
+            if (st.chained()) {
+                out.add(st.joinStageSnapshot());
+            }
             out.add(st.snapshot());
         }
         out.sort((a, b) -> Long.compare(a.dispatchNanos(), b.dispatchNanos()));
@@ -760,8 +910,9 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
 
     /** 片段任务运行态（可变；监控读并发安全 —— 状态字段 volatile、行数 AtomicLong）。 */
     private static final class FragmentTaskState {
+        final FragmentSpec spec;
         final String taskId, workerId, kind;
-        final boolean producer;
+        final boolean producer, terminal;
         /** Producer 扫描基表（schema.table），非扫描片段为 null —— 监控据此按来源分组 Scan 叶子。 */
         final String source;
         final long dispatchNanos;
@@ -771,10 +922,12 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
         volatile String failure;
 
         FragmentTaskState(FragmentSpec spec) {
+            this.spec = spec;
             this.taskId = spec.fragmentId();
             this.workerId = spec.selfWorkerId();
             this.kind = kindOf(spec);
             this.producer = spec.isProducer();
+            this.terminal = isTerminal(spec);
             this.source = (spec instanceof FragmentSpec.Producer p)
                     ? p.scan().request().schema() + "." + p.scan().request().table()
                     : null;
@@ -782,8 +935,24 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
         }
 
         DistributedTask snapshot() {
-            return new DistributedTask(taskId, workerId, kind, producer, state, rowsOut.get(),
+            return new DistributedTask(taskId, workerId, kind, producer, terminal, state, rowsOut.get(),
                     dispatchNanos, finishNanos, failure, source);
+        }
+
+        /**
+         * 链式片段（join → 窗口 / 聚合压在同一个 Worker 片段）的 <b>join 阶段</b>任务。
+         *
+         * <p>它与 {@link #snapshot()} 的窗口 / 聚合阶段共享同一片段生命周期（状态 / 完成时间跟随），
+         * 行数由 Worker 遥测按 {@link DistributedTask#joinStageTaskId(String)} 上报（join 输出行数）——
+         * 监控因此能把「Join」与「Window」拆成两个框，看出当前推进到哪一段。</p>
+         */
+        DistributedTask joinStageSnapshot() {
+            return new DistributedTask(DistributedTask.joinStageTaskId(taskId), workerId, "Join",
+                    false, false, state, 0L, dispatchNanos, finishNanos, failure, null);
+        }
+
+        boolean chained() {
+            return spec instanceof FragmentSpec.ChainedJoinConsumer;
         }
 
         void finish() {
@@ -798,19 +967,74 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
         }
     }
 
-    /** 片段的人类可读任务类别（Worker 侧要干的活，供监控任务列表展示）。 */
+    /**
+     * 片段的人类可读任务类别（Worker 侧要干的活，供监控任务列表 / 阶段框展示）。
+     *
+     * <p>链式片段（{@code ChainedJoinConsumer}）这里只返回<b>后半段</b>的类别（Window / Aggregate），
+     * 前半段 join 由 {@link FragmentTaskState#joinStageSnapshot()} 以独立的 "Join" 任务呈现 ——
+     * 监控不再把 join 和窗口糊成一个框。</p>
+     */
     private static String kindOf(FragmentSpec spec) {
         if (spec instanceof FragmentSpec.Producer) return "Scan→Shuffle";
         if (spec instanceof FragmentSpec.Consumer) return "Join";
         if (spec instanceof FragmentSpec.AggregateConsumer) return "Aggregate";
-        if (spec instanceof FragmentSpec.WindowConsumer) return "Window";
+        if (spec instanceof FragmentSpec.WindowConsumer w) {
+            return "Window#" + windowGroup(w.in().exchangeId());
+        }
         if (spec instanceof FragmentSpec.ChainedJoinConsumer c) {
-            return c.followUp() instanceof FragmentSpec.WindowStep
-                    ? "Join→Window" : "Join→Aggregate";
+            // join 段已由 <fragmentId>#join 独立呈现，这里只描述紧随其后的计算段（链上恒为第 0 组）
+            String stage = c.followUp() instanceof FragmentSpec.WindowStep ? "Window#0" : "Aggregate#0";
+            return c.terminal() ? stage : stage + "→Shuffle";
         }
         if (spec instanceof FragmentSpec.MiddleJoinConsumer) return "Join→Shuffle";
-        if (spec instanceof FragmentSpec.MiddleAggregateConsumer) return "Aggregate→Shuffle";
-        if (spec instanceof FragmentSpec.MiddleWindowConsumer) return "Window→Shuffle";
+        if (spec instanceof FragmentSpec.MiddleAggregateConsumer m) {
+            return "Aggregate#" + exchangeGroup(m.in().exchangeId(), "AW") + "→Shuffle";
+        }
+        if (spec instanceof FragmentSpec.MiddleWindowConsumer m) {
+            return "Window#" + windowGroup(m.in().exchangeId()) + "→Shuffle";
+        }
         return "Fragment";
+    }
+
+    /** 窗口链交换名 {@code ...-JW<i>} / 聚合→窗口链 {@code ...-AW<i>} → 窗口组序号（无编号=0）。 */
+    private static String windowGroup(String exchangeId) {
+        if (exchangeId == null) {
+            return "0";
+        }
+        int jw = exchangeId.lastIndexOf("-JW");
+        int aw = exchangeId.lastIndexOf("-AW");
+        int i = Math.max(jw, aw);
+        if (i < 0) {
+            return "0";
+        }
+        String tail = exchangeId.substring(i + 3);
+        return tail.isEmpty() ? "0" : tail;
+    }
+
+    /** 从交换名取阶段序号（聚合链 {@code -AW<i>}；单组无编号视作 0）。 */
+    private static String exchangeGroup(String exchangeId, String tag) {
+        if (exchangeId == null) {
+            return "0";
+        }
+        int i = exchangeId.lastIndexOf('-' + tag);
+        if (i < 0) {
+            return "0";
+        }
+        String tail = exchangeId.substring(i + tag.length() + 1);
+        return tail.isEmpty() ? "0" : tail;
+    }
+
+    /** 片段是否把结果回传 Master（终端段）：Producer / 各类 MiddleConsumer 都是中间层。 */
+    private static boolean isTerminal(FragmentSpec spec) {
+        if (spec instanceof FragmentSpec.ChainedJoinConsumer c) {
+            return c.terminal();
+        }
+        if (spec instanceof FragmentSpec.Producer) return false;
+        if (spec instanceof FragmentSpec.MiddleJoinConsumer
+                || spec instanceof FragmentSpec.MiddleAggregateConsumer
+                || spec instanceof FragmentSpec.MiddleWindowConsumer) {
+            return false;
+        }
+        return true;
     }
 }

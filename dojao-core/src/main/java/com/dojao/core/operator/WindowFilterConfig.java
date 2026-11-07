@@ -103,6 +103,11 @@ public class WindowFilterConfig {
     public WindowFunctionType functionType() { return functionType; }
     public long targetValue() { return targetValue; }
 
+    /** EXPLAIN 展示（如 {@code RANK EQ 1}），供用户确认提前过滤确实下推生效。 */
+    public String describe() {
+        return functionType + " " + operator + " " + targetValue;
+    }
+
     /** 位置型 + 等值时的 0-indexed 输出位置。 */
     public int outputPosition() { return (int) targetValue - 1; }
 }

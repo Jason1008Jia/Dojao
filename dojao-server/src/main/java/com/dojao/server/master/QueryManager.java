@@ -463,9 +463,10 @@ public final class QueryManager {
             // 总量估计只对「扫切片」有意义：命中探查表的 Producer 任务带上 rowCount 估计，其余 -1
             String src = t.source();
             out.add(new OperatorSnapshot.Task(t.taskId(), t.workerId(), t.kind(), t.producer(),
-                    taskStateForDisplay(t.state()), rows,
+                    t.terminal(), taskStateForDisplay(t.state()), rows,
                     liveFragmentBytesIn.getOrDefault(t.taskId(), 0L),
                     liveFragmentBytesOut.getOrDefault(t.taskId(), 0L),
+                    liveFragmentSpilled.getOrDefault(t.taskId(), 0L),
                     t.dispatchNanos(), t.finishNanos(), t.failure(),
                     src, expectedFor(src)));
         }
@@ -550,9 +551,11 @@ public final class QueryManager {
             boolean done = finishedFragments.contains(id);
             long finishNanos = done && t.finishNanos() <= 0L ? System.nanoTime() : t.finishNanos();
             out.add(new OperatorSnapshot.Task(id, t.workerId(), t.kind(), t.producer(),
-                    done ? DistributedTask.FINISHED : taskStateForDisplay(t.state()), rows,
+                    t.terminal(), done ? DistributedTask.FINISHED : taskStateForDisplay(t.state()), rows,
                     liveFragmentBytesIn.getOrDefault(id, 0L),
                     liveFragmentBytesOut.getOrDefault(id, 0L),
+                    // 溢写是算子对象级（非分区级）：挂在 0 号分区上，阶段框按任务求和仍得真实值
+                    k == 0 ? liveFragmentSpilled.getOrDefault(base, 0L) : 0L,
                     t.dispatchNanos(), finishNanos, t.failure(), t.source(),
                     expectedFor(t.source())));
         }

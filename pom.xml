@@ -574,4 +574,24 @@
         </pluginManagement>
     </build>
 
+    <!--
+        dojao-dist 被 .gitignore 忽略，只在本地/发布机上存在。
+        用「文件存在时自动激活」的 profile 把它挂进 reactor：
+          - 本地有 dojao-dist/pom.xml 时，根目录 `mvn -DskipTests install` 会一并生成总包；
+          - 干净 clone / CI 没有该目录，profile 不激活，构建不受影响。
+    -->
+    <profiles>
+        <profile>
+            <id>local-dist</id>
+            <activation>
+                <file>
+                    <exists>${basedir}/dojao-dist/pom.xml</exists>
+                </file>
+            </activation>
+            <modules>
+                <module>dojao-dist</module>
+            </modules>
+        </profile>
+    </profiles>
+
 </project>

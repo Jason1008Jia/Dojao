@@ -3,6 +3,7 @@ package com.dojao.server.worker;
 import com.dojao.common.data.Page;
 import com.dojao.core.operator.AggregationSpec;
 import com.dojao.core.operator.CaseProjectOperator;
+import com.dojao.core.operator.ColumnAliasOperator;
 import com.dojao.core.operator.ConnectorScanOperator;
 import com.dojao.core.operator.DistributedTask;
 import com.dojao.core.operator.ExpandOperator;
@@ -10,9 +11,11 @@ import com.dojao.core.operator.ExpressionProjectOperator;
 import com.dojao.core.operator.FilterOperator;
 import com.dojao.core.planner.SqlTextUtil;
 import com.dojao.core.operator.FragmentSpec;
+import com.dojao.core.operator.GroupKeyExpression;
 import com.dojao.core.operator.HashAggregationOperator;
 import com.dojao.core.operator.HashJoinOperator;
 import com.dojao.core.operator.HashPartitionOperator;
+import com.dojao.core.operator.MaterializedCteConnector;
 import com.dojao.core.operator.MeasurableOperator;
 import com.dojao.core.operator.MergeProgress;
 import com.dojao.core.operator.Operator;
@@ -20,6 +23,7 @@ import com.dojao.core.operator.OperatorStats;
 import com.dojao.core.operator.OrderByTail;
 import com.dojao.core.operator.PartitionedSource;
 import com.dojao.core.operator.PartitionedSourceOperator;
+import com.dojao.core.operator.ProjectOperator;
 import com.dojao.core.operator.ShuffleReader;
 import com.dojao.core.operator.SortMergeJoinOperator;
 import com.dojao.core.operator.WindowFilterConfig;
@@ -41,10 +45,12 @@ import com.dojao.spi.function.AggregateFunction;
 import com.dojao.spi.function.AggregateFunctionRegistry;
 import com.dojao.spi.function.CollectAggregateFunction;
 import com.dojao.spi.function.CollectAggregateRegistry;
+import org.apache.arrow.vector.types.pojo.Field;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -204,42 +210,82 @@ public final class FragmentExecutor {
 
     /**
      * 中间层 join 的<b>分区并行度</b>登记：本算子片段内部恒有 {@code numPartitions} 个分区线程
-     * （{@link HashJoinOperator}），但片段任务只有 1 个 —— 监控看到的「Join 只有 1 个 task」由此而来。
-     * 这里把每个分区登记为独立子任务 {@code <fragmentId>#p<k>}：行数 = 该分区真实 join 输出行数、
-     * 字节 = 该分区从 shuffle 读入 / 发出 join 输出的字节，收尾 = 该分区线程做完（早于片段整体收尾）
-     * → Master 逐分区变绿，Join 框进度条按分区推进。仍是同一片段的内部视图，不新增派发、不改数据面。
+     * （{@link HashJoinOperator} / {@link SortMergeJoinOperator}），但片段任务只有 1 个 —— 监控看到的
+     * 「Join 只有 1 个 task」由此而来。这里把每个分区登记为独立子任务 {@code <fragmentId>#p<k>}：
+     * 行数 = 该分区真实 join 输出行数、字节 = 该分区从 shuffle 读入 / 发出 join 输出的字节，
+     * 收尾 = 该分区线程做完（早于片段整体收尾）→ Master 逐分区变绿，Join 框进度条按分区推进。
+     * 仍是同一片段的内部视图，不新增派发、不改数据面。
      */
-    private void trackJoinPartitions(String fragmentId, HashJoinOperator join) {
+    private void trackJoinPartitions(String fragmentId, Operator join) {
         if (queryId == null || telemetry == null || join == null) {
             return;
         }
-        int n = join.numPartitions();
-        for (int k = 0; k < n; k++) {
+        JoinPartitionView view = JoinPartitionView.of(join);
+        if (view == null) return;
+        for (int k = 0; k < view.numPartitions(); k++) {
             final int p = k;
             telemetry.track(queryId, DistributedTask.partitionTaskId(fragmentId, p),
-                    () -> join.partitionRowsOut(p),
-                    () -> join.partitionBytesIn(p), () -> join.partitionBytesOut(p),
-                    () -> join.partitionDone(p));
+                    () -> view.rowsOut(p),
+                    () -> view.bytesIn(p), () -> view.bytesOut(p),
+                    () -> view.done(p));
         }
     }
 
     /** 中间层 join 收尾：逐分区补发终值 + done（采样器已被 done 判定注销的为 no-op）。 */
-    private void finishJoinPartitions(String fragmentId, HashJoinOperator join) {
+    private void finishJoinPartitions(String fragmentId, Operator join) {
         if (queryId == null || telemetry == null || join == null) {
             return;
         }
-        for (int k = 0; k < join.numPartitions(); k++) {
+        JoinPartitionView view = JoinPartitionView.of(join);
+        if (view == null) return;
+        for (int k = 0; k < view.numPartitions(); k++) {
             telemetry.finish(queryId, DistributedTask.partitionTaskId(fragmentId, k));
         }
     }
 
     /** 中间层 join 分区子任务注销（失败 / 取消：不补发终值，防泄漏）。 */
-    private void untrackJoinPartitions(String fragmentId, HashJoinOperator join) {
+    private void untrackJoinPartitions(String fragmentId, Operator join) {
         if (queryId == null || telemetry == null || join == null) {
             return;
         }
-        for (int k = 0; k < join.numPartitions(); k++) {
+        JoinPartitionView view = JoinPartitionView.of(join);
+        if (view == null) return;
+        for (int k = 0; k < view.numPartitions(); k++) {
             telemetry.untrack(queryId, DistributedTask.partitionTaskId(fragmentId, k));
+        }
+    }
+
+    /**
+     * join 算子的分区级视图 —— 把 {@link HashJoinOperator} / {@link SortMergeJoinOperator}
+     * 两种实现的同名访问器统一成一套接口，遥测登记代码不用按算法分支。
+     */
+    private interface JoinPartitionView {
+        int numPartitions();
+        long rowsOut(int p);
+        long bytesIn(int p);
+        long bytesOut(int p);
+        boolean done(int p);
+
+        static JoinPartitionView of(Operator join) {
+            if (join instanceof HashJoinOperator h) {
+                return new JoinPartitionView() {
+                    public int numPartitions() { return h.numPartitions(); }
+                    public long rowsOut(int p) { return h.partitionRowsOut(p); }
+                    public long bytesIn(int p) { return h.partitionBytesIn(p); }
+                    public long bytesOut(int p) { return h.partitionBytesOut(p); }
+                    public boolean done(int p) { return h.partitionDone(p); }
+                };
+            }
+            if (join instanceof SortMergeJoinOperator s) {
+                return new JoinPartitionView() {
+                    public int numPartitions() { return s.numPartitions(); }
+                    public long rowsOut(int p) { return s.partitionRowsOut(p); }
+                    public long bytesIn(int p) { return s.partitionBytesIn(p); }
+                    public long bytesOut(int p) { return s.partitionBytesOut(p); }
+                    public boolean done(int p) { return s.partitionDone(p); }
+                };
+            }
+            return null;
         }
     }
 
@@ -260,7 +306,10 @@ public final class FragmentExecutor {
                                  BlockingQueue<FragmentEvent> resultQueue) throws Exception {
         FragmentSpec.ScanStep scanStep = spec.scan();
         FragmentSpec.PartitionStep partStep = spec.partition();
-        DojaoConnector conn = provider.get(scanStep.catalog());
+        // 物化 CTE 的哨兵 catalog 不在 catalog 注册表里：数据就在切片载荷中，用无状态解码连接器。
+        DojaoConnector conn = MaterializedCteConnector.isCteCatalog(scanStep.catalog())
+                ? MaterializedCteConnector.wire()
+                : provider.get(scanStep.catalog());
         HashPartitionOperator part = null;
         boolean completed = false;
         try {
@@ -319,8 +368,22 @@ public final class FragmentExecutor {
         ShuffleReader right = exchangeManager.readerFor(spec.rightIn().exchangeId());
         Operator join = localJoin(left, right, joinStep);
         trackSpill(spec.fragmentId(), join);   // 排序归并 / 哈希 join 溢写（终端片段：行数走数据面，此处只报溢写）
+        // join 之上的行级谓词下沉：分区内逐行过滤（与 Master 侧 Filter 语义一致，只是不回传被滤掉的行）
+        Operator feed = join;
+        String joinFilter = spec.filterAfterJoin();
+        if (joinFilter != null && !joinFilter.isBlank()) {
+            for (String cond : SqlTextUtil.splitConjuncts(joinFilter)) {
+                if (!cond.isBlank()) {
+                    feed = new FilterOperator(feed, cond);
+                }
+            }
+        }
+        // 外层分组聚合下沉的终态段：join（+过滤）输出同 Worker 再聚一次（协分区成立 ⇒ 每分区即终态）
+        if (spec.partialFollowUp() != null) {
+            feed = buildFollowUp(spec.fragmentId(), feed, spec.partialFollowUp());
+        }
         // 顶层 ORDER BY/LIMIT 下推：终端缝挂截断尾（本地排序 + 截到 offset+limit 候选）
-        Operator terminal = spec.tail() != null ? OrderByTail.wrap(join, spec.tail()) : join;
+        Operator terminal = spec.tail() != null ? OrderByTail.wrap(feed, spec.tail()) : feed;
         // 心跳进度源 = 两侧 shuffle 收页 + 归并进度：join build（右表）慢但仍在收页时 Keepalive；
         // 输入收齐后卡在归并（如排序归并 Phase 1）时，靠归并 tick 续命
         if (spec.sink() != null) {
@@ -354,13 +417,17 @@ public final class FragmentExecutor {
         ShuffleReader right = exchangeManager.readerFor(spec.rightIn().exchangeId());
         Operator join = localJoin(left, right, joinStep);
         trackSpill(spec.fragmentId(), join);   // 中间层 join 溢写（与下方行数采样器叠加，通道独立）
+        // 外连接同名列消歧：join 输出先补 __jk_* 副本，再按下一层键重分区 —— 下一层窗口 / join
+        // 键（经 aliasOuterJoinKeyRefs 改写）引用这些副本，缺了在 Worker 侧解析不到列。
+        Operator aliased = applyJoinAliases(join, joinStep);
         // 多维聚合展开（最末层才有）：join 输出之后、按 (维度…, gid) 重哈希之前复制行 ——
         // 整条 join 链只跑一次，基表只扫一次
         Operator expand = spec.expand() == null ? null
-                : new ExpandOperator(join, spec.expand().dimColumns(), spec.expand().groupingSets());
-        Operator downstream = expand != null ? expand : join;
-        // 分区级实时遥测（Join 框 n 个分区任务）只有 HashJoinOperator 有；排序归并走碎片统计
-        HashJoinOperator hashJoin = join instanceof HashJoinOperator h ? h : null;
+                : new ExpandOperator(aliased, spec.expand().dimColumns(), spec.expand().groupingSets());
+        Operator downstream = expand != null ? expand : aliased;
+        // 下一层窗口 / join 键含表达式：重分区前物化合成列
+        downstream = applyComputed(downstream, spec.nextComputed());
+        // 分区级实时遥测（Join 框 n 个分区任务）：Hash / SortMerge 两种算法都实现了分区访问器
         HashPartitionOperator part = null;
         boolean completed = false;
         try {
@@ -374,7 +441,7 @@ public final class FragmentExecutor {
                     exchangeManager.selfWorkerId(),
                     nextPartition.distribution(), nextPartition.fixedBucket());
             track(spec, part);   // 采样器先登记：中间层 join 输出行数（Join 框实时行数来源）
-            trackJoinPartitions(spec.fragmentId(), hashJoin);   // 片段内部分区并行度（Join 框 n 个分区任务）
+            trackJoinPartitions(spec.fragmentId(), join);   // 片段内部分区并行度（Join 框 n 个分区任务）
             part.open();
             part.awaitDistributedDone();   // 等所有分发线程完成并已通知下一层所有归属 Worker
             if (part.distributorFailure() != null) {
@@ -385,10 +452,10 @@ public final class FragmentExecutor {
         } finally {
             if (completed) {
                 finishTelemetry(spec.fragmentId());
-                finishJoinPartitions(spec.fragmentId(), hashJoin);
+                finishJoinPartitions(spec.fragmentId(), join);
             } else {
                 untrack(spec.fragmentId());
-                untrackJoinPartitions(spec.fragmentId(), hashJoin);
+                untrackJoinPartitions(spec.fragmentId(), join);
             }
             if (part != null) {
                 try { part.close(); } catch (Throwable ignored) { }
@@ -431,9 +498,14 @@ public final class FragmentExecutor {
         HashAggregationOperator agg = new HashAggregationOperator(
                 src, aggStep.keyColumns(), aggs, aggStep.memoryLimit(), aggStep.numPartitions());
         trackSpill(spec.fragmentId(), agg);   // 派生聚合中间层溢写（与下方行数采样器叠加）
+        // 派生体两级聚合（max(sum(x))）：第二级聚合同 Worker 直接压在第一级输出上（两级分组键相同 ⇒
+        // 分区键 = 分组键 ⇒ 每分区两级都是终态），之后才走 HAVING / 重分区。
+        Operator feed = agg;
+        if (spec.followUp() != null) {
+            feed = buildFollowUp(spec.fragmentId(), feed, spec.followUp());
+        }
         // 派生内层 HAVING：聚合输出行级过滤（每 key 整组都在本分区聚齐 → 按聚合输出行过滤语义与单机一致）。
         // FilterOperator 按列名引用聚合输出列（keys + agg 输出列）；进 HashPartitionOperator 前逐行过滤。
-        Operator feed = agg;
         String postAggregate = spec.filterAfterAggregate();
         if (postAggregate != null && !postAggregate.isBlank()) {
             // 按顶层 AND 拆成多个 FilterOperator：单个 FilterOperator 只编译「单个简单谓词」，
@@ -445,6 +517,8 @@ public final class FragmentExecutor {
                 }
             }
         }
+        // 下游窗口键含表达式：重分区前物化合成列（聚合输出 + HAVING 过滤之后）
+        feed = applyComputed(feed, spec.nextComputed());
         HashPartitionOperator part = null;
         boolean completed = false;
         try {
@@ -474,7 +548,8 @@ public final class FragmentExecutor {
             if (part != null) {
                 try { part.close(); } catch (Throwable ignored) { }
             }
-            try { agg.close(); } catch (Throwable ignored) { }
+            // feed 位于 agg 之上（HAVING 过滤 / 键表达式物化），关闭它级联关闭 agg
+            try { feed.close(); } catch (Throwable ignored) { }
         }
     }
 
@@ -497,18 +572,14 @@ public final class FragmentExecutor {
         // 接收端已在派发阶段注册进本 Worker 的 ExchangeManager
         ShuffleReader reader = exchangeManager.readerFor(spec.in().exchangeId());
         Operator src = new PartitionedSourceOperator(reader, spec.in().numPartitions());
-        WindowSortOperator sort = new WindowSortOperator(
-                src, w.partitionBy(), w.orderBy(), w.ascending(), w.memoryLimit(), w.numPartitions());
-        WindowFunctionOperator win = new WindowFunctionOperator(
-                sort, w.partitionBy(), w.functions(), w.orderBy(), AGGREGATE_REGISTRY);
-        applyWindowFilter(w, sort, win);
-        trackSpill(spec.fragmentId(), sort);   // 派生窗口中间层溢写（WindowSort 是溢写方，与行数采样器叠加）
-        trackSpill(spec.fragmentId(), win);    // 窗口函数「整分区缓冲」溢写（另一路写盘，累加）
+        // 键表达式合成列 / 排序 / 窗口 / 收窄 → 下一组窗口键的合成列（重分区前物化）
+        Operator win = buildWindow(spec.fragmentId(), src, w);
+        Operator feed = applyComputed(win, spec.nextComputed());
         HashPartitionOperator part = null;
         boolean completed = false;
         try {
             ExchangeChannel channel = exchangeManager.channelFor();
-            part = new HashPartitionOperator(win, nextPartition.keyColumns(), nextPartition.numPartitions(), 1,
+            part = new HashPartitionOperator(feed, nextPartition.keyColumns(), nextPartition.numPartitions(), 1,
                     channel, nextPartition.ownerWorkerIds().toArray(new String[0]),
                     nextPartition.exchangeIds().toArray(new String[0]),
                     exchangeManager.selfWorkerId(),
@@ -575,14 +646,12 @@ public final class FragmentExecutor {
         // 接收端已在派发阶段注册进本 Worker 的 ExchangeManager
         ShuffleReader reader = exchangeManager.readerFor(spec.in().exchangeId());
         PartitionedSourceOperator src = new PartitionedSourceOperator(reader, spec.in().numPartitions());
-        FragmentSpec.WindowStep w = spec.window();
-        WindowSortOperator sort = new WindowSortOperator(
-                src, w.partitionBy(), w.orderBy(), w.ascending(), w.memoryLimit(), w.numPartitions());
-        WindowFunctionOperator win = new WindowFunctionOperator(
-                sort, w.partitionBy(), w.functions(), w.orderBy(), AGGREGATE_REGISTRY);
-        applyWindowFilter(w, sort, win);
-        trackSpill(spec.fragmentId(), sort);   // 终端窗口排序溢写（行数走数据面，此处只报溢写）
-        trackSpill(spec.fragmentId(), win);    // 窗口函数「整分区缓冲」溢写（另一路写盘，累加）
+        // 键表达式合成列（若发送端未物化，如单组链的终端）/ 排序 / 窗口 / 收窄输出列
+        Operator win = buildWindow(spec.fragmentId(), src, spec.window());
+        // 二级聚合（外层全局聚合下沉）：窗口输出上同 Worker 再聚一次，每分区 1 行 partial。
+        if (spec.partialFollowUp() != null) {
+            win = buildFollowUp(spec.fragmentId(), win, spec.partialFollowUp());
+        }
         // 顶层 ORDER BY/LIMIT 下推：终端缝挂截断尾（本地排序 + 截到 offset+limit 候选）
         Operator terminal = spec.tail() != null ? OrderByTail.wrap(win, spec.tail()) : win;
         // 心跳进度源 = shuffle 收页 + 窗口排序 Phase 2 归并进度：
@@ -608,20 +677,113 @@ public final class FragmentExecutor {
         // 接收端已在派发阶段注册进本 Worker 的 ExchangeManager
         ShuffleReader left = exchangeManager.readerFor(spec.leftIn().exchangeId());
         ShuffleReader right = exchangeManager.readerFor(spec.rightIn().exchangeId());
-        Operator join = localJoin(left, right, spec.join());
-        trackSpill(spec.fragmentId(), join);   // 链式 join 溢写（与后续窗口 / 聚合溢写叠加，各算子各报一路）
-        Operator op = buildFollowUp(spec.fragmentId(), join, spec.followUp());
+        // ★tagPartitionIds=true：join 输出直接喂本地窗口排序，分区号必须保留 —— 否则各分区结果全落
+        //   窗口排序槽 0，单槽归并整份数据（线上 1.8GB 单槽 Phase 2 长时间不吐页，-JW1 收不到数据）。
+        Operator join = localJoin(left, right, spec.join(), true);
+        // join 阶段的行数 / 分区进度 / 溢写登记到独立子任务 <fragmentId>#join：Master 据此把本片段拆成
+        // 两个监控阶段（Join / Window），而不是一个 fused 框 —— 窗口归并期间仍能看到 join 输出推进。
+        // join 溢写挂 joinStageId、后续窗口 / 聚合溢写仍挂 fragmentId：两段各报各的，互不叠加掩盖。
+        String joinStageId = DistributedTask.joinStageTaskId(spec.fragmentId());
+        trackSpill(joinStageId, join);
+        // 外连接同名列消歧：紧随 join 补 __jk_* 副本（窗口键 / 值表达式经 aliasOuterJoinKeyRefs
+        // 改写为引用这些副本；Master 的单机 ColumnAliasOperator 在分布式窗口链里已被折叠掉）。
+        Operator aliased = applyJoinAliases(join, spec.join());
+        // 同 key 零交换的窗口若键含表达式：join 输出上就地物化合成列（没有任何重分区发送端）
+        Operator followUpInput = aliased;
+        if (spec.followUp() instanceof FragmentSpec.WindowStep w) {
+            followUpInput = applyComputed(aliased, w.computed());
+        }
+        Operator op = buildFollowUp(spec.fragmentId(), followUpInput, spec.followUp());
+        // 二级聚合（外层全局聚合下沉）：链式聚合输出上同 Worker 再聚一次，每分区 1 行 partial。
+        if (spec.partialFollowUp() != null) {
+            op = buildFollowUp(spec.fragmentId(), op, spec.partialFollowUp());
+        }
+        // 非终端链（多窗口分组）：join→首窗口输出按下一窗口键重分区，数据留在 Worker 侧继续流向
+        // 后续窗口交换 —— 不回传 Master（镜像 MiddleWindowConsumer 的尾部）。
+        if (!spec.terminal()) {
+            FragmentSpec.PartitionStep next = spec.nextPartition();
+            // 下一组窗口键含表达式：重分区前物化合成列（本层窗口输出已收窄到声明列）
+            Operator feed = applyComputed(op, spec.nextComputed());
+            HashPartitionOperator part = null;
+            boolean completed = false;
+            try {
+                ExchangeChannel channel = exchangeManager.channelFor();
+                part = new HashPartitionOperator(feed, next.keyColumns(), next.numPartitions(), 1,
+                        channel, next.ownerWorkerIds().toArray(new String[0]),
+                        next.exchangeIds().toArray(new String[0]),
+                        exchangeManager.selfWorkerId(),
+                        next.distribution(), next.fixedBucket());
+                // 采样器先登记：窗口/聚合阶段输出行数（= 进入重分区的行数）。窗口归并期间恒 0 是
+                // 真实进度（尚未吐行），join 阶段由 joinStageId 独立推进 —— 两段互不掩盖。
+                trackChainedOutput(spec, part);
+                trackJoinPartitions(joinStageId, join);   // Join 框 n 个分区任务
+                part.open();
+                part.awaitDistributedDone();   // 等所有分发线程完成并已通知下一窗口的归属 Worker
+                if (part.distributorFailure() != null) {
+                    throw new RuntimeException("ChainedJoinConsumer 分发失败 fragment=" + spec.fragmentId(),
+                            part.distributorFailure());
+                }
+                completed = true;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();   // 取消 ≠ 失败：保留中断标记，上层据此静默放弃
+                throw new RuntimeException("ChainedJoinConsumer 分区分发被中断 fragment="
+                        + spec.fragmentId(), e);
+            } finally {
+                if (completed) {
+                    finishTelemetry(spec.fragmentId());
+                    finishTelemetry(joinStageId);   // join 阶段的溢写终值（分区子任务另由 finishJoinPartitions 收）
+                    finishJoinPartitions(joinStageId, join);
+                } else {
+                    untrack(spec.fragmentId());
+                    untrack(joinStageId);
+                    untrackJoinPartitions(joinStageId, join);
+                }
+                if (part != null) {
+                    try { part.close(); } catch (Throwable ignored) { }
+                }
+                try { op.close(); } catch (Throwable ignored) { }
+            }
+            return;
+        }
         // 顶层 ORDER BY/LIMIT 下推：终端缝挂截断尾（本地排序 + 截到 offset+limit 候选）
         Operator terminal = spec.tail() != null ? OrderByTail.wrap(op, spec.tail()) : op;
         // 心跳进度源 = 两侧 shuffle 收页 + 后续窗口/聚合的归并进度：
         // 链式 join→聚合/窗口的最末层 Phase 1/归并长时间不吐结果时 Keepalive
-        if (spec.sink() != null) {
-            runAndSink(spec.fragmentId(), terminal, spec.sink(), resultQueue,
-                    () -> livenessProgress(() -> left.pagesReceived() + right.pagesReceived(), terminal));
-        } else {
-            runAndStream(spec.fragmentId(), terminal, resultQueue,
-                    () -> livenessProgress(() -> left.pagesReceived() + right.pagesReceived(), terminal));
+        trackJoinPartitions(joinStageId, join);   // Join 框 n 个分区任务的实时行数 / 字节 / 完成
+        boolean ok = false;
+        try {
+            if (spec.sink() != null) {
+                runAndSink(spec.fragmentId(), terminal, spec.sink(), resultQueue,
+                        () -> livenessProgress(() -> left.pagesReceived() + right.pagesReceived(), terminal));
+            } else {
+                runAndStream(spec.fragmentId(), terminal, resultQueue,
+                        () -> livenessProgress(() -> left.pagesReceived() + right.pagesReceived(), terminal));
+            }
+            ok = true;
+        } finally {
+            // runAndStream/runAndSink 已对 fragmentId（窗口阶段）收尾；join 阶段与分区子任务是独立采样器，在此补收尾
+            if (ok) {
+                finishTelemetry(joinStageId);
+                finishJoinPartitions(joinStageId, join);
+            } else {
+                untrack(joinStageId);
+                untrackJoinPartitions(joinStageId, join);
+            }
         }
+    }
+
+    /**
+     * 非终端链式片段的<b>窗口/聚合阶段</b>输出行数：即本层计算完成、写入重分区通道的行数。
+     * 窗口归并期间恒 0 是真实进度（尚未吐行）；join 阶段的推进由 {@code <fragmentId>#join}
+     * 子任务独立上报 —— 两段互不掩盖，不再用 join 行数顶替窗口进度。
+     */
+    private void trackChainedOutput(FragmentSpec spec, HashPartitionOperator part) {
+        if (queryId == null || telemetry == null || part == null) {
+            return;
+        }
+        final OperatorStats stats = part.getStats();
+        telemetry.track(queryId, spec.fragmentId(),
+                stats::getRowsProcessed, stats::getInputBytes, stats::getOutputBytes);
     }
 
     /**
@@ -642,6 +804,47 @@ public final class FragmentExecutor {
      */
     private static Operator localJoin(PartitionedSource left, PartitionedSource right,
                                       FragmentSpec.JoinStep joinStep) {
+        return localJoin(left, right, joinStep, false);
+    }
+
+    /**
+     * 外连接同名列消歧（Master 单机 {@code ColumnAliasOperator} 的 Worker 复现）：在本地 join 输出上
+     * 追加 {@code __jk_<col>_<k>} 副本。别名规则为空时原样返回 join（零额外开销）。
+     */
+    private static Operator applyJoinAliases(Operator join, FragmentSpec.JoinStep joinStep) {
+        List<FragmentSpec.JoinAlias> aliases = joinStep.outputAliases();
+        if (aliases == null || aliases.isEmpty()) {
+            return join;
+        }
+        List<ColumnAliasOperator.Alias> core = new ArrayList<>(aliases.size());
+        for (FragmentSpec.JoinAlias a : aliases) {
+            core.add(new ColumnAliasOperator.Alias(a.sourceName(), a.occurrence(), a.aliasName()));
+        }
+        // 上游列名仅供 ColumnAliasOperator 的输出命名（执行期按实际 schema 定位源列）。
+        List<String> upstream = new ArrayList<>();
+        if (joinStep.declaredLeftFields() != null) {
+            for (Field f : joinStep.declaredLeftFields()) upstream.add(f.getName());
+        }
+        if (joinStep.declaredRightFields() != null) {
+            for (Field f : joinStep.declaredRightFields()) upstream.add(f.getName());
+        }
+        return new ColumnAliasOperator(join, upstream, core);
+    }
+
+    /**
+     * @param tagPartitionIds 哈希 join 输出页是否带分区号。链式片段（join 输出<b>直接</b>喂多分区
+     *                        窗口排序）必须 true：否则各分区结果全落窗口排序槽 0，单槽归并整份数据
+     *                        ⇒ 长时间不吐页、其它槽空闲。中间层 / 单机链路为 false（下游按 1 分区建槽）。
+     */
+    private static Operator localJoin(PartitionedSource left, PartitionedSource right,
+                                      FragmentSpec.JoinStep joinStep, boolean tagPartitionIds) {
+        boolean hasOnFilter = joinStep.onLeftFilter() != null || joinStep.onRightFilter() != null;
+        if (hasOnFilter && joinStep.algorithm() == FragmentSpec.JoinAlgorithm.SORT_MERGE) {
+            // 规划期必须为带 ON 残差谓词的 join 选 HASH（残差语义实现在 HashJoinOperator 内）。
+            throw new IllegalStateException(
+                    "SortMergeJoin 不支持 ON 单侧残差谓词，规划期应选 HASH：" + joinStep.onLeftFilter()
+                            + " / " + joinStep.onRightFilter());
+        }
         return switch (joinStep.algorithm()) {
             case SORT_MERGE -> new SortMergeJoinOperator(
                     new PartitionedSourceOperator(left, left.numPartitions()),
@@ -659,7 +862,8 @@ public final class FragmentExecutor {
             case HASH, BROADCAST -> new HashJoinOperator(left, right,
                     joinStep.leftKeyColumns(), joinStep.rightKeyColumns(),
                     joinStep.joinType(), joinStep.memoryLimit(), joinStep.numPartitions(),
-                    joinStep.declaredRightFields(), joinStep.declaredLeftFields());
+                    joinStep.declaredRightFields(), joinStep.declaredLeftFields(), tagPartitionIds,
+                    joinStep.onLeftFilter(), joinStep.onRightFilter());
         };
     }
 
@@ -682,6 +886,41 @@ public final class FragmentExecutor {
     }
 
     /**
+     * 窗口键 / 值含表达式时，发送端在<b>重分区之前</b>物化合成列（{@link ExpressionProjectOperator}）：
+     * 分区键被 Planner 改写成 {@code __win_key_N} / {@code __win_arg_N}，必须先算出来才能按值哈希，
+     * 否则同值行散到不同桶（窗口结果错）。{@code computed} 为空时原样返回上游。
+     */
+    private static Operator applyComputed(Operator upstream, List<GroupKeyExpression> computed) {
+        return computed == null || computed.isEmpty() ? upstream
+                : new ExpressionProjectOperator(upstream, computed);
+    }
+
+    /**
+     * 窗口输出收窄到 {@code outputColumns}：丢掉为键表达式临时物化的合成列，恢复
+     * {@code upstream.outputColumns() + 窗口函数输出列} 的布局（与 {@code outputFields} / CTAS 一致）。
+     */
+    private static Operator trimTo(Operator op, List<String> outputColumns) {
+        return outputColumns == null || outputColumns.isEmpty() ? op
+                : new ProjectOperator(op, outputColumns);
+    }
+
+    /**
+     * 构造单个窗口步骤的本地算子链：{@link WindowSortOperator} → {@link WindowFunctionOperator}
+     * → 收窄到声明输出列。键表达式合成列由<b>发送端</b>在重分区前物化（见 {@link #applyComputed}），
+     * 接收端不再重复计算。三处窗口执行点（终端 / 中间层 / 链式后续）共用同一构造，避免行为漂移。
+     */
+    private Operator buildWindow(String fragmentId, Operator upstream, FragmentSpec.WindowStep w) {
+        WindowSortOperator sort = new WindowSortOperator(
+                upstream, w.partitionBy(), w.orderBy(), w.ascending(), w.memoryLimit(), w.numPartitions());
+        WindowFunctionOperator win = new WindowFunctionOperator(
+                sort, w.partitionBy(), w.functions(), w.orderBy(), AGGREGATE_REGISTRY);
+        applyWindowFilter(w, sort, win);
+        trackSpill(fragmentId, sort);
+        trackSpill(fragmentId, win);
+        return trimTo(win, w.outputColumns());
+    }
+
+    /**
      * 同 key 后续计算：把 join 输出接到本地窗口 / 聚合上（join 是 spillable 上游，open/close 自动传播）。
      *
      * <p>后续算子（窗口排序 / 聚合）同样是溢写方，按 {@code fragmentId} 登记溢写采样器 —— 与 join 那路
@@ -689,16 +928,7 @@ public final class FragmentExecutor {
      */
     private Operator buildFollowUp(String fragmentId, Operator upstream, FragmentSpec.FollowUp followUp) {
         return switch (followUp) {
-            case FragmentSpec.WindowStep w -> {
-                WindowSortOperator sort = new WindowSortOperator(
-                        upstream, w.partitionBy(), w.orderBy(), w.ascending(), w.memoryLimit(), w.numPartitions());
-                WindowFunctionOperator win = new WindowFunctionOperator(
-                        sort, w.partitionBy(), w.functions(), w.orderBy(), AGGREGATE_REGISTRY);
-                applyWindowFilter(w, sort, win);
-                trackSpill(fragmentId, sort);
-                trackSpill(fragmentId, win);   // 窗口函数缓冲溢写（与排序溢写累加）
-                yield win;
-            }
+            case FragmentSpec.WindowStep w -> buildWindow(fragmentId, upstream, w);
             case FragmentSpec.AggregateStep a -> {
                 // SUM(CASE WHEN ...) / SUM(IF(...)) 派生列：CASE 逐行、与分区无关，Worker 本地
                 // 先算派生列再聚合（与单机一致；join 输出即上游，派生列按 join 输出 schema 解析）
@@ -740,6 +970,11 @@ public final class FragmentExecutor {
         try {
             op.open();
             while (true) {
+                // ★取消抬头：任务线程被 interrupt = 查询被取消（WorkerManager.cancelTask）。
+                //   算子层已有检查点，这里再兜一层，保证片段循环本身不空转。
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new CancellationException("fragment cancelled: " + fragmentId);
+                }
                 Page p = op.next();
                 if (p.isEOF()) break;
                 profPages++;
@@ -813,6 +1048,10 @@ public final class FragmentExecutor {
             DojaoConnector conn = provider.get(sink.catalog());
             op.open();
             while (true) {
+                // ★取消抬头：同 runAndStream。
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new CancellationException("fragment cancelled: " + fragmentId);
+                }
                 long t0 = System.nanoTime();
                 Page p = op.next();
                 nextNanos += System.nanoTime() - t0;

@@ -23,7 +23,7 @@ package com.dojao.core.operator;
  * @date 2026/9/6
  */
 public record DistributedTask(String taskId, String workerId, String kind,
-                              boolean producer, String state, long rowsOut,
+                              boolean producer, boolean terminal, String state, long rowsOut,
                               long dispatchNanos, long finishNanos, String failure,
                               String source) {
 
@@ -34,6 +34,21 @@ public record DistributedTask(String taskId, String workerId, String kind,
 
     /** 片段内部分区子任务 id 的分隔符（{@code <fragmentId>#p<分区号>}）。 */
     public static final String PARTITION_SEP = "#p";
+
+    /**
+     * 链式片段内<b>join 阶段</b>子任务 id 的后缀（{@code <fragmentId>#join}）。
+     *
+     * <p>链式 join（{@code ChainedJoinConsumer}）把「join → 窗口 / 聚合」压在一个 Worker 片段里，
+     * 监控若只按片段展示，join 与窗口就糊成一个框。Worker 侧把 join 输出行数登记到这个子任务
+     * （分区级为 {@code <fragmentId>#join#p<k>}），Master 侧据此把同一片段拆成 Join + Window/Aggregate
+     * 两个阶段框 —— 用户能看出当前卡在 join（Phase 1 build/probe）还是窗口（归并）。
+     */
+    public static final String JOIN_STAGE = "#join";
+
+    /** 链式片段的 join 阶段子任务 id。 */
+    public static String joinStageTaskId(String fragmentId) {
+        return fragmentId + JOIN_STAGE;
+    }
 
     /**
      * 片段内部第 {@code partition} 个分区子任务的 id。

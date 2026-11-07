@@ -203,6 +203,13 @@ public final class ResourceConfig {
     /** 多次引用 CTE 物化开关（{@code query.cte.materialize}，默认开）。 */
     public static final String QUERY_CTE_MATERIALIZE = "query.cte.materialize";
     /**
+     * 物化 CTE 随切片下发的 wire 载荷总量上限（{@code query.cte.wire.maxBytes}）。
+     *
+     * <p>物化文件在 Master 侧重编码成 Arrow IPC 字节后随切片常驻 Master 堆直至派发完成；
+     * 超过上限直接失败并提示调高本配置，而不是把整个 Master 堆交给一条查询。</p>
+     */
+    public static final String QUERY_CTE_WIRE_MAX_BYTES = "query.cte.wire.maxBytes";
+    /**
      * 多维聚合展开开关（{@code query.groupingSets.expand}，默认开）：{@code ROLLUP/CUBE/GROUPING SETS}
      * 只扫一次表（展开算子 + 单次聚合）而非每维度组合各扫一次（UNION ALL 多腿）。关掉 = 回退旧多腿路径。
      */
@@ -315,6 +322,8 @@ public final class ResourceConfig {
     public static final boolean DEFAULT_PARTITION_METADATA_SCAN = true;
     /** 多次引用 CTE 物化默认开启（同一查询体只执行一次，结果落盘供各引用重放）。 */
     public static final boolean DEFAULT_CTE_MATERIALIZE = true;
+    /** wire 载荷总量默认上限：512MB（单条 CTE；超出需显式调高）。 */
+    public static final long DEFAULT_CTE_WIRE_MAX_BYTES = 512L * 1024 * 1024;
     /** 多维聚合展开默认开启（表只扫一次，各维度组合由放大后的行在聚合端分开）。 */
     public static final boolean DEFAULT_GROUPING_SETS_EXPAND = true;
     /** Master 侧回退单机聚合默认预算 256M（见 {@link #masterAggregationMemoryBytes()}）。 */
@@ -1004,6 +1013,17 @@ public final class ResourceConfig {
     public static boolean cteMaterializeEnabled() {
         String v = value(QUERY_CTE_MATERIALIZE, String.valueOf(DEFAULT_CTE_MATERIALIZE));
         return !"false".equalsIgnoreCase(v.trim());
+    }
+
+    /**
+     * 物化 CTE 随切片下发的 wire 载荷总量上限（{@code query.cte.wire.maxBytes}，默认 512MB）。
+     *
+     * <p>载荷是 Master 堆上的 {@code byte[]}，且要在全部引用点派发完成前常驻；没有上限时
+     * 一条大 CTE 查询就可能吃穿 Master 堆。超限由 {@code MaterializedCteScanOperator.Store}
+     * 响亮失败，并在消息里给出本配置键与当前值。</p>
+     */
+    public static long cteWireMaxBytes() {
+        return longValue(QUERY_CTE_WIRE_MAX_BYTES, DEFAULT_CTE_WIRE_MAX_BYTES);
     }
 
     /**

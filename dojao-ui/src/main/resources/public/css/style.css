@@ -1522,17 +1522,26 @@ textarea.sql-editor::-moz-selection { background: rgba(37, 99, 235, 0.26); color
 /* 聚焦态一律不画描边/光环（浏览器给 textarea 的默认 focus ring 也在内） */
 .ai-input:focus, .ai-input:focus-visible { outline: none; box-shadow: none; }
 .ai-input::placeholder { color: var(--text-faint); }
+/* 发送键：简约圆形小飞机。推理中同一位置切成红色方框（停止）。 */
 .ai-send {
-  padding: 9px 18px;
+  flex-shrink: 0;
+  width: 36px; height: 36px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
   background: var(--accent); color: #fff;
-  border: 1px solid var(--accent); border-radius: var(--radius-sm);
-  font-family: inherit; font-size: 14px; font-weight: 600; white-space: nowrap; cursor: pointer;
-  transition: background .18s var(--ease);
+  border: 1px solid var(--accent); border-radius: 50%;
+  cursor: pointer;
+  transition: background .18s var(--ease), border-color .18s var(--ease),
+              border-radius .18s var(--ease);
 }
-.ai-send:hover:not(:disabled) { background: var(--accent-hover); }
+.ai-send-ico { width: 18px; height: 18px; display: block; }
+/* 停止符号：红方框里的小白方框（默认隐藏）。 */
+.ai-send-stop { display: none; width: 12px; height: 12px; border-radius: 2px; background: #fff; }
+.ai-send:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
 .ai-send:disabled { background: #c7d5f5; border-color: #c7d5f5; cursor: not-allowed; }
-/* 推理中：发送键变红色「停止」，点一下强制终止本次推理。 */
-.ai-send.busy { background: var(--err); border-color: var(--err); }
+/* 推理中：圆 → 红色方框，点一下强制终止本次推理。 */
+.ai-send.busy { background: var(--err); border-color: var(--err); border-radius: 9px; }
+.ai-send.busy .ai-send-ico { display: none; }
+.ai-send.busy .ai-send-stop { display: block; }
 .ai-send.busy:hover { background: #d33; border-color: #d33; }
 .ai-stopped {
   margin-top: 2px; font-size: 12.5px; color: var(--text-faint);
@@ -1677,7 +1686,10 @@ textarea.sql-editor::-moz-selection { background: rgba(37, 99, 235, 0.26); color
   border: 1px solid var(--accent); border-left-width: 3px; border-radius: var(--radius-sm);
   background: var(--bg2);
 }
-.ai-confirm-head { font-size: 13px; font-weight: 600; color: var(--accent); }
+.ai-confirm-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  font-size: 13px; font-weight: 600; color: var(--accent);
+}
 .ai-confirm-sql {
   white-space: pre-wrap; word-break: break-word; margin: 8px 0;
   padding: 8px 10px; border-radius: var(--radius-sm); background: var(--bg3); border: 1px solid var(--line);
@@ -1766,6 +1778,21 @@ textarea.sql-editor::-moz-selection { background: rgba(37, 99, 235, 0.26); color
   border: 1px solid var(--line); border-radius: var(--radius-sm); overflow: auto;
 }
 .ai-answer pre.md-pre code { background: none; border: none; padding: 0; font-size: 12.5px; line-height: 1.55; }
+/* AI 代码区（报告代码块 / DDL 确认卡）右上角「复制全部」。
+   按钮事件走 dashboard.js 的 document 委托 —— 流式回答重绘 innerHTML 不会丢功能。 */
+.md-code { position: relative; margin: 10px 0; }
+.md-code pre.md-pre { margin: 0; padding-top: 30px; }
+.md-code-copy {
+  padding: 2px 9px;
+  font-family: inherit; font-size: 12px; line-height: 1.6;
+  color: var(--text-dim); background: var(--bg2);
+  border: 1px solid var(--line); border-radius: 4px;
+  cursor: pointer; opacity: .85;
+  transition: color .15s var(--ease), border-color .15s var(--ease), opacity .15s var(--ease);
+}
+.md-code-copy:hover { color: var(--accent); border-color: var(--accent); opacity: 1; }
+.md-code-copy.copied { color: var(--ok, #047857); border-color: var(--ok, #047857); }
+.md-code .md-code-copy { position: absolute; top: 6px; right: 8px; z-index: 1; }
 .ai-answer a { color: var(--accent-text); text-decoration: underline; }
 .ai-answer blockquote {
   margin: 10px 0; padding: 4px 12px;

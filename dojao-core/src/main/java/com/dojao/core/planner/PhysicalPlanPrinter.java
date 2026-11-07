@@ -58,6 +58,17 @@ public final class PhysicalPlanPrinter {
             }
         }
 
+        // 仅展示的数据来源（分布式节点内部折叠掉的基表 Scan）—— 不显示为执行子节点，
+        // 而是显式标成「来源」，避免用户误以为计划里没有 scan。
+        List<PhysicalNode> sources = node.sources();
+        if (!sources.isEmpty()) {
+            sb.append(childPrefix).append("- sources:\n");
+            String srcPrefix = childPrefix + "    ";
+            for (int i = 0; i < sources.size(); i++) {
+                render(sources.get(i), srcPrefix, i == sources.size() - 1, sb, actualRows);
+            }
+        }
+
         List<PhysicalNode> children = node.children();
         for (int i = 0; i < children.size(); i++) {
             render(children.get(i), childPrefix, i == children.size() - 1, sb, actualRows);

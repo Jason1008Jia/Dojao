@@ -4,6 +4,7 @@ import com.dojao.common.data.Page;
 import com.dojao.common.memory.NodeMemory;
 import com.dojao.core.config.ResourceConfig;
 import com.dojao.core.runtime.worker.ExchangeChannel;
+import com.dojao.core.runtime.worker.ExchangeLease;
 import com.dojao.spi.util.NestedTypeSupport;
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
@@ -17,7 +18,9 @@ import org.apache.arrow.vector.util.TransferPair;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -98,10 +101,38 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
     private ExecutorService distributorExecutor;
     /** 分发线程已完成的计数（最后一个线程负责塞 partitionEnd）。 */
     private final AtomicInteger distributorsDone = new AtomicInteger();
+    /**
+     * 正在运行的分发线程数（进入 {@link #distributeLoop} 即 +1，_finally_ 里 -1）。
+     *
+     * <p>与 {@link #distributorsDone} 的区别：{@code shutdownNow()} 会取消<b>尚未启动</b>的任务，
+     * 这些任务永远走不到 finally，done 永远达不到 {@code numDistributors}。判断「不可能再有
+     * send/complete」只能靠「运行中的线程数归零」。</p>
+     */
+    private final AtomicInteger distributorsRunning = new AtomicInteger();
     /** partitionEnd 是否已发送（确保只发一次）。 */
     private final AtomicBoolean partitionEndSent = new AtomicBoolean();
     /** 本生产端已向交换通道释放过发送流（close 幂等 + 引用计数与 {@link #doOpen} 的 acquire 严格配对）。 */
     private final AtomicBoolean exchangeReleased = new AtomicBoolean();
+    /**
+     * 是否<b>成功</b>在通道上登记过本生产端（{@link #doOpen} 的 acquire 循环走完才置 true）。
+     *
+     * <p>{@code close()} 可能发生在 {@code open()} 之前（open 抛错 / 取消路径），此时绝不能
+     * {@code release}：同一 Worker 上多个 Producer 片段共用一条 (目标Worker, exchangeId) 发送流，
+     * 未登记却减引用计数会把仍在发送的邻居片段计数减到 0 → 提前关流，邻居的
+     * {@code send/complete} 撞上 "发送流已释放"。</p>
+     */
+    private volatile boolean exchangeAcquired;
+    /**
+     * 每分区的发送租约（{@code exchangeIds[pid]} 相同的分区共享同一租约）。
+     *
+     * <p>send/complete/fail 全部经句柄路由，不再按 exchangeId 去通道的全局流表里查 ——
+     * 句柄固化了「使用哪一代发送流」，避免同一 Worker 上先后执行的片段复用上一代已收尾的流。</p>
+     */
+    private volatile ExchangeLease[] exchangeLeases;
+    /** 已获取的租约（按 exchangeId 去重，收尾时逐个关闭）。 */
+    private final List<ExchangeLease> acquiredLeases = new ArrayList<>();
+    /** 已请求收尾（{@link #doClose} 进入）：最后一个分发线程退出时补做发送流释放（见超时路径）。 */
+    private final AtomicBoolean closing = new AtomicBoolean();
     /** 分发线程的异常（消费端 rethrow；正常为 null）。 */
     private volatile Throwable distributorFailure;
     /** 各分发线程的独立 allocator（doClose 时统一释放）。 */
@@ -247,7 +278,7 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
             if (exchangeChannel == null) {
                 partitionQueues[pid].put(page);
             } else {
-                exchangeChannel.send(ownerWorkerIds[pid], exchangeIds[pid], pid, page);
+                exchangeLease(pid).send(ownerWorkerIds[pid], pid, page);
             }
         } finally {
             emitBlockNanos.addAndGet(System.nanoTime() - t0);
@@ -259,7 +290,7 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
         if (exchangeChannel == null) {
             partitionQueues[pid].put(Page.partitionEnd(pid));
         } else {
-            exchangeChannel.complete(ownerWorkerIds[pid], exchangeIds[pid], pid);
+            exchangeLease(pid).complete(ownerWorkerIds[pid], pid);
         }
     }
 
@@ -267,11 +298,21 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
     private void notifyRemoteFail(Throwable t) {
         for (int i = 0; i < numPartitions; i++) {
             try {
-                exchangeChannel.fail(ownerWorkerIds[i], exchangeIds[i], i, t);
+                exchangeLease(i).fail(ownerWorkerIds[i], i, t);
             } catch (Throwable ignored) {
                 // 目标已死 → 忽略，由 Master 看门狗兜底（Phase C）
             }
         }
+    }
+
+    /** 取分区对应的发送租约；缺失说明 open 时序错配（分发线程不该在租约就绪前启动）。 */
+    private ExchangeLease exchangeLease(int pid) {
+        ExchangeLease[] leases = exchangeLeases;
+        ExchangeLease lease = leases == null ? null : leases[pid];
+        if (lease == null) {
+            throw new IllegalStateException("分区 " + pid + " 没有发送租约（doOpen 未完成 / exchangeId 为空）");
+        }
+        return lease;
     }
 
     @Override
@@ -279,13 +320,35 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
         upstream.open();
         // 先登记本生产端再启动分发线程：同一 Worker 上多个 Producer 片段共用一条
         // (目标 Worker, exchangeId) 发送流，先跑完的片段释放时不得关掉仍在用的共享流。
+        // 登记返回「发送租约」—— send/complete/fail 全部经它路由（代际固化在句柄里）。
         if (exchangeChannel != null && exchangeIds != null) {
-            java.util.Set<String> acquired = new java.util.HashSet<>();
-            for (String id : exchangeIds) {
-                if (id != null && acquired.add(id)) {
-                    exchangeChannel.acquire(id);
+            Map<String, ExchangeLease> byId = new HashMap<>();
+            ExchangeLease[] leases = new ExchangeLease[numPartitions];
+            List<ExchangeLease> acquired = new ArrayList<>();
+            try {
+                for (int pid = 0; pid < numPartitions; pid++) {
+                    String id = exchangeIds[pid];
+                    if (id == null) {
+                        continue;
+                    }
+                    ExchangeLease lease = byId.get(id);
+                    if (lease == null) {
+                        lease = exchangeChannel.acquireLease(id);
+                        byId.put(id, lease);
+                        acquired.add(lease);
+                    }
+                    leases[pid] = lease;
                 }
+            } catch (RuntimeException e) {
+                // 半途失败：归还已获取的租约（此时还不能置 exchangeAcquired，releaseExchange 不适用）
+                for (ExchangeLease lease : acquired) {
+                    try { lease.close(); } catch (Throwable ignored) { }
+                }
+                throw e;
             }
+            exchangeLeases = leases;
+            acquiredLeases.addAll(acquired);
+            exchangeAcquired = true;
         }
         startDistributors();
     }
@@ -325,9 +388,10 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
             }
             if (!anySeen) {
                 try { Thread.sleep(1); } catch (InterruptedException e) {
+                    // ★取消必须原样抛出：旧实现返回 EOF，把「取消」伪装成「上游正常结束」，
+                    //   下游溢写算子会立刻起一整轮 Phase 2 归并（纯 CPU），取消后反而更忙。
                     Thread.currentThread().interrupt();
-                    mergedDrained = true;
-                    return Page.eof();
+                    throw e;
                 }
             }
         }
@@ -336,9 +400,14 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
     @Override
     protected void doClose() throws Exception {
         // 1. 先停掉所有后台分发线程
+        closing.set(true);
+        boolean stopConfirmed = true;
         if (distributorExecutor != null) {
             distributorExecutor.shutdownNow();
             try { distributorExecutor.awaitTermination(5, TimeUnit.SECONDS); } catch (InterruptedException ignored) {}
+            // 已 shutdown 的池：isTerminated = 全部任务（含被 shutdownNow 取消的未启动任务）都已结束。
+            // 超时未停 ⇒ 还有线程活着，release 推迟到最后一个分发线程退出（见 distributeLoop finally）。
+            stopConfirmed = distributorExecutor.isTerminated();
         }
         // 2. 清理各分区队列中未消费的 Page
         for (BlockingQueue<Page> q : partitionQueues) {
@@ -348,15 +417,14 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
             }
         }
         // 3. 通知交换通道释放本 exchange 的发送侧资源（网络流 / 流复用根 / flusher 线程）。
-        //    分发线程已停止 ⇒ 不会再有新的 send/complete/fail；通道在待发队列排空后自行收尾。
-        //    exchangeReleased 保证 close 重入时不会把共享流的引用计数减两次。
-        if (exchangeChannel != null && exchangeIds != null && exchangeReleased.compareAndSet(false, true)) {
-            java.util.Set<String> released = new java.util.HashSet<>();
-            for (String id : exchangeIds) {
-                if (id != null && released.add(id)) {
-                    try { exchangeChannel.release(id); } catch (Throwable ignored) {}
-                }
-            }
+        //    ★只有确认分发线程<b>全部退出</b>才释放：awaitTermination 超时（分发线程卡在
+        //    upstream.next() / gRPC putNext 上，中断不会立刻生效）时它稍后仍会 send/complete，
+        //    提前关共享流会让它撞上 "发送流已释放"。此时把释放交给最后一个退出的分发线程
+        //    （见 distributeLoop 的 finally）。exchangeReleased 保证只减一次引用计数。
+        //    distributorExecutor == null = 分发线程从未启动（open 在启动前就失败）⇒ 不可能再有发送，
+        //    直接释放本次已登记的引用计数（未 open 则 exchangeAcquired=false，releaseExchange 空转）。
+        if (distributorExecutor == null || stopConfirmed) {
+            releaseExchange();
         }
         // 4. 关闭上游
         upstream.close();
@@ -365,6 +433,26 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
             try { a.close(); } catch (Exception ignored) {}
         }
         distributorAllocators.clear();
+    }
+
+    /**
+     * 关闭本生产端持有的全部发送租约（引用计数 -1，最后一个租约才真正收尾共享流）。
+     *
+     * <p>仅当 {@link #doOpen} 确实登记过（{@code exchangeAcquired}）才执行 —— 未 open 就 close
+     * 不能减计数，否则会把同 Worker 上仍在发送的邻居片段的计数误减到 0。重入由
+     * {@code exchangeReleased} 兜住；每个租约对象自身也幂等。</p>
+     */
+    private void releaseExchange() {
+        if (exchangeChannel == null || !exchangeAcquired) {
+            return;
+        }
+        if (!exchangeReleased.compareAndSet(false, true)) {
+            return;
+        }
+        for (ExchangeLease lease : acquiredLeases) {
+            try { lease.close(); } catch (Throwable ignored) { }
+        }
+        acquiredLeases.clear();
     }
 
     // ==================== 分发 ====================
@@ -388,6 +476,7 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
      * 各线程持有独立的 PartitionBuffer + BufferAllocator，线程间零共享（除输出队列）。
      */
     private void distributeLoop() {
+        distributorsRunning.incrementAndGet();
         // 每个分发线程的分配器也是共享根的子：分区缓冲的堆外占用进统一账本，受共享根硬上限约束。
         BufferAllocator myAlloc = NodeMemory.shared()
                 .newOperatorAllocator("hashpartition-dist", ResourceConfig.queryDirectLimit());
@@ -482,6 +571,14 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
                             acc[0] / 1_000_000, acc[1] / 1_000_000, acc[2] / 1_000_000,
                             acc[3] / 1_000_000, acc[4] / 1_000_000, acc[5] / 1_000_000);
                 }
+            }
+            // doClose 的 awaitTermination 超时 = 本线程当时还活着，释放被推迟到这里：
+            // 最后一个<b>运行过</b>的分发线程退出后才不会再有任何 send/complete/fail
+            //（正常路径已释放 → no-op）。用 running 而非 done：shutdownNow 取消掉的未启动任务
+            // 永远走不到这里，done 永远差数，会让发送流引用计数泄漏、接收端永远收不到 COMPLETE。
+            int remaining = distributorsRunning.decrementAndGet();
+            if (closing.get() && remaining == 0) {
+                releaseExchange();
             }
         }
     }

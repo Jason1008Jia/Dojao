@@ -68,6 +68,10 @@ message ResourceSummaryMsg {
   // 本进程 RSS（Linux /proc/self/status 的 VmRSS；非 Linux 为 0）——
   // 与「主机已用内存」区分：后者含可回收页缓存，RSS 才是进程真正占住的物理内存。
   int64 process_rss_bytes = 17;
+  // 网络命名空间累计收发字节（Linux /proc/net/dev 各非回环接口 rx / tx 之和；非 Linux 为 0）。
+  // 累计计数 ⇒ 监控页按相邻采样点差分画带宽；proto3 缺省 0 与旧发送方兼容。
+  int64 net_rx_bytes = 18;
+  int64 net_tx_bytes = 19;
 }
 
 // 单个命名分配器类别的用量快照（监控页内存明细）。
@@ -227,6 +231,20 @@ message JoinStepMsg {
   // 左表（probe 侧）声明列，语义与 right_schema_ipc 对称：RIGHT / FULL join 某分区左表一页未收时，
   // 「右行 + 左列全 NULL」的孤儿行需要左列类型才能构造输出 schema。
   bytes left_schema_ipc = 8;
+  // join 输出别名副本（外连接同名列消歧）：Worker 在 join 之后、后续窗口/聚合之前套用，
+  // 使链式分布式执行不再因 Master 侧 ColumnAlias 包装而失去对 join 的识别（退回单机）。
+  repeated JoinAliasMsg output_aliases = 9;
+  // JOIN ON 中只引用左（probe）侧 / 右（build）侧的条件（已去限定符）。空 = 无。
+  // 作为「匹配判定」的一部分在 Worker 本地求值：条件为假/NULL 的行视为未匹配，
+  // 外连接仍按孤儿行输出（保留侧不能提前过滤掉整行）。
+  string on_left_filter = 10;
+  string on_right_filter = 11;
+}
+
+message JoinAliasMsg {
+  string source_name = 1;
+  int32 occurrence = 2;   // 同名源列出现次序（从 1 起）
+  string alias_name = 3;
 }
 
 message AggregationDtoMsg {
@@ -310,6 +328,11 @@ message WindowStepMsg {
   // Worker 侧 WindowSortOperator，在 Phase 1 末尾就地裁掉不合格行，避免整组回传 Master 再过滤。
   // 空 = 无下推（老 Worker / 不满足下推条件的窗口函数）。proto3 message 字段天然可空。
   WindowFilterMsg filter = 7;
+  // 窗口键 / 值参数表达式合成列（partition_by / order_by / 函数参数已改写为引用这些列）：
+  // Worker 在窗口排序前逐行物化。空 = 键都是裸列名（老行为）。
+  repeated GroupKeyExpressionMsg computed = 8;
+  // 本组窗口完成后的对外列（上游列 + 已产生的窗口输出列）；非空 → Worker 窗口后裁剪掉合成列。
+  repeated string output_columns = 9;
 }
 
 // 窗口提前过滤配置 —— WindowFilterConfig 的线格式镜像（枚举用名称字符串，抗枚举重排）。
@@ -369,6 +392,11 @@ message ConsumerMsg {
   JoinStepMsg join = 5;
   SinkStepMsg sink = 6;   // 空 = 无写目标（SELECT 回传）
   SortLimitStepMsg tail = 7;   // 空 = 无 top-N 片内截断
+  // 本地 join 输出上的行级过滤（join 之上的 Filter 下沉；按顶层 AND 拆分逐条编译）。
+  string filter_after_join = 8;
+  // 本地 join（+过滤）输出上的<b>二级聚合</b>（外层分组聚合下沉的终态段）：
+  // 非空 → 同 Worker 再跑一次 HashAggregation；分组键须覆盖 join 分区键（协分区 ⇒ 每分区终态）。
+  AggregateStepMsg partial_follow_up = 9;
 }
 
 message AggregateConsumerMsg {
@@ -391,6 +419,9 @@ message WindowConsumerMsg {
   WindowStepMsg window = 4;
   SinkStepMsg sink = 5;   // 空 = 无写目标（SELECT 回传）
   SortLimitStepMsg tail = 6;   // 空 = 无 top-N 片内截断
+  // 窗口输出之上的二级聚合（外层全局聚合下沉）：每分区只回传 1 行 partial，
+  // Master 侧 PartialAggregationMergeOperator 合并。
+  AggregateStepMsg partial_follow_up = 7;
 }
 
 message ChainedJoinConsumerMsg {
@@ -405,6 +436,15 @@ message ChainedJoinConsumerMsg {
   }
   SinkStepMsg sink = 8;   // 空 = 无写目标（SELECT 回传）
   SortLimitStepMsg tail = 9;   // 空 = 无 top-N 片内截断
+  // 非终端链：join→后续计算输出按此重分区推给下一窗口交换（不回传 Master）。
+  // 空 = 终端片段（老 Master / 单窗口组形态）。
+  PartitionStepMsg next_partition = 10;
+  // next_partition 的目标窗口分组键表达式合成列（重分区前本机物化）。空 = 无表达式键。
+  repeated GroupKeyExpressionMsg next_computed = 11;
+  // join→聚合 follow_up 输出上的二级聚合（外层全局聚合下沉的 partial 段）：
+  // 非空 → 本地聚合输出再喂给同 Worker 的第二次 HashAggregation（key 通常为空 = 全局 partial），
+  // 每分区只回传 1 行 partial，Master 侧 PartialAggregationMergeOperator 再合并成最终行。
+  AggregateStepMsg partial_follow_up = 12;
 }
 
 message MiddleJoinConsumerMsg {
@@ -415,6 +455,8 @@ message MiddleJoinConsumerMsg {
   JoinStepMsg join = 5;
   PartitionStepMsg next_partition = 6;
   ExpandStepMsg expand = 7;                                   // 未设置 = 无多维聚合展开
+  // next_partition 的目标窗口分组键表达式合成列（重分区前本机物化）。空 = 无表达式键。
+  repeated GroupKeyExpressionMsg next_computed = 8;
 }
 
 // 派生表分布式 join 的聚合中间层：own 桶原始数据 → 本地 HashAggregation →
@@ -427,6 +469,11 @@ message MiddleAggregateConsumerMsg {
   AggregateStepMsg aggregate = 4;
   PartitionStepMsg next_partition = 5;
   string filter_after_aggregate = 6;   // 空 = 无 HAVING（可空派生内层 HAVING 谓词，列 ∈ 本地聚合输出列）
+  // next_partition 的目标窗口分组键表达式合成列（重分区前本机物化）。空 = 无表达式键。
+  repeated GroupKeyExpressionMsg next_computed = 7;
+  // 二级聚合（派生体为两级聚合 max(sum(x))）：本地聚合输出再聚一次（HAVING 之前）。
+  // 要求两级分组键相同（分区键 = 分组键 ⇒ 每分区终态）。
+  AggregateStepMsg follow_up = 8;
 }
 
 // 派生表分布式 join 的窗口中间层：own 桶原始数据 → 本地 WindowSort + WindowFunction →
@@ -437,6 +484,8 @@ message MiddleWindowConsumerMsg {
   ExchangeInStepMsg in = 3;
   WindowStepMsg window = 4;
   PartitionStepMsg next_partition = 5;
+  // next_partition 的目标窗口分组键表达式合成列（重分区前本机物化）。空 = 无表达式键。
+  repeated GroupKeyExpressionMsg next_computed = 6;
 }
 
 message FragmentSpecMsg {

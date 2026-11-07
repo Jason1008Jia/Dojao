@@ -116,6 +116,7 @@ function chartEmpty(ctx, w, h, text) {
 function chartNum(v, unit) {
     if (unit === 'pct') return Math.round(Number(v) || 0) + '%';
     if (unit === 'count') return fmtRows(v);
+    if (unit === 'bytesPerSec') return fmtBytes(v) + '/s';
     return fmtBytes(v);
 }
 
@@ -153,7 +154,7 @@ function lastVal(points) {
  * @param {HTMLCanvasElement} canvas
  * @param {Array<{name:string, color:string=, points:Array<{t:number, v:number}>}>} series
  * @param {Object=} opts
- *        {unit:'pct'|'bytes'|'count', max:number=, min:number=, showLegend:boolean=,
+ *        {unit:'pct'|'bytes'|'bytesPerSec'|'count', max:number=, min:number=, showLegend:boolean=,
  *         hover:boolean=, yTicks:number=, emptyText:string=}
  */
 function lineChart(canvas, series, opts) {
@@ -196,8 +197,8 @@ function lineChart(canvas, series, opts) {
         if (!alive.length) { chartEmpty(ctx, w, h, opts.emptyText); return; }
 
         var legendH = opts.showLegend === false ? 0 : 20;
-        // bytes 的轴标签最长（如 "39.0 GB"），左侧留宽一点免得贴边
-        var padL = unit === 'bytes' ? 56 : 40;
+        // bytes / bytesPerSec 的轴标签最长（如 "39.0 GB" / "39.0 MB/s"），左侧留宽一点免得贴边
+        var padL = unit === 'bytes' ? 56 : unit === 'bytesPerSec' ? 70 : 40;
         var padR = 12, padT = 8 + legendH, padB = 26;
         var plotW = Math.max(10, w - padL - padR);
         var plotH = Math.max(10, h - padT - padB);

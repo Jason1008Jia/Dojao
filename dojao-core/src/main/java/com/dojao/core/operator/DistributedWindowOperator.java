@@ -19,7 +19,7 @@ import java.util.List;
  * <p>执行形态：
  * <pre>
  *   doOpen → dispatchStage：
- *     StageScheduler.planWindow()       切分：N 个 Producer + 每 Worker 一个 WindowConsumer
+ *     StageScheduler.planWindowChain()  切分：N 个 Producer + 每 Worker 一个 WindowConsumer
  *     dispatch Consumer（先）           同步注册各 Worker 的 ShuffleReader
  *     dispatch Producer（后）           Worker 扫切片 → 按 PARTITION BY 哈希分区 → 推给归属 Worker
  *     Consumer：own 桶 → PartitionedSourceOperator → 本地 WindowSort + WindowFunction → 回传
@@ -36,7 +36,8 @@ import java.util.List;
  * @version 3.0
  * @date 2026/8/20
  */
-public class DistributedWindowOperator extends AbstractDistributedOperator implements Explainable {
+public class DistributedWindowOperator extends AbstractDistributedOperator
+        implements Explainable, WindowChainCarrier {
 
     /** 探针连接器：Master 侧本地做分区规划（不参与数据拉取）。 */
     private final ReadRequest baseRequest;
@@ -54,13 +55,13 @@ public class DistributedWindowOperator extends AbstractDistributedOperator imple
     private final List<String> orderBy;
     private final List<Boolean> ascending;
     private final List<WindowFunctionSpec> functions;
+    /**
+     * 多窗口分组链（至少 1 组，按 SELECT 中首次出现顺序）：扫描源一次，组间按下一组
+     * PARTITION BY 重分区，全部在 Worker 内完成。单组时长度为 1（与旧字段等价）。
+     */
+    private List<FragmentSpec.WindowStep> windowSteps;
     private final long memoryLimit;
     private final DojaoConnector probe;
-    /** 提前过滤下推（外层 WHERE 窗口函数列 op 值）；null = 无。规划期由 Planner 设置。 */
-    private WindowFilterConfig filter;
-
-    /** 规划期下推：把外层窗口过滤条件下推到 Worker 侧 WindowSortOperator（见 {@link WindowFilterConfig}）。 */
-    public void setFilterConfig(WindowFilterConfig filter) { this.filter = filter; }
 
     /**
      * 设置本算子对外的窗口前输出列（须在 {@code doOpen()} 前调用）。
@@ -72,12 +73,20 @@ public class DistributedWindowOperator extends AbstractDistributedOperator imple
         this.visibleColumns = columns == null ? null : List.copyOf(columns);
     }
 
-    /** 本算子对外输出页的全部列名（窗口前输出列 + 窗口函数结果列）。 */
+    /** 本算子对外输出页的全部列名（窗口前输出列 + 各组窗口函数结果列）。 */
     private List<String> emittedColumns() {
+        // 链尾步骤若声明了输出列（toDistributedWindowStep 构造），以其为准：窗口链被追加扩展时
+        // （K 形状：窗口 → 投影 → 窗口），链首输入已变为投影后的列，与扫描 projection 不同名。
+        FragmentSpec.WindowStep last = windowSteps.get(windowSteps.size() - 1);
+        if (!last.outputColumns().isEmpty()) {
+            return last.outputColumns();
+        }
         List<String> base = visibleColumns != null ? visibleColumns : projection;
         List<String> out = new ArrayList<>(base.size() + functions.size());
         out.addAll(base);
-        for (WindowFunctionSpec spec : functions) out.add(spec.outputColumn());
+        for (FragmentSpec.WindowStep step : windowSteps) {
+            for (WindowFunctionSpec spec : step.functions()) out.add(spec.outputColumn());
+        }
         return out;
     }
 
@@ -103,8 +112,6 @@ public class DistributedWindowOperator extends AbstractDistributedOperator imple
     /** 窗口上游列（Worker 扫描列集）—— 聚合型下推解析输入列索引用。 */
     public List<String> projection() { return projection; }
 
-    /** 已下推的窗口提前过滤配置（null = 未下推）—— 诊断 / 探针用。 */
-    public WindowFilterConfig filter() { return filter; }
 
     /** EXPLAIN 明细：扫描表 / 窗口分组与排序键 / 窗口函数 / 下推谓词。 */
     @Override
@@ -112,12 +119,16 @@ public class DistributedWindowOperator extends AbstractDistributedOperator imple
         List<String> out = new ArrayList<>();
         out.add("scan " + baseRequest.catalog() + "." + baseRequest.schema() + "." + baseRequest.table()
                 + (predicates.isEmpty() ? "" : " filter=[" + String.join(" AND ", predicates) + "]"));
-        out.add("window partitionBy=" + (partitionBy.isEmpty() ? "<all>" : partitionBy)
-                + " orderBy=" + (orderBy.isEmpty() ? "<none>" : orderBy)
-                + " functions=" + functions.stream()
-                        .map(f -> f.type() + (f.functionName() != null ? "(" + f.functionName() + ")" : "")
-                                + " AS " + f.outputColumn()).toList()
-                + (filter != null ? " earlyFilter=" + filter : ""));
+        for (int i = 0; i < windowSteps.size(); i++) {
+            FragmentSpec.WindowStep step = windowSteps.get(i);
+            out.add("window#" + i + " partitionBy=" + (step.partitionBy().isEmpty() ? "<all>" : step.partitionBy())
+                    + " orderBy=" + (step.orderBy().isEmpty() ? "<none>" : step.orderBy())
+                    + " functions=" + step.functions().stream()
+                            .map(f -> f.type() + (f.functionName() != null ? "(" + f.functionName() + ")" : "")
+                                    + " AS " + f.outputColumn()).toList()
+                    + (step.filter() != null ? " earlyFilter=" + step.filter().describe() : "")
+                    + (i > 0 ? " (repartition from window#" + (i - 1) + ")" : ""));
+        }
         return out;
     }
 
@@ -144,6 +155,36 @@ public class DistributedWindowOperator extends AbstractDistributedOperator imple
         this.orderBy = List.copyOf(orderBy);
         this.ascending = List.copyOf(ascending);
         this.functions = List.copyOf(functions);
+        this.windowSteps = List.of(new FragmentSpec.WindowStep(partitionBy, orderBy, ascending, functions,
+                memoryLimit, Math.max(1, numPartitions)));
+        this.memoryLimit = memoryLimit;
+        this.probe = probe;
+    }
+
+    /**
+     * 多窗口分组链构造：{@code windowSteps} 至少 1 组，顺序即 SELECT 中首次出现顺序。
+     * 单组调用方仍可用旧构造（等价于长度 1 的链）。
+     */
+    public DistributedWindowOperator(String queryId, ReadRequest baseRequest, List<String> predicates,
+                                     List<String> projection,
+                                     List<FragmentSpec.WindowStep> windowSteps,
+                                     long memoryLimit, int numPartitions,
+                                     WorkerGateway gateway, DojaoConnector probe,
+                                     List<WorkerRegistration> workers) {
+        super("DistributedWindow", queryId, numPartitions, gateway, workers);
+        if (windowSteps == null || windowSteps.isEmpty()) {
+            throw new IllegalArgumentException("windowSteps 不能为空");
+        }
+        this.baseRequest = baseRequest;
+        this.predicates = List.copyOf(predicates);
+        this.projection = projection == null ? List.of() : List.copyOf(projection);
+        this.windowSteps = List.copyOf(windowSteps);
+        FragmentSpec.WindowStep first = windowSteps.get(0);
+        this.partitionBy = first.partitionBy();
+        this.orderBy = first.orderBy();
+        this.ascending = first.ascending();
+        // 多组链禁用「窗口提前过滤下推」（无法唯一归属到某一组）。
+        this.functions = windowSteps.size() == 1 ? first.functions() : List.of();
         this.memoryLimit = memoryLimit;
         this.probe = probe;
     }
@@ -159,9 +200,8 @@ public class DistributedWindowOperator extends AbstractDistributedOperator imple
             if (p == null || p.isBlank()) continue;
             effective = probe.pushdownPredicate(effective, p);
         }
-        StageScheduler.DistributedStage stage = StageScheduler.planWindow(
-                queryId, workers, numPartitions, effective,
-                partitionBy, orderBy, ascending, functions, memoryLimit, filter, probe);
+        StageScheduler.DistributedStage stage = StageScheduler.planWindowChain(
+                queryId, workers, numPartitions, effective, windowSteps, probe);
 
         // 先 Consumer（同步注册接收端）后 Producer（发送端）—— 发送方 push 前所有接收端就绪
         List<FragmentSpec> consumers = withTerminal(stage.consumers());   // 分布式写 SinkStep + top-N 截断尾
@@ -172,7 +212,10 @@ public class DistributedWindowOperator extends AbstractDistributedOperator imple
         for (FragmentSpec producer : stage.producers()) {
             dispatch(producer);
         }
-        return consumers.size();
+        // 只有终端 WindowConsumer（每 Worker 一个）向 Master 回报 FragmentFinished；
+        // 中间窗口层（MW*）只把结果推进下一交换、不回传 —— 完成计数必须由 StageScheduler 给出，
+        // 不能按 consumers.size() 推算（否则永远差 N 个而挂到看门狗超时）。
+        return stage.finalConsumerCount();
     }
 
     @Override
@@ -187,19 +230,23 @@ public class DistributedWindowOperator extends AbstractDistributedOperator imple
         // ★用 visibleColumns（对外声明列）而非 projection —— 后者可能多带「只作过滤用」的引擎
         //   过滤列（如 Hive 非下推时的分区列 dt），带上它会让 CTAS 建出多余列。
         List<String> base = visibleColumns != null ? visibleColumns : projection;
-        List<Field> out = new ArrayList<>();
         List<Field> input = scanFields(probe, baseRequest.catalog(), baseRequest.schema(),
                 baseRequest.table(), base);
-        out.addAll(input);
-        // LAG/LEAD 镜像输入列类型（按列名匹配），其余函数类型已内嵌于 windowFunctionField
-        for (WindowFunctionSpec spec : functions) {
-            out.add(windowFunctionField(spec, name -> {
-                for (Field f : input) {
-                    if (f.getName().equalsIgnoreCase(name)) return f;
-                }
-                return null;
-            }));
-        }
-        return out;
+        // 多组链 + K 形状投影吸收：逐步按声明输出列重定基再追加函数列（见基类 helper）。
+        return windowChainOutputFields(input, windowSteps);
     }
+
+    /** 多窗口分组链（长度 1 = 单组，与旧行为等价）。 */
+    @Override
+    public List<FragmentSpec.WindowStep> windowSteps() { return windowSteps; }
+
+    /** 替换整条窗口链（Planner 窗口过滤下推只重建末组）。 */
+    @Override
+    public void replaceWindowSteps(List<FragmentSpec.WindowStep> steps) {
+        if (steps == null || steps.isEmpty()) return;
+        this.windowSteps = List.copyOf(steps);
+    }
+
+    /** 是否多窗口分组链。 */
+    public boolean hasWindowChain() { return windowSteps.size() > 1; }
 }

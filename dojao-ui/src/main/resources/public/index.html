@@ -390,6 +390,10 @@
         <canvas class="mon-chart" id="mon-chart-cpu"></canvas>
       </div>
       <div class="mon-chart-card">
+        <div class="mc-label">网络带宽（收 + 发）</div>
+        <canvas class="mon-chart" id="mon-chart-net"></canvas>
+      </div>
+      <div class="mon-chart-card">
         <div class="mc-label">JVM 堆使用</div>
         <canvas class="mon-chart" id="mon-chart-heap"></canvas>
       </div>
@@ -459,7 +463,13 @@
                  accept=".txt,.text,.log,.sql,.csv,.tsv,.json,.xml,.yaml,.yml,.md,.markdown,.html,.htm,.docx,.xlsx">
           <textarea id="ai-input" class="ai-input" rows="2" spellcheck="false"
                     placeholder="向 Dojao AI 提问，例如：统计上个月各产品的销量"></textarea>
-          <button type="button" class="ai-send" id="ai-send">发送</button>
+          <button type="button" class="ai-send" id="ai-send" title="发送" aria-label="发送">
+            <svg class="ai-send-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M22 2 11 13"/><path d="M22 2 15 22 11 13 2 9 22 2z"/>
+            </svg>
+            <span class="ai-send-stop" aria-hidden="true"></span>
+          </button>
         </div>
         <div class="ai-hint" id="ai-hint">Enter 发送 · Ctrl+Enter 换行 · 点左侧回形针或直接把文件拖到这里添加参考文件</div>
       </div>

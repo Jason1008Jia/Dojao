@@ -129,8 +129,13 @@ public final class WorkerQueryTelemetry implements AutoCloseable {
         if (queryId == null || taskId == null || rowsSupplier == null) {
             return;
         }
+        // ★ 必须 merge 而非 put：中间层片段先 trackSpill(...) 再 track(...)（或反之），
+        //   put 会把先登记的溢写通道整条抹掉 ⇒ WebUI 上非终端片段的溢写恒 0。
         byQuery.computeIfAbsent(queryId, k -> new ConcurrentHashMap<>())
-                .put(taskId, new Sampler(rowsSupplier, bytesInSupplier, bytesOutSupplier, null, doneSupplier));
+                .compute(taskId, (k, prev) -> new Sampler(
+                        rowsSupplier, bytesInSupplier, bytesOutSupplier,
+                        prev == null ? null : prev.spilled(),
+                        doneSupplier != null ? doneSupplier : (prev == null ? null : prev.done())));
     }
 
     /**

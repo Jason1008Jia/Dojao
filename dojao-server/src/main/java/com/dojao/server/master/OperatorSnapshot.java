@@ -43,11 +43,18 @@ public record OperatorSnapshot(
         /** 分布式算子已派发的 Worker 任务（无 = 单机算子）。 */
         List<Task> tasks) {
 
-    /** 单个 Worker 任务的实时快照（任务级监控，见 core DistributedTask）。 */
+    /**
+     * 单个 Worker 任务的实时快照（任务级监控，见 core DistributedTask）。
+     *
+     * <p>{@code terminal}：该任务是否为算子末段（结果回传 Master）。监控据此把片段分成
+     * 「Scan 叶 / 中间层 / 终端」三类，不再靠推导任务类别文本判断。</p>
+     */
     public record Task(String taskId, String workerId, String kind, boolean producer,
-                       String state, long rowsOut,
+                       boolean terminal, String state, long rowsOut,
                        /** 累计读入 / 发出字节（Worker 遥测；非终端片段才有，其余 0）。 */
                        long bytesIn, long bytesOut,
+                       /** 该片段（阶段）在 Worker 侧的累计溢写字节 —— 各阶段框各报各的。 */
+                       long spilledBytes,
                        long dispatchNanos, long finishNanos,
                        String failure, String source,
                        /** Producer 扫描基表的探查行数总量估计（{@code schema.table} 命中才有，否则 -1）。 */

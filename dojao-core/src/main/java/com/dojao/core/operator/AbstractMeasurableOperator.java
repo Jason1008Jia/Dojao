@@ -4,6 +4,8 @@ import com.dojao.common.data.Page;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.CancellationException;
+
 /**
  *
  * 可度量算子抽象基类 —— 封装监控样板代码，子类只需关注业务逻辑。
@@ -46,6 +48,13 @@ public abstract class AbstractMeasurableOperator implements MeasurableOperator {
 
     @Override
     public Page next() {
+        // ★取消检查点：执行线程被中断 = 查询被取消（QueryManager.cancel / WorkerManager.cancelTask）。
+        //   过去只有阻塞点（队列 poll / sleep）能感知中断，纯 CPU 的 doNext（归并、排序、聚合）
+        //   会在取消后继续烧 CPU：任务槽已摘除（WebUI 显示 0 个运行中），线程却永不退出。
+        //   在这里统一抬头，任何算子链的每次拉取都能立刻收到取消信号。
+        if (Thread.currentThread().isInterrupted()) {
+            throw new CancellationException("operator cancelled: " + stats.getOperatorId());
+        }
         long startNanos = System.nanoTime();
         try {
             Page page = doNext();

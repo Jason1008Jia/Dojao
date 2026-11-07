@@ -5,7 +5,9 @@ import com.dojao.core.runtime.master.StageScheduler.JoinChainStage;
 import com.dojao.core.runtime.master.StageScheduler.JoinLink;
 import com.dojao.core.runtime.master.WorkerRegistration;
 import com.dojao.core.runtime.worker.WorkerGateway;
+import com.dojao.spi.bean.DojaoType;
 import com.dojao.spi.service.DojaoConnector;
+import com.dojao.spi.util.DojaoTypeMapper;
 import org.apache.arrow.vector.types.pojo.Field;
 
 import java.util.ArrayList;
@@ -53,6 +55,18 @@ public class DistributedJoinAggregationOperator extends AbstractDistributedOpera
     private final List<CaseProjection> caseProjections;
     /** 多维聚合展开（可空）：只挂最末层 join 的 MiddleJoinConsumer，join 链与基表扫描都只做一次。 */
     private final FragmentSpec.ExpandStep expand;
+    /** GROUP BY 表达式派生分组键（最末层 join 输出上先物化派生列，再按派生名重哈希）。 */
+    private final List<GroupKeyExpression> groupKeyExpressions;
+    /** 各关系的派生源（下标 0 = 首表；下标 k = 第 k 层 join 右表）；null = 全普通基表。 */
+    private final List<StageScheduler.DerivedSource> sources;
+    /** 外连接同名列消歧别名（Worker 在本地 join 后、重哈希前套用）；空 = 无别名。 */
+    private final List<FragmentSpec.JoinAlias> outputAliases;
+    /**
+     * 二级聚合（外层全局聚合下沉）：AggregateConsumer 本地聚合输出后同 Worker 零交换再聚一次，
+     * 每分区只回传 1 行 partial，Master 侧 {@code PartialAggregationMergeOperator} 合并。
+     * Planner 在 doOpen 前设置；null = 无。
+     */
+    private volatile FragmentSpec.AggregateStep followUp;
 
     public DistributedJoinAggregationOperator(String queryId,
                                               String firstCatalog, String firstSchema, String firstTable,
@@ -96,6 +110,48 @@ public class DistributedJoinAggregationOperator extends AbstractDistributedOpera
                                               WorkerGateway gateway, List<WorkerRegistration> workers,
                                               List<String> firstColumns,
                                               FragmentSpec.ExpandStep expand) {
+        this(queryId, firstCatalog, firstSchema, firstTable, firstLeftKeys, firstProbe, firstFilter,
+                links, memoryLimit, groupKeys, aggregations, caseProjections, numPartitions, gateway,
+                workers, firstColumns, expand, List.of(), null);
+    }
+
+    /**
+     * 完整形态：+ GROUP BY 表达式派生键（{@code groupKeyExpressions}，最末层 join 输出上物化）+
+     * 派生源（{@code sources}，子查询 / CTE 流水线原样保留，链上 CROSS 的 build 侧单值广播同样生效）。
+     */
+    public DistributedJoinAggregationOperator(String queryId,
+                                              String firstCatalog, String firstSchema, String firstTable,
+                                              List<String> firstLeftKeys, DojaoConnector firstProbe,
+                                              String firstFilter,
+                                              List<JoinLink> links, long memoryLimit,
+                                              List<String> groupKeys, List<AggregationSpec> aggregations,
+                                              List<CaseProjection> caseProjections,
+                                              int numPartitions,
+                                              WorkerGateway gateway, List<WorkerRegistration> workers,
+                                              List<String> firstColumns,
+                                              FragmentSpec.ExpandStep expand,
+                                              List<GroupKeyExpression> groupKeyExpressions,
+                                              List<StageScheduler.DerivedSource> sources) {
+        this(queryId, firstCatalog, firstSchema, firstTable, firstLeftKeys, firstProbe, firstFilter,
+                links, memoryLimit, groupKeys, aggregations, caseProjections, numPartitions, gateway,
+                workers, firstColumns, expand, groupKeyExpressions, sources, List.of());
+    }
+
+    /** 完整形态 + 外连接同名列消歧别名（Worker 在 join 后、重哈希前套用）。 */
+    public DistributedJoinAggregationOperator(String queryId,
+                                              String firstCatalog, String firstSchema, String firstTable,
+                                              List<String> firstLeftKeys, DojaoConnector firstProbe,
+                                              String firstFilter,
+                                              List<JoinLink> links, long memoryLimit,
+                                              List<String> groupKeys, List<AggregationSpec> aggregations,
+                                              List<CaseProjection> caseProjections,
+                                              int numPartitions,
+                                              WorkerGateway gateway, List<WorkerRegistration> workers,
+                                              List<String> firstColumns,
+                                              FragmentSpec.ExpandStep expand,
+                                              List<GroupKeyExpression> groupKeyExpressions,
+                                              List<StageScheduler.DerivedSource> sources,
+                                              List<FragmentSpec.JoinAlias> outputAliases) {
         super("DistributedJoinAggregation", queryId, numPartitions, gateway, workers);
         this.firstCatalog = firstCatalog;
         this.firstSchema = firstSchema;
@@ -110,6 +166,9 @@ public class DistributedJoinAggregationOperator extends AbstractDistributedOpera
         this.aggregations = List.copyOf(aggregations);
         this.caseProjections = caseProjections == null ? List.of() : List.copyOf(caseProjections);
         this.expand = expand;
+        this.groupKeyExpressions = groupKeyExpressions == null ? List.of() : List.copyOf(groupKeyExpressions);
+        this.sources = sources;
+        this.outputAliases = outputAliases == null ? List.of() : List.copyOf(outputAliases);
     }
 
     // ==================== 规划 spec 只读暴露 ====================
@@ -144,16 +203,41 @@ public class DistributedJoinAggregationOperator extends AbstractDistributedOpera
     /** 多维聚合展开描述（null = 普通聚合）。 */
     public FragmentSpec.ExpandStep expand() { return expand; }
 
+    /** GROUP BY 表达式派生分组键（空 = 纯裸列分组）。 */
+    public List<GroupKeyExpression> groupKeyExpressions() { return groupKeyExpressions; }
+
+    /** 各关系的派生源（null = 全普通基表）。 */
+    public List<StageScheduler.DerivedSource> sources() { return sources; }
+
+    /** 外连接同名列消歧别名（空 = 无别名）。 */
+    public List<FragmentSpec.JoinAlias> outputAliases() { return outputAliases; }
+
+    /** 桶数（聚合交换的分区数；二级聚合的槽数必须与之一致）。 */
+    public int numPartitions() { return numPartitions; }
+
+    /** 设置二级聚合（Planner 在 doOpen 前调用；null = 无二级聚合）。 */
+    public void setFollowUp(FragmentSpec.AggregateStep f) { this.followUp = f; }
+
+    /** 已设置的二级聚合（可空；Planner / EXPLAIN 只读）。 */
+    public FragmentSpec.AggregateStep followUp() { return followUp; }
+
     @Override
     public List<ScanColumn> scanColumnSets() {
         List<ScanColumn> out = new ArrayList<>();
-        out.add(ScanColumn.required(firstCatalog + "." + firstSchema + "." + firstTable, firstColumns));
-        for (JoinLink link : links) {
-            out.add(ScanColumn.required(
-                    link.rightCatalog() + "." + link.rightSchema() + "." + link.rightTable(),
+        out.add(scanColumn(0, firstCatalog, firstSchema, firstTable, firstColumns));
+        for (int i = 0; i < links.size(); i++) {
+            JoinLink link = links.get(i);
+            out.add(scanColumn(i + 1, link.rightCatalog(), link.rightSchema(), link.rightTable(),
                     link.rightColumns()));
         }
         return out;
+    }
+
+    /** 下标 i（0 = 首表；k = 第 k 层 join 右表）：派生源 → pipeline，否则 required 基表扫描。 */
+    private ScanColumn scanColumn(int i, String catalog, String schema, String table, List<String> columns) {
+        String relation = catalog + "." + schema + "." + table;
+        boolean derived = sources != null && i < sources.size() && sources.get(i) != null;
+        return derived ? ScanColumn.pipeline(relation) : ScanColumn.required(relation, columns);
     }
 
     @Override
@@ -161,7 +245,8 @@ public class DistributedJoinAggregationOperator extends AbstractDistributedOpera
         JoinChainStage stage = StageScheduler.planJoinAggregation(
                 queryId, workers, numPartitions,
                 firstCatalog, firstSchema, firstTable, firstLeftKeys, firstProbe, firstFilter,
-                links, memoryLimit, groupKeys, aggregations, caseProjections, firstColumns, expand);
+                links, memoryLimit, groupKeys, aggregations, caseProjections, firstColumns, expand,
+                groupKeyExpressions, sources, outputAliases, followUp);
         // 片段已在 planJoinAggregation 内按反死锁顺序排好：
         // ① 每分区 AggregateConsumer（先注册聚合交换读端）→ ② 最末层 MiddleJoinConsumer
         // （join→按分组键重哈希→推聚合交换）→ ③ 中间层逆序 → ④ 基表 Producers（build 先 probe）
@@ -180,8 +265,45 @@ public class DistributedJoinAggregationOperator extends AbstractDistributedOpera
     protected void closeProbes() {
         try { firstProbe.closeRead(); } catch (Throwable ignored) { }
         for (JoinLink link : links) {
-            try { link.rightProbe().closeRead(); } catch (Throwable ignored) { }
+            // 派生源所在层的右表由聚合流水线喂入 → 无右表探针
+            if (link.rightProbe() != null) {
+                try { link.rightProbe().closeRead(); } catch (Throwable ignored) { }
+            }
         }
+        if (sources != null) {
+            for (StageScheduler.DerivedSource ds : sources) {
+                if (ds != null && ds.innerProbe() != null) {
+                    try { ds.innerProbe().closeRead(); } catch (Throwable ignored) { }
+                }
+            }
+        }
+    }
+
+    /**
+     * 某关系（下标 {@code i}，0 = 首表）的输出列：派生源 → 派生体声明列（无连接器元数据可查）；
+     * 普通基表 → 连接器元数据扫描列。
+     */
+    private List<Field> sourceFields(int i, DojaoConnector probe, String catalog, String schema,
+                                     String table, List<String> columns) {
+        StageScheduler.DerivedSource ds =
+                (sources == null || i >= sources.size()) ? null : sources.get(i);
+        return ds != null ? StageScheduler.derivedFields(ds)
+                : scanFields(probe, catalog, schema, table, columns);
+    }
+
+    /**
+     * 把 GROUP BY 表达式派生分组键（发送端物化列，不在 join 输出里）补成 STRING 静态列 ——
+     * 与 {@code DistributedAggregationOperator} 对派生键的既有口径一致，不因聚合上游不同而抛缺列。
+     */
+    private List<Field> withDerivedKeyFields(List<Field> wire) {
+        if (groupKeyExpressions.isEmpty()) return wire;
+        List<Field> out = new ArrayList<>(wire);
+        for (GroupKeyExpression g : groupKeyExpressions) {
+            if (fieldOf(out, g.derivedColumn()) == null) {
+                out.add(DojaoTypeMapper.toField(g.derivedColumn(), DojaoType.STRING));
+            }
+        }
+        return out;
     }
 
     /**
@@ -206,7 +328,10 @@ public class DistributedJoinAggregationOperator extends AbstractDistributedOpera
                     + " build=" + qualified(link.rightCatalog(), link.rightSchema(), link.rightTable())
                     + " keys=" + keys
                     + " algo=" + JoinExplain.distributed(link.algorithm(), memoryLimit, numPartitions)
-                    + filterSuffix(link.rightFilter()));
+                    + filterSuffix(link.rightFilter())
+                    // ON 单侧残差：保留侧不能下推扫描（孤儿行仍须输出），在 Worker 匹配阶段求值
+                    + (link.onLeftFilter() != null ? " onLeft=[" + link.onLeftFilter() + "]" : "")
+                    + (link.onRightFilter() != null ? " onRight=[" + link.onRightFilter() + "]" : ""));
         }
         out.add("aggregate: groupBy=" + groupKeys
                 + " aggs=" + aggregations.stream().map(AggregationSpec::outputColumn).toList()
@@ -214,6 +339,14 @@ public class DistributedJoinAggregationOperator extends AbstractDistributedOpera
         if (expand != null) {
             out.add("expand: groupingSets=" + expand.groupingSets()
                     + "（join 链与基表扫描都只做一次）");
+        }
+        FragmentSpec.AggregateStep fu = followUp;
+        if (fu != null) {
+            out.add("follow-up aggregate on workers groupBy="
+                    + (fu.keyColumns().isEmpty() ? "<global>" : fu.keyColumns())
+                    + " aggs=" + fu.aggregations().stream()
+                    .map(d -> d.aggregateName() + "(" + (d.inputColumn() == null ? "*" : d.inputColumn())
+                            + ") AS " + d.outputColumn()).toList());
         }
         return out;
     }
@@ -233,20 +366,25 @@ public class DistributedJoinAggregationOperator extends AbstractDistributedOpera
         // 复刻最终 AggregateConsumer 输出页 schema：先复算最末层 join 全输出（左/右扫描列逐层剔除
         // 「右 join key 且左已有同名」列），聚合在 join 输出上按分组键重哈希后本地做：
         // 输出 = 分组键列（join 输出列类型）+ 各聚合结果列（AggregationSpec.outputArrowType）。
-        // 列集必须与实际扫描一致（firstColumns / link.rightColumns()，空 = 全列）。
+        // 列集必须与实际扫描一致（firstColumns / link.rightColumns()，空 = 全列）；派生源按派生体声明列。
         List<Field> wire = new ArrayList<>(
-                scanFields(firstProbe, firstCatalog, firstSchema, firstTable, firstColumns));
+                sourceFields(0, firstProbe, firstCatalog, firstSchema, firstTable, firstColumns));
+        int idx = 1;
         for (JoinLink link : links) {
-            List<Field> right = scanFields(link.rightProbe(), link.rightCatalog(), link.rightSchema(),
+            List<Field> right = sourceFields(idx, link.rightProbe(), link.rightCatalog(), link.rightSchema(),
                     link.rightTable(), link.rightColumns());
             wire = joinOutputFields(link.joinType(), wire, right, link.leftKeys(), link.rightKeys());
+            idx++;
         }
+        // 表达式派生分组键（如 year(created_at)）不在 join 输出里 —— 发送端物化后才出现，类型按 STRING
+        // 兜底（与 DistributedAggregationOperator 对派生键的既有口径一致）。
+        List<Field> wireWithDerived = withDerivedKeyFields(wire);
         // __grouping_id 是展开算子追加的合成列（不在 join 输出里），类型固定 BIGINT —— 按原位置换回
         List<String> wireKeys = new ArrayList<>(groupKeys.size());
         for (String k : groupKeys) {
             if (!ExpandOperator.GROUPING_ID_COLUMN.equalsIgnoreCase(k)) wireKeys.add(k);
         }
-        List<Field> resolved = fieldsByNames(wire, wireKeys);
+        List<Field> resolved = fieldsByNames(wireWithDerived, wireKeys);
         List<Field> out = new ArrayList<>(groupKeys.size());
         int nextWireKey = 0;
         for (String k : groupKeys) {

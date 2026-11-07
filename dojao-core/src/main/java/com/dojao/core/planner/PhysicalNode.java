@@ -28,6 +28,13 @@ public final class PhysicalNode {
     private final List<String> outputColumns;  // 算子输出的列名（有序，与 Arrow schema 一致）
     private final List<PhysicalNode> children;
     private final long estimatedRows;          // 规划期估算输出行数；UNKNOWN_ROWS = 未知
+    /**
+     * <b>仅展示</b>的数据来源节点（如分布式算子内部折叠掉的基表 Scan）。
+     *
+     * <p>不进入 {@link #children()}：优化（列裁剪 / 估算 / 审计）与执行只看真实算子链；
+     * 这些节点只由 {@link PhysicalPlanPrinter} 渲染，让用户看到「数据从哪张表来」。</p>
+     */
+    private final List<PhysicalNode> sources;
 
     public PhysicalNode(String name, Operator operator,
                         List<String> outputColumns, List<PhysicalNode> children) {
@@ -36,11 +43,18 @@ public final class PhysicalNode {
 
     public PhysicalNode(String name, Operator operator,
                         List<String> outputColumns, List<PhysicalNode> children, long estimatedRows) {
+        this(name, operator, outputColumns, children, estimatedRows, List.of());
+    }
+
+    public PhysicalNode(String name, Operator operator,
+                        List<String> outputColumns, List<PhysicalNode> children, long estimatedRows,
+                        List<PhysicalNode> sources) {
         this.name = name;
         this.operator = operator;
         this.outputColumns = List.copyOf(outputColumns);
         this.children = children != null ? List.copyOf(children) : List.of();
         this.estimatedRows = estimatedRows;
+        this.sources = sources != null ? List.copyOf(sources) : List.of();
     }
 
     public PhysicalNode(String name, Operator operator,
@@ -56,12 +70,20 @@ public final class PhysicalNode {
     public List<String> outputColumns() { return outputColumns; }
     public List<PhysicalNode> children() { return children; }
 
+    /** 仅展示的数据来源节点（不参与优化 / 执行）。 */
+    public List<PhysicalNode> sources() { return sources; }
+
     /** 规划期估算输出行数；{@link #UNKNOWN_ROWS} = 无法估算（统计缺失 / 中间结果不可知）。 */
     public long estimatedRows() { return estimatedRows; }
 
-    /** 复制本节点并替换估算行数（算子 / 子节点 / 列不变）。 */
+    /** 复制本节点并替换估算行数（算子 / 子节点 / 列 / 展示来源不变）。 */
     public PhysicalNode withEstimate(long rows) {
-        return new PhysicalNode(name, operator, outputColumns, children, rows);
+        return new PhysicalNode(name, operator, outputColumns, children, rows, sources);
+    }
+
+    /** 复制本节点并设置仅展示的数据来源（真实子节点不变）。 */
+    public PhysicalNode withSources(List<PhysicalNode> newSources) {
+        return new PhysicalNode(name, operator, outputColumns, children, estimatedRows, newSources);
     }
 
     /** 输出列是否包含指定裸列名（大小写不敏感）。 */

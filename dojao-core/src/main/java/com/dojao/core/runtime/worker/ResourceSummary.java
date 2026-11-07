@@ -33,25 +33,28 @@ import java.util.List;
  * @param diskReadBytes    进程级磁盘读累计字节（Linux {@code /proc/self/io} 的 read_bytes；非 Linux 为 0）
  * @param diskWriteBytes   进程级磁盘写累计字节（Linux {@code /proc/self/io} 的 write_bytes；非 Linux 为 0）
  * @param processRssBytes  本进程常驻内存 RSS（Linux {@code /proc/self/status} 的 VmRSS；取不到为 0）
+ * @param netRxBytes       网络命名空间累计接收字节（Linux {@code /proc/net/dev} 各非回环接口 rx 之和；非 Linux 为 0）
+ * @param netTxBytes       网络命名空间累计发送字节（Linux {@code /proc/net/dev} 各非回环接口 tx 之和；非 Linux 为 0）
  * @author jiaxin
- * @version 1.2
+ * @version 1.3
  * @date 2026/8/11
  */
 public record ResourceSummary(int cpuCores, int cpuUsagePct, long totalMemoryBytes, long usedMemoryBytes,
                               long totalDiskBytes, long freeDiskBytes, int maxConcurrency, long timestampNanos,
                               long heapUsedBytes, long heapMaxBytes, int threadCount,
                               long directUsedBytes, long directBudgetBytes, List<AllocatorUsage> allocators,
-                              long diskReadBytes, long diskWriteBytes, long processRssBytes) {
+                              long diskReadBytes, long diskWriteBytes, long processRssBytes,
+                              long netRxBytes, long netTxBytes) {
 
     /**
-     * 旧 11 参构造（兼容既有探针 / 测试的位置参数调用）：直接内存 / 磁盘 IO / RSS 字段缺省 0 / 空表。
+     * 旧 11 参构造（兼容既有探针 / 测试的位置参数调用）：直接内存 / 磁盘 IO / RSS / 网络字段缺省 0 / 空表。
      */
     public ResourceSummary(int cpuCores, int cpuUsagePct, long totalMemoryBytes, long usedMemoryBytes,
                            long totalDiskBytes, long freeDiskBytes, int maxConcurrency, long timestampNanos,
                            long heapUsedBytes, long heapMaxBytes, int threadCount) {
         this(cpuCores, cpuUsagePct, totalMemoryBytes, usedMemoryBytes, totalDiskBytes, freeDiskBytes,
                 maxConcurrency, timestampNanos, heapUsedBytes, heapMaxBytes, threadCount,
-                0L, 0L, List.of(), 0L, 0L, 0L);
+                0L, 0L, List.of(), 0L, 0L, 0L, 0L, 0L);
     }
 
     /** 采集本节点当前资源摘要。 */
@@ -102,9 +105,12 @@ public record ResourceSummary(int cpuCores, int cpuUsagePct, long totalMemoryByt
         // 进程级磁盘 IO（累计字节；非 Linux 无 /proc/self/io → 0）
         long[] diskIo = readProcessDiskIo();
 
+        // 网络收发（累计字节；非 Linux 无 /proc/net/dev → 0）
+        long[] netIo = readNamespaceNetIo();
+
         return new ResourceSummary(cores, cpuPct, totalMem, usedMem, totalDisk, freeDisk, maxConcurrency,
                 System.nanoTime(), heapUsed, heapMax, threads, directUsed, directBudget, allocators,
-                diskIo[0], diskIo[1], readProcessRssBytes());
+                diskIo[0], diskIo[1], readProcessRssBytes(), netIo[0], netIo[1]);
     }
 
     /**
@@ -173,6 +179,43 @@ public record ResourceSummary(int cpuCores, int cpuUsagePct, long totalMemoryByt
         return Long.parseLong(line.substring(line.indexOf(':') + 1).trim());
     }
 
+    /**
+     * 读 Linux {@code /proc/net/dev} 各<b>非回环</b>接口的累计收发字节（所有接口 rx / tx 之和）。
+     *
+     * <p>该文件是<b>网络命名空间</b>口径 —— 同命名空间内的所有进程共用同一份计数器，
+     * 也就是本节点网卡的真实流量（区别于 {@code /proc/self/io} 的进程级磁盘 IO）。
+     * 回环 {@code lo} 被排除：它只承载本机进程间流量，不占总线带宽。
+     * 非 Linux（无该文件 / 读异常）→ {@code {0, 0}}（监控页显示平 0，不报错）。</p>
+     */
+    private static long[] readNamespaceNetIo() {
+        try {
+            long rx = 0L;
+            long tx = 0L;
+            for (String line : java.nio.file.Files.readAllLines(
+                    java.nio.file.Path.of("/proc/net/dev"), java.nio.charset.StandardCharsets.US_ASCII)) {
+                int colon = line.indexOf(':');
+                if (colon < 0) continue;                       // 两行表头
+                String iface = line.substring(0, colon).strip();
+                if (iface.isEmpty() || "lo".equals(iface)) continue;
+                String[] f = line.substring(colon + 1).strip().split("\\s+");
+                if (f.length < 9) continue;
+                rx += parseLongOrZero(f[0]);
+                tx += parseLongOrZero(f[8]);
+            }
+            return new long[]{rx, tx};
+        } catch (Exception e) {
+            return new long[]{0L, 0L};
+        }
+    }
+
+    private static long parseLongOrZero(String s) {
+        try {
+            return Long.parseLong(s);
+        } catch (Exception e) {
+            return 0L;
+        }
+    }
+
     /** 人类可读摘要（监控/日志用）。 */
     public String describe() {
         StringBuilder sb = new StringBuilder();
@@ -185,7 +228,8 @@ public record ResourceSummary(int cpuCores, int cpuUsagePct, long totalMemoryByt
                 .append(" direct=").append(human(directUsedBytes)).append('/').append(human(directBudgetBytes))
                 .append(" threads=").append(threadCount)
                 .append(" io=r").append(human(diskReadBytes)).append("/w").append(human(diskWriteBytes))
-                .append(" rss=").append(human(processRssBytes));
+                .append(" rss=").append(human(processRssBytes))
+                .append(" net=rx").append(human(netRxBytes)).append("/tx").append(human(netTxBytes));
         return sb.toString();
     }
 

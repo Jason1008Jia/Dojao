@@ -3,6 +3,8 @@ package com.dojao.core.operator;
 import com.dojao.common.data.Page;
 import com.dojao.common.memory.NodeMemory;
 import com.dojao.core.config.ResourceConfig;
+import com.dojao.core.operator.expr.ExprEvaluator;
+import com.dojao.core.operator.expr.ExprParser;
 import com.dojao.spi.util.NestedTypeSupport;
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
@@ -64,9 +66,13 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
     /** EXPLAIN 明细：算法（shuffle / broadcast / sort_merge）+ 是否可溢写 + 连接类型 / 连接键 / 分区数。 */
     @Override
     public List<String> explainLines() {
-        return List.of("algorithm: " + JoinExplain.localHash(memoryLimit, numPartitions)
+        List<String> lines = new ArrayList<>();
+        lines.add("algorithm: " + JoinExplain.localHash(memoryLimit, numPartitions)
                 + " type=" + joinType + " keys=" + leftKeyColumns + "=" + rightKeyColumns
                 + " partitions=" + numPartitions);
+        if (onLeftFilter != null) lines.add("on-left-filter: " + onLeftFilter);
+        if (onRightFilter != null) lines.add("on-right-filter: " + onRightFilter);
+        return lines;
     }
 
     /** 发送批大小：每凑满 5W 行即组装输出，不再全量攒批。 */
@@ -124,6 +130,24 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
      */
     private final List<Field> declaredLeftFields;
 
+    /**
+     * ON 子句中的<b>单侧残差谓词</b>（只引用一侧的列），null = 无。
+     *
+     * <p>为什么不能下推到扫描：OUTER JOIN 的 ON 谓词为假时行<b>不是被过滤掉</b>，而是「未匹配」——
+     * LEFT/FULL 的左行仍要 NULL 扩展输出，RIGHT/FULL 的右行仍要 NULL 扩展输出。下推到任一侧扫描
+     * 都会永久丢掉保留侧应输出的孤儿行（旧实现因此直接拒绝 FULL JOIN 的此类 ON 条件）。
+     * 正确语义在本算子内实现：谓词为假的左行不参与探测（按未匹配处理），为假的右行不参与匹配
+     * （{@code rightRowMatched} 保持 false，RIGHT/FULL 收尾时作为孤儿输出）。</p>
+     */
+    private final String onLeftFilter;
+    private final String onRightFilter;
+    /** 预编译的残差谓词求值器（构造期解析，运行期按<b>页</b>批求值，逐候选只查布尔位）。 */
+    private final ExprEvaluator leftFilterEvaluator;
+    private final ExprEvaluator rightFilterEvaluator;
+    /** 残差谓词引用的列名（列裁剪必须保留，否则求值页里找不到列）。 */
+    private final java.util.Set<String> onLeftFilterColumns;
+    private final java.util.Set<String> onRightFilterColumns;
+
     /** 变长列占位源：空行/跳过行经 setSafe(k, EMPTY_BYTES) 写 0 长度，保持 offset 连续。 */
     private static final byte[] EMPTY_BYTES = new byte[0];
 
@@ -164,6 +188,14 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
     private final AtomicLong[] partitionBytesIn;
     private final AtomicLong[] partitionBytesOut;
     private final boolean[] partitionDone;
+    /**
+     * 输出页是否携带分区号（{@link Page#partitioned}）。
+     *
+     * <p>默认 false：单机 HashJoin → HashAggregation（分区数 1）链路里，输出页无分区号即落到槽 0，
+     * 带号反而可能让下游按 pid 建槽越界。链式分布式 join（join 输出直接喂窗口排序）必须置 true：
+     * 否则 N 个分区的 join 结果全部挤进窗口排序的槽 0，单槽归并整份数据 → 长时间不吐页。</p>
+     */
+    private final boolean tagPartitionIds;
 
     // ==================== 构造 ====================
 
@@ -208,6 +240,32 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
                             List<String> leftKeyColumns, List<String> rightKeyColumns,
                             JoinType joinType, long memoryLimit, int numPartitions,
                             List<Field> declaredRightFields, List<Field> declaredLeftFields) {
+        this(leftPart, rightPart, leftKeyColumns, rightKeyColumns, joinType, memoryLimit, numPartitions,
+                declaredRightFields, declaredLeftFields, false);
+    }
+
+    /**
+     * @param tagPartitionIds 输出页是否带分区号：分布式链式 join（join 输出直接喂多分区窗口排序）必须
+     *                        true，否则各分区结果全落窗口排序槽 0；单机链路保持 false（下游按 1 分区建槽）。
+     */
+    public HashJoinOperator(PartitionedSource leftPart, PartitionedSource rightPart,
+                            List<String> leftKeyColumns, List<String> rightKeyColumns,
+                            JoinType joinType, long memoryLimit, int numPartitions,
+                            List<Field> declaredRightFields, List<Field> declaredLeftFields,
+                            boolean tagPartitionIds) {
+        this(leftPart, rightPart, leftKeyColumns, rightKeyColumns, joinType, memoryLimit, numPartitions,
+                declaredRightFields, declaredLeftFields, tagPartitionIds, null, null);
+    }
+
+    /**
+     * @param onLeftFilter  ON 子句中只引用左表的残差谓词（已去限定符），null = 无
+     * @param onRightFilter ON 子句中只引用右表的残差谓词（已去限定符），null = 无
+     */
+    public HashJoinOperator(PartitionedSource leftPart, PartitionedSource rightPart,
+                            List<String> leftKeyColumns, List<String> rightKeyColumns,
+                            JoinType joinType, long memoryLimit, int numPartitions,
+                            List<Field> declaredRightFields, List<Field> declaredLeftFields,
+                            boolean tagPartitionIds, String onLeftFilter, String onRightFilter) {
         super("HashJoin", "HashJoin", Math.max(1, numPartitions));
         this.leftPart = leftPart;
         this.rightPart = rightPart;
@@ -217,10 +275,22 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
         this.needNullRight = (joinType == JoinType.LEFT || joinType == JoinType.FULL);
         this.memoryLimit = memoryLimit;
         this.numPartitions = Math.max(1, numPartitions);
+        this.tagPartitionIds = tagPartitionIds;
         this.declaredRightFields = (declaredRightFields == null || declaredRightFields.isEmpty())
                 ? null : List.copyOf(declaredRightFields);
         this.declaredLeftFields = (declaredLeftFields == null || declaredLeftFields.isEmpty())
                 ? null : List.copyOf(declaredLeftFields);
+        this.onLeftFilter = blankToNull(onLeftFilter);
+        this.onRightFilter = blankToNull(onRightFilter);
+        // 构造期解析：表达式非法时立刻失败（而不是跑起来后在每个分区里抛同样的错）。
+        this.leftFilterEvaluator = this.onLeftFilter == null
+                ? null : new ExprEvaluator(ExprParser.parse(this.onLeftFilter));
+        this.rightFilterEvaluator = this.onRightFilter == null
+                ? null : new ExprEvaluator(ExprParser.parse(this.onRightFilter));
+        this.onLeftFilterColumns = this.leftFilterEvaluator == null
+                ? java.util.Set.of() : java.util.Set.copyOf(this.leftFilterEvaluator.columnArgs());
+        this.onRightFilterColumns = this.rightFilterEvaluator == null
+                ? java.util.Set.of() : java.util.Set.copyOf(this.rightFilterEvaluator.columnArgs());
         // 分配器是进程级共享根（NodeMemory）的子 —— build 侧哈希表全部堆外占用进统一账本（背压水位可见），
         // 并受共享根硬上限约束：build 表超预算时抛 OOM 让该查询失败，而非被内核 OOM-killer 杀进程。
         this.allocator = NodeMemory.shared()
@@ -243,6 +313,12 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
     public List<String> getLeftKeyColumns() { return leftKeyColumns; }
     public List<String> getRightKeyColumns() { return rightKeyColumns; }
     public JoinType getJoinType() { return joinType; }
+
+    /** ON 左（probe 侧）残差谓词引用的列 —— 列裁剪必须保留（否则 probe 页缺列，求值即失败）。 */
+    public java.util.Set<String> onLeftFilterColumns() { return onLeftFilterColumns; }
+
+    /** ON 右（build 侧）残差谓词引用的列 —— 列裁剪必须保留。 */
+    public java.util.Set<String> onRightFilterColumns() { return onRightFilterColumns; }
 
     /**
      * 计算输出缓冲字节预算（{@link #outputByteBudget}）—— 由构造器调用。
@@ -360,6 +436,12 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
         int[] probeKeyIndices;
         JoinHashTable table;
         boolean[] rightRowMatched;
+        /**
+         * build 行是否通过右残差谓词（null = 无右残差，全部通过）。
+         * 谓词为假的 build 行<b>仍然入表</b>（否则 RIGHT/FULL 收尾时无从输出该孤儿行），
+         * 只是不参与匹配、{@code rightRowMatched} 保持 false。
+         */
+        boolean[] rightRowOk;
         // 跨页攒批（扁平 int 数组，替代逐对 int[3] 对象分配，降低 GC 压力）：
         int[] batchPage = new int[1024];   // 左行来源持有页下标
         int[] batchLRow = new int[1024];   // 左行号（-1 = 该侧 NULL）
@@ -446,8 +528,16 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
                     j.table = new JoinHashTable(allocator, rightKeyColumns, keyFields, j.rightSchema);
                 }
                 int rows = page.getRowCount();
+                // 右残差谓词：每页求值一次得到布尔掩码；为假的行同样入表（RIGHT/FULL 收尾要作为孤儿输出），
+                // 只是不参与匹配。
+                boolean[] pageOk = evaluateMask(rightFilterEvaluator, page.getRoot(), rows, "__on_right");
+                if (pageOk != null) {
+                    ensureRightOkCapacity(j, j.table.buildRowCount() + rows);
+                }
                 for (int r = 0; r < rows; r++) {
+                    int buildRow = j.table.buildRowCount();
                     j.table.insertOrAppend(page, r);
+                    if (pageOk != null) j.rightRowOk[buildRow] = pageOk[r];
                 }
                 long mem = j.table.estimateMemoryBytes();
                 if (mem > memBudget) {
@@ -504,13 +594,19 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
             boolean crossJoin = leftKeyColumns.isEmpty();
             boolean emptyBuild = (j.table == null || j.table.isEmpty());
 
+            // 左残差谓词：每页求值一次（逐候选只查布尔位）。
+            boolean[] leftPageOk = evaluateMask(leftFilterEvaluator, root, rowCount, "__on_left");
             for (int r = 0; r < rowCount; r++) {
-                int groupIdx = emptyBuild ? -1
+                boolean leftOk = leftPageOk == null || leftPageOk[r];
+                int groupIdx = (!leftOk || emptyBuild) ? -1
                         : (crossJoin ? 0 : j.table.probe(page, j.probeKeyIndices, r));
+                int matchedPairs = 0;
                 if (groupIdx >= 0) {
                     for (int rr : j.table.getMatchingRows(groupIdx)) {
+                        if (j.rightRowOk != null && !j.rightRowOk[rr]) continue;   // 右残差为假 ⇒ 该 build 行不匹配
                         addPair(j, pageIdx, r, rr);
                         j.matches++;
+                        matchedPairs++;
                         if (j.rightRowMatched != null) j.rightRowMatched[rr] = true;
                         if (j.batchSize >= JOIN_SEND_BATCH_SIZE) {
                             flush(j, true);
@@ -518,7 +614,10 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
                             pageIdx = 0;
                         }
                     }
-                } else if (needNullRight) {
+                }
+                // ON 谓词为假 / 键不匹配 / 所有候选 build 行都被右残差否决 ⇒ 该左行「未匹配」。
+                // 只有 LEFT/FULL 需要 NULL 扩展输出它；INNER/RIGHT 无输出（右侧由收尾阶段补发）。
+                if (matchedPairs == 0 && needNullRight) {
                     addPair(j, pageIdx, r, -1);
                     j.nulls++;
                     if (j.batchSize >= JOIN_SEND_BATCH_SIZE) {
@@ -580,7 +679,7 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
             throws InterruptedException {
         awaitOutputBudget();
         VectorSchemaRoot outRoot = builder.get();
-        Page out = Page.fromRoot(outRoot);
+        Page out = tagPartitionIds ? Page.partitioned(outRoot, j.pid) : Page.fromRoot(outRoot);
         long bytes = out.getSizeInBytes();
         pendingOutputBytes.addAndGet(bytes);                 // 入账：排队中，doNext 取出时递减
         partitionRowsOut[j.pid].addAndGet(out.getRowCount());   // 监控：该分区已发出行数
@@ -997,6 +1096,36 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
     }
 
     // ==================== 工具 ====================
+
+    /**
+     * 对一页求值 ON 残差谓词，返回逐行布尔掩码；{@code evaluator == null}（无残差）或空页 → null
+     * （语义为「全部通过」，避免无谓分配）。
+     *
+     * <p>SQL 三值逻辑：NULL（未知）按不通过处理，与 {@code FilterOperator} 同口径。</p>
+     */
+    private boolean[] evaluateMask(ExprEvaluator evaluator, VectorSchemaRoot root, int rows, String outName) {
+        if (evaluator == null || rows == 0) return null;
+        boolean[] mask = new boolean[rows];
+        try (FieldVector v = evaluator.evaluate(root, allocator, outName)) {
+            for (int r = 0; r < rows; r++) {
+                mask[r] = !v.isNull(r) && ExprEvaluator.truthy(v.getObject(r));
+            }
+        }
+        return mask;
+    }
+
+    /** 扩容 {@link PartitionJoin#rightRowOk}（只在右残差存在时调用；首次分配即全 false，随后逐行覆盖）。 */
+    private static void ensureRightOkCapacity(PartitionJoin j, int needed) {
+        if (j.rightRowOk == null) {
+            j.rightRowOk = new boolean[Math.max(16, needed)];
+        } else if (j.rightRowOk.length < needed) {
+            j.rightRowOk = Arrays.copyOf(j.rightRowOk, Math.max(needed, j.rightRowOk.length * 2));
+        }
+    }
+
+    private static String blankToNull(String s) {
+        return s == null || s.isBlank() ? null : s;
+    }
 
     /**
      * 解析键列在给定 schema 中的下标（保持 {@code keyColumns} 顺序）。

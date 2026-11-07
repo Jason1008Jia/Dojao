@@ -17,6 +17,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -46,6 +47,16 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
     private boolean isCompositeKey;
     private boolean pipelineDone;
 
+    /**
+     * 分区级<b>输入</b>计数（行 / 字节）—— 仅 Phase 1 拉取线程写、遥测采样线程读，故用原子数组。
+     *
+     * <p>SortMergeJoin 的 WebUI 分区子任务要看「这个分区从 shuffle 读进多少」；基类只有全局
+     * {@code stats}，没有分区维度，这里补上。计数按页的 {@code partitionId} 归属，与
+     * {@code accumulatePage} 的路由口径一致（无分区号的页落 0 号分区）。</p>
+     */
+    private final AtomicLongArray partitionRowsIn;
+    private final AtomicLongArray partitionBytesIn;
+
     /** join 排序内部缓冲 / 输出批行数（独立于 agg/window 旋钮，固定 50000）。 */
     private static final int OUTPUT_BATCH_SIZE = 50000;
 
@@ -58,6 +69,8 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
         super("Sort", "Sort", 1, upstream, memoryLimit, numPartitions);
         this.joinKeyColumns = joinKeyColumns;
         this.pipelineDone = false;
+        this.partitionRowsIn = new AtomicLongArray(numPartitions);
+        this.partitionBytesIn = new AtomicLongArray(numPartitions);
     }
 
     public JoinSortOperator(Operator upstream,
@@ -125,6 +138,7 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
             RowAccumulator theAcc = null;
             int slotCount = 0;
             for (int s = 0; s < SLOT_COUNT; s++) {
+                checkCancelled();
                 RowAccumulator acc = pa.slots.get(s);
                 if (acc == null || acc.isEmpty()) continue;
                 if (theAcc == null) theAcc = acc;
@@ -142,18 +156,29 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
             } else {
                 // 多 slot：回退原有拷贝路径（罕见）
                 List<VectorSchemaRoot> sortedRoots = new ArrayList<>();
-                for (int s = 0; s < SLOT_COUNT; s++) {
-                    RowAccumulator acc = pa.slots.get(s);
-                    if (acc == null || acc.isEmpty()) continue;
-                    sortedRoots.add(buildKeySortedOutput(acc));
-                    acc.clear();
-                    pa.slots.set(s, null);
+                try {
+                    for (int s = 0; s < SLOT_COUNT; s++) {
+                        checkCancelled();
+                        RowAccumulator acc = pa.slots.get(s);
+                        if (acc == null || acc.isEmpty()) continue;
+                        sortedRoots.add(buildKeySortedOutput(acc));
+                        acc.clear();
+                        pa.slots.set(s, null);
+                    }
+                    if (sortedRoots.isEmpty()) return;
+                    pa.inMemoryRoot = sortedRoots.size() == 1
+                            ? sortedRoots.getFirst()
+                            : mergeSortedRoots(sortedRoots);
+                    pa.compacted = true;
+                } catch (RuntimeException | Error e) {
+                    // 取消 / 失败：已构造的排序快照不在 PartitionState 里，必须在这里释放。
+                    for (VectorSchemaRoot r : sortedRoots) {
+                        if (r != pa.inMemoryRoot) {
+                            try { r.close(); } catch (Exception ignored) {}
+                        }
+                    }
+                    throw e;
                 }
-                if (sortedRoots.isEmpty()) return;
-                pa.inMemoryRoot = sortedRoots.size() == 1
-                        ? sortedRoots.getFirst()
-                        : mergeSortedRoots(sortedRoots);
-                pa.compacted = true;
                 for (VectorSchemaRoot r : sortedRoots) {
                     if (r != pa.inMemoryRoot) r.close();
                 }
@@ -162,6 +187,7 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
             // 有溢写文件：剩余 slot 数据写成 Arrow 文件（补充到 batchFiles），
             // 后续 compactPartition 归并成 key 连续文件
             for (int s = 0; s < SLOT_COUNT; s++) {
+                checkCancelled();
                 RowAccumulator acc = pa.slots.get(s);
                 if (acc == null || acc.isEmpty()) continue;
                 writeAccumulatorToArrow(pa, acc, pid);
@@ -188,21 +214,33 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
         List<Field> fields = r1.getSchema().getFields();
         List<FieldVector> out = createOutputVectors(r1.getSchema(), total);
 
-        int i = 0, j = 0, pos = 0;
-        while (i < r1.getRowCount() && j < r2.getRowCount()) {
-            if (compareKey(keyAt(r1, i), keyAt(r2, j)) <= 0) {
-                copyRow(r1, i++, out, pos++);
-            } else {
-                copyRow(r2, j++, out, pos++);
+        boolean ok = false;
+        try {
+            int i = 0, j = 0, pos = 0;
+            while (i < r1.getRowCount() && j < r2.getRowCount()) {
+                checkCancelled();
+                if (compareKey(keyAt(r1, i), keyAt(r2, j)) <= 0) {
+                    copyRow(r1, i++, out, pos++);
+                } else {
+                    copyRow(r2, j++, out, pos++);
+                }
             }
-        }
-        while (i < r1.getRowCount()) copyRow(r1, i++, out, pos++);
-        while (j < r2.getRowCount()) copyRow(r2, j++, out, pos++);
+            while (i < r1.getRowCount()) copyRow(r1, i++, out, pos++);
+            while (j < r2.getRowCount()) copyRow(r2, j++, out, pos++);
 
-        for (FieldVector v : out) v.setValueCount(total);
-        r1.close();
-        r2.close();
-        return new VectorSchemaRoot(fields, out, total);
+            for (FieldVector v : out) v.setValueCount(total);
+            ok = true;
+            return new VectorSchemaRoot(fields, out, total);
+        } finally {
+            if (!ok) {
+                // 取消检查点抛出：在途输出向量与两个源都必须在此释放（否则停止任务后内存不回落）。
+                for (FieldVector v : out) {
+                    try { v.close(); } catch (Exception ignored) {}
+                }
+            }
+            try { r1.close(); } catch (Exception ignored) {}
+            try { r2.close(); } catch (Exception ignored) {}
+        }
     }
 
     @Override
@@ -276,27 +314,39 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
             isFixed[col] = tw > 0;
             if (!isFixed[col]) tps[col] = srcVecs[col].makeTransferPair(dstVecs[col]);
         }
-        for (int i = 0; i < acc.rowCount; i++) {
-            int srcIdx = outIndices[i];
-            for (int col = 0; col < nCols; col++) {
-                if (isFixed[col]) {
-                    int tw = widths[col];
-                    dstVecs[col].getDataBuffer().setBytes((long) i * tw,
-                            srcVecs[col].getDataBuffer(), (long) srcIdx * tw, tw);
-                    // ★ memcpy 不搬 validity：新缓冲零值（= 全 NULL），非空行必须显式置位
-                    if (srcVecs[col].isNull(srcIdx)) {
-                        dstVecs[col].setNull(i);
+        boolean ok = false;
+        try {
+            for (int i = 0; i < acc.rowCount; i++) {
+                checkCancelled();
+                int srcIdx = outIndices[i];
+                for (int col = 0; col < nCols; col++) {
+                    if (isFixed[col]) {
+                        int tw = widths[col];
+                        dstVecs[col].getDataBuffer().setBytes((long) i * tw,
+                                srcVecs[col].getDataBuffer(), (long) srcIdx * tw, tw);
+                        // ★ memcpy 不搬 validity：新缓冲零值（= 全 NULL），非空行必须显式置位
+                        if (srcVecs[col].isNull(srcIdx)) {
+                            dstVecs[col].setNull(i);
+                        } else {
+                            ArrowBuf val = dstVecs[col].getValidityBuffer();
+                            if (val != null) BitVectorHelper.setBit(val, i);
+                        }
                     } else {
-                        ArrowBuf val = dstVecs[col].getValidityBuffer();
-                        if (val != null) BitVectorHelper.setBit(val, i);
+                        tps[col].copyValueSafe(srcIdx, i);
                     }
-                } else {
-                    tps[col].copyValueSafe(srcIdx, i);
+                }
+            }
+            for (FieldVector v : dstVecs) v.setValueCount(acc.rowCount);
+            ok = true;
+            return new VectorSchemaRoot(fields, Arrays.asList(dstVecs), acc.rowCount);
+        } finally {
+            if (!ok) {
+                // 取消检查点抛出：已分配的排序快照向量不能泄漏（它不登记在 PartitionState 里）。
+                for (FieldVector v : dstVecs) {
+                    try { v.close(); } catch (Exception ignored) {}
                 }
             }
         }
-        for (FieldVector v : dstVecs) v.setValueCount(acc.rowCount);
-        return new VectorSchemaRoot(fields, Arrays.asList(dstVecs), acc.rowCount);
     }
 
     /** 构建排序索引：INT 键用 primitive map 快速路径，其他键用 LinkedHashMap */
@@ -306,6 +356,7 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
         if (acc.hasIntKeys()) {
             int[] keys = acc.sortedIntKeys();
             for (int key : keys) {
+                checkCancelled();
                 for (int idx : acc.getIntRowIndices(key)) {
                     outIndices[pos++] = idx;
                 }
@@ -314,6 +365,7 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
             List<Object> keys = new ArrayList<>(acc.keyToRowIndices.keySet());
             sortKeys(keys);
             for (Object key : keys) {
+                checkCancelled();
                 for (int idx : acc.keyToRowIndices.get(key)) {
                     outIndices[pos++] = idx;
                 }
@@ -343,6 +395,7 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
         int pageCount = 0;
         long totalRows = 0;
         while (!upstreamExhausted) {
+            checkCancelled();
             long tNext = System.currentTimeMillis();
             Page input = upstream.next();
             nextTotal += System.currentTimeMillis() - tNext;
@@ -352,6 +405,12 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
             }
             totalRows += input.getRowCount();
             recordInput(input);
+            // 分区级输入计数：与 accumulatePage 的路由口径一致（无分区号 → 0 号）
+            int inPid = input.getPartitionId().orElse(0);
+            if (inPid >= 0 && inPid < partitionRowsIn.length()) {
+                partitionRowsIn.addAndGet(inPid, input.getRowCount());
+                partitionBytesIn.addAndGet(inPid, input.getSizeInBytes());
+            }
 
             long tAcc = System.currentTimeMillis();
             accumulatePage(input);
@@ -396,6 +455,8 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
                         } else {
                             outputMemory(pa, p);
                         }
+                    } catch (java.util.concurrent.CancellationException ce) {
+                        // 取消：静默收手（不记 failure —— 取消不是失败）
                     } catch (Throwable e) {
                         failure.compareAndSet(null, e);
                         System.err.printf("[Sort] Partition %d failed: %s%n", p, e);
@@ -404,7 +465,14 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
                 t.start();
                 threads.add(t);
             }
-            for (Thread t : threads) t.join();
+            // 主线程被中断（取消）时先把并行刷盘线程一并打断 —— 它们不在任何线程池里，
+            // 光靠 future.cancel(true) 只中断本线程，这些线程会继续把整份数据刷完（CPU 不降的元凶）。
+            try {
+                for (Thread t : threads) t.join();
+            } catch (InterruptedException ie) {
+                for (Thread t : threads) t.interrupt();
+                throw ie;
+            }
         }
         rethrowIfFailed(failure, "Phase 2 flush");
 
@@ -424,7 +492,9 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
             }
             Thread t = new Thread(() -> {
                 try { compactPartition(p); }
-                catch (Throwable e) {
+                catch (java.util.concurrent.CancellationException ce) {
+                    // 取消：静默收手
+                } catch (Throwable e) {
                     // ★ 不能吞：compacted 保持 false 会退化到 indexBasedMergeJoin，
                     //   而归并中途已删除源文件、索引也不再维护 ⇒ 必然丢行/空结果。
                     failure.compareAndSet(null, e);
@@ -434,7 +504,12 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
             t.start();
             compactThreads.add(t);
         }
-        for (Thread t : compactThreads) t.join();
+        try {
+            for (Thread t : compactThreads) t.join();
+        } catch (InterruptedException ie) {
+            for (Thread t : compactThreads) t.interrupt();
+            throw ie;
+        }
         rethrowIfFailed(failure, "Phase 3 compaction");
 
         System.err.printf("[Sort] Compact done: %d ms%n", System.currentTimeMillis() - t3);
@@ -476,9 +551,11 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
         long inputCap = mergeInputCap();
         int round = 0;
         while (sources.size() > 1) {
+            checkCancelled();
             List<Path> next = new ArrayList<>();
             int i = 0;
             while (i < sources.size()) {
+                checkCancelled();
                 int[] consumedOut = new int[1];
                 next.addAll(mergeOneRound(sources, i, pid, round, inputCap, consumedOut));
                 i += Math.max(1, consumedOut[0]);
@@ -540,6 +617,7 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
         try {
             // 装载源：至少 1 个；已有 ≥2 个且逼近堆外闸门就停
             while (cursor < n && loaded < MAX_MERGE_K) {
+                checkCancelled();
                 if (loaded >= 2 && allocator.getAllocatedMemory() >= inputCap) break;
                 Path srcPath = sources.get(cursor++);
                 FileChannel ch = FileChannel.open(srcPath, StandardOpenOption.READ);
@@ -573,8 +651,8 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
             Schema schema = inputSchema;
             List<FieldVector> outVectors = null;
             int outRowCount = 0, outCapacity = 0;
-            Object lastKey = null;
             while (!heap.isEmpty()) {
+                checkCancelled();
                 int si = heap.poll();
                 VectorSchemaRoot src = roots[si];
                 int row = positions[si];
@@ -592,23 +670,23 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
                     outWriter = new ArrowFileWriter(outRoot, null, outCh);
                 }
 
-                Object curKey = keyAt(src, row);
-                // 缓冲满且 key 换组 → 落一个 batch（保证 key 组不跨 batch，便于下游顺序扫描）
-                if (outRowCount >= OUTPUT_BATCH_SIZE && lastKey != null && !keysEqual(lastKey, curKey)) {
+                // 缓冲满 → 立即落一个 batch，<b>不要求 key 换组</b>。
+                // 旧实现只在 key 换组时切批，因此「单个 join key 组 > 一批」时输出向量会在
+                // 同一组内无限 reAlloc（实测：热键组把 Sort 算子分配器撑到 438MB 后申请 32MB
+                // 失败 → OOM）。切批后 key 组可以跨 batch，下游 SortMergeJoin 按「组跨批」消费。
+                if (outRowCount >= OUTPUT_BATCH_SIZE) {
                     outRoot.setRowCount(outRowCount);
                     outWriter.writeBatch();
                     wroteAny = true;
                     for (FieldVector v : outVectors) v.setValueCount(0);
                     outRowCount = 0;
                 }
-                // 扩容（同一 key 组超过 batch 大小时）
                 if (outRowCount >= outCapacity) {
                     for (FieldVector v : outVectors) v.reAlloc();
                     outCapacity = minValueCapacity(outVectors);
                 }
 
                 copyRow(src, row, outVectors, outRowCount);
-                lastKey = curKey;
                 outRowCount++;
 
                 positions[si]++;
@@ -814,6 +892,16 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
     }
 
     int getPartitionCount() { return partitions.length; }
+
+    /** 指定分区从上游读入的行数（Phase 1 计数；遥测用）。 */
+    long partitionRowsIn(int pid) {
+        return pid >= 0 && pid < partitionRowsIn.length() ? partitionRowsIn.get(pid) : 0L;
+    }
+
+    /** 指定分区从上游读入的字节数（Phase 1 计数；遥测用）。 */
+    long partitionBytesIn(int pid) {
+        return pid >= 0 && pid < partitionBytesIn.length() ? partitionBytesIn.get(pid) : 0L;
+    }
 
     /**
      * 返回指定分区的排序数据。如果没有溢写（dataFilePath == null），

@@ -46,6 +46,38 @@ function newConsoleId() {
     return 'c' + consoleSeq + '-' + Date.now().toString(36);
 }
 
+/**
+ * 控制台自己的「结果预览」状态。
+ *
+ * <p><b>为什么挂在控制台上而不是全局：</b>结果区是同一份物理 DOM，但查询属于<b>发起它的那个
+ * 控制台</b>。旧实现把 queryId / 轮询定时器 / 结果快照全放全局，切标签时一刀 {@code reset}，
+ * 于是「跑着的查询在服务端继续、本地却再也找不回来了」（静默丢结果）。现在每个控制台各自持有
+ * 预览状态与轮询句柄，切标签只切换「谁在显示」，不打断任何在跑的查询。</p>
+ *
+ * <p>轮询 / 计时句柄不放在这里（见 dashboard.js 的 {@code sqlPreviewPolls}），
+ * 本对象只存可回放的数据，故可安全地随控制台存活。</p>
+ */
+function makeConsolePreview() {
+    return {
+        queryId: null,          // 当前关联的 queryId
+        submitPending: false,   // POST 在途（还没拿到 queryId）
+        running: false,         // 是否还在跑（提交那刻就置位，不等 POST 往返）
+        startMs: 0,             // 本次查询提交时刻
+        elapsedMs: 0,           // 结束时的最终耗时
+        errStreak: 0,           // 轮询连续失败次数
+        lastResult: null,       // 最近一帧结果（Finished / Running / Failed 都留）
+        sortCol: -1,            // 表头排序（纯前端）
+        sortDir: 0,
+        transposed: false,      // 结果区「列转行」开关（纯前端，跟随控制台）
+        lastSqlText: '',        // 本次真正提交的 SQL（复制 / AI 修复用）
+        ranSelection: false,
+        autoLimited: false,
+        batchCount: 0,
+        lastError: '',          // 最近一次报错 / 轮询失败
+        lastErrorDetail: ''
+    };
+}
+
 /** 造一个控制台模型；savedText 缺省 = text（即「刚打开，未改动」）。 */
 function makeConsole(opts) {
     opts = opts || {};
@@ -55,7 +87,8 @@ function makeConsole(opts) {
         title: opts.title || '查询',
         scriptId: opts.scriptId || null,
         text: text,
-        savedText: (opts.savedText != null) ? opts.savedText : text
+        savedText: (opts.savedText != null) ? opts.savedText : text,
+        preview: makeConsolePreview()
     };
 }
 
@@ -115,9 +148,13 @@ function syncEditorToActiveConsole() {
     if (input) c.text = input.value || '';
 }
 
-/** 切标签后的共用收尾：清结果区 + 光标记忆 + 补全弹层。 */
+/**
+ * 切标签后的共用收尾：恢复该控制台自己的结果区 + 光标记忆 + 补全弹层。
+ *
+ * <p>只换「显示」：在跑的查询由 dashboard.js 按控制台各自轮询，切走不停、切回即恢复。</p>
+ */
 function afterConsoleSwitch() {
-    if (typeof resetSqlResultUi === 'function') resetSqlResultUi();
+    if (typeof restoreSqlResultUi === 'function') restoreSqlResultUi();
     sqlCaretMemory = null;                            // 拖表名不从上个控制台的落点续写
     if (typeof acHide === 'function') acHide();
 }
@@ -182,6 +219,7 @@ function bindConsoleTabsUi() {
 function setActiveConsole(id) {
     if (id === activeConsoleId || !findConsole(id)) return;
     syncEditorToActiveConsole();
+    if (typeof captureSqlResultUi === 'function') captureSqlResultUi();   // 把排序等只存在于界面的状态存回旧控制台
     activeConsoleId = id;
     applyActiveConsoleToEditor();
     afterConsoleSwitch();
@@ -200,6 +238,7 @@ function setActiveConsole(id) {
 function newQueryConsole(opts) {
     opts = opts || {};
     syncEditorToActiveConsole();
+    if (typeof captureSqlResultUi === 'function') captureSqlResultUi();
     var c = makeConsole({
         title: opts.title || nextConsoleTitle(),
         scriptId: opts.scriptId || null,
@@ -232,6 +271,9 @@ function doCloseConsole(id) {
     }
     if (i < 0) return;
     var wasActive = (activeConsoleId === id);
+    if (wasActive && typeof captureSqlResultUi === 'function') captureSqlResultUi();
+    // 控制台关掉 = 它的结果再也无处展示；停掉本控制台的轮询，服务端查询本身不强杀
+    if (typeof stopPreviewPoll === 'function') stopPreviewPoll(id);
     consoles.splice(i, 1);
     if (!consoles.length) {   // 关到 0 → 补一个空标签，保证始终有编辑器可用
         consoles.push(makeConsole({ title: '查询 1', text: '', savedText: '' }));
@@ -276,24 +318,35 @@ function showCloseConsoleDialog(c) {
 function saveConsoleToScript(c, onDone) {
     if (!c) c = activeConsole();
     if (!c) return;
+    if (c === activeConsole()) syncEditorToActiveConsole();   // Ctrl+S 时编辑器里才是最新内容
     var content = c.text || '';
     if (!content.trim()) { showToast('控制台为空，没有可保存的 SQL'); return; }
-    promptNameModal('保存 SQL 脚本', '为当前控制台的 SQL 起个名字（同名脚本将覆盖）。',
-        c.scriptId ? c.title : '',
+    // 从「SQL 脚本管理」打开 / 已经保存过一次的标签（有 scriptId）：直接同名覆盖，不再弹命名框。
+    // 从未保存过的控制台才需要起名。
+    if (c.scriptId) {
+        persistConsoleScript(c, c.title || 'SQL 脚本', content, onDone);
+        return;
+    }
+    promptNameModal('保存 SQL 脚本', '为当前控制台的 SQL 起个名字（同名脚本将覆盖）。', '',
         function (name) {
-            httpPost('/api/scripts', { name: name, content: content })
-                .then(function (r) {
-                    c.title = name;
-                    c.savedText = content;
-                    if (r && r.id) c.scriptId = r.id;
-                    renderConsoleTabs();
-                    persistConsoles();
-                    showToast('已保存脚本：' + name);
-                    if (typeof onDone === 'function') onDone();
-                })
-                .catch(function (err) {
-                    showToast('保存失败：' + oneLine(err && err.message ? err.message : err, 80));
-                });
+            persistConsoleScript(c, name, content, onDone);
+        });
+}
+
+/** 脚本落库（SQLite，按登录用户隔离）+ 回写控制台元信息。 */
+function persistConsoleScript(c, name, content, onDone) {
+    httpPost('/api/scripts', { name: name, content: content })
+        .then(function (r) {
+            c.title = name;
+            c.savedText = content;
+            if (r && r.id) c.scriptId = r.id;
+            renderConsoleTabs();
+            persistConsoles();
+            showToast('已保存脚本：' + name);
+            if (typeof onDone === 'function') onDone();
+        })
+        .catch(function (err) {
+            showToast('保存失败：' + oneLine(err && err.message ? err.message : err, 80));
         });
 }
 
@@ -342,7 +395,13 @@ function writeConsolesNow() {
     try {
         window.localStorage.setItem(SQL_CONSOLES_KEY, JSON.stringify({
             active: activeConsoleId,
-            consoles: consoles
+            // preview 是运行期状态（含 queryId / 结果快照），不入库；刷新后由新会话重新建立
+            consoles: consoles.map(function (c) {
+                return {
+                    id: c.id, title: c.title, scriptId: c.scriptId,
+                    text: c.text, savedText: c.savedText
+                };
+            })
         }));
     } catch (e) { /* 隐私模式 / 配额满：静默退化成「不记忆」 */ }
 }

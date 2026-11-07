@@ -3,6 +3,7 @@ package com.dojao.server.worker;
 import com.dojao.common.data.Page;
 import com.dojao.core.operator.ConnectorScanOperator;
 import com.dojao.core.operator.FragmentSpec;
+import com.dojao.core.operator.MaterializedCteConnector;
 import com.dojao.core.operator.OrderByTail;
 import com.dojao.core.operator.Operator;
 import com.dojao.core.operator.ShuffleReader;
@@ -284,19 +285,32 @@ public final class WorkerControlProducer implements FlightProducer {
         DojaoConnector conn = null;
         Operator op = null;
         try {
-            conn = provider.get(catalog);   // 每个任务独立副本，游标互不干扰
+            // 物化 CTE 的哨兵 catalog 不在注册表里：数据就在切片载荷中，用无状态解码连接器。
+            conn = MaterializedCteConnector.isCteCatalog(catalog)
+                    ? MaterializedCteConnector.wire()
+                    : provider.get(catalog);   // 每个任务独立副本，游标互不干扰
             // 谓词在数据所在地执行：连接器认识的推给数据源，引擎注册函数谓词由引擎在本节点补 Filter
             // （必须在 top-N 截断尾之前 —— 语义是「先过滤再取前 N 行」）
             Operator source = ConnectorScanOperator.openWithEngineFilter(conn, slice.request(), slice.split());
             op = tail != null ? OrderByTail.wrap(source, tail) : source;
             op.open();
             Page page;
-            while (!(page = op.next()).isEOF()) {
+            while (true) {
+                // ★取消抬头：扫描线程被 interrupt = 任务被取消（WorkerManager.cancelTask）。
+                //   不抬头的话，纯 CPU 的扫描会一直跑完，连接器游标/内存直到 close 才释放。
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new java.util.concurrent.CancellationException("scan cancelled: " + taskId);
+                }
+                if ((page = op.next()).isEOF()) break;
                 // put 已接管页生命周期（发送/丢弃都会 close）—— 此处不得再 close
                 queue.put(new ScanEvent.ScanPage(taskId, page));   // 网络回传即背压
             }
             queue.offer(new ScanEvent.ScanFinished(taskId), 1, TimeUnit.SECONDS);
+        } catch (java.util.concurrent.CancellationException ce) {
+            // 取消 ≠ 失败：静默退出，不发 ScanFailed（Master 侧已放弃该任务）。
         } catch (Throwable t) {
+            // queue.put 的 InterruptedException 会清掉中断标记 —— 认标记优先，取消同样静默退出。
+            if (Thread.currentThread().isInterrupted()) return;
             // 显式失败回传（尽力送达）：Master 收到即 fail-fast；万一丢失，Master 侧看门狗兜底判 LOST
             queue.offer(new ScanEvent.ScanFailed(taskId, String.valueOf(t)), 3, TimeUnit.SECONDS);
         } finally {

@@ -84,10 +84,10 @@ public final class PartitionedSourceOperator extends AbstractMeasurableOperator 
                 try {
                     Thread.sleep(1);
                 } catch (InterruptedException e) {
+                    // ★取消必须原样抛出：旧实现返回 EOF，把「取消」伪装成「上游正常结束」，
+                    //   下游溢写算子会立刻起一整轮 Phase 2 归并（纯 CPU），取消后反而更忙。
                     Thread.currentThread().interrupt();
-                    mergedDrained = true;
-                    checkSourceFailure();   // 取消不是失败：无失败时 checkSourceFailure 是 no-op
-                    return Page.eof();
+                    throw e;
                 }
             }
         }

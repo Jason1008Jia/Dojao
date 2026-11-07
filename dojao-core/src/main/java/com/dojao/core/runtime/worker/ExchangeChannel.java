@@ -2,6 +2,8 @@ package com.dojao.core.runtime.worker;
 
 import com.dojao.common.data.Page;
 
+import java.util.concurrent.atomic.AtomicBoolean;
+
 /**
  * Worker↔Worker 的数据交换通道 —— 分布式 Hash 分区的发送端通过它把数据页推到
  * 该分区的归属 Worker（{@link ShuffleReader}）。
@@ -56,8 +58,58 @@ public interface ExchangeChannel {
     }
 
     /**
-     * 登记一个即将使用该 exchange 发送流的<b>生产端</b>，须在首次 {@link #send}/{@link #complete}
-     * 之前调用（{@code HashPartitionOperator.doOpen}）。
+     * 获取一个<b>发送租约</b>（推荐入口）：{@code HashPartitionOperator.doOpen} 每个唯一的
+     * exchangeId 调用一次，之后的 send/complete/fail 全部经返回的句柄路由。
+     *
+     * <p>网络实现把「使用哪一代发送流」固化在租约里：每次 0→1 登记创建新的一代（epoch），
+     * 上一代已收尾但 flusher 尚未退出的流不会被新一代复用。同一 Worker 上的多个 Producer
+     * 片段并发登记时共享当前代（引用计数），只有最后一个租约关闭才真正收尾共享流。</p>
+     *
+     * <p>默认实现退化为 {@link #acquire}/{@link #release} 配对，供无发送侧资源的本地实现
+     * （{@code LocalExchangeChannel}）与测试 / 工具使用。</p>
+     */
+    default ExchangeLease acquireLease(String exchangeId) {
+        acquire(exchangeId);
+        return new ExchangeLease() {
+            private final AtomicBoolean closed = new AtomicBoolean();
+
+            @Override
+            public void send(String toWorkerId, int bucketId, Page page) throws InterruptedException {
+                requireOpen();
+                ExchangeChannel.this.send(toWorkerId, exchangeId, bucketId, page);
+            }
+
+            @Override
+            public void complete(String toWorkerId, int bucketId) throws InterruptedException {
+                requireOpen();
+                ExchangeChannel.this.complete(toWorkerId, exchangeId, bucketId);
+            }
+
+            @Override
+            public void fail(String toWorkerId, int bucketId, Throwable cause) {
+                requireOpen();
+                ExchangeChannel.this.fail(toWorkerId, exchangeId, bucketId, cause);
+            }
+
+            @Override
+            public void close() {
+                if (closed.compareAndSet(false, true)) {
+                    ExchangeChannel.this.release(exchangeId);
+                }
+            }
+
+            private void requireOpen() {
+                if (closed.get()) {
+                    throw new IllegalStateException("exchange 发送租约已关闭 exchangeId=" + exchangeId
+                            + "：send/complete 必须在 lease.close() 之前");
+                }
+            }
+        };
+    }
+
+    /**
+     * 登记一个即将使用该 exchange 发送流的<b>生产端</b>（旧接口，等价于丢弃
+     * {@link #acquireLease} 返回的句柄）。
      *
      * <p><b>为什么需要</b>：同一 Worker 上的多个 Producer 片段共用「(目标 Worker, exchangeId)」
      * 这一条底层流（{@code NetworkExchangeChannel} 按 Worker 缓存的单例通道）。若每个片段各自
@@ -65,7 +117,8 @@ public interface ExchangeChannel {
      * 无消费者的待发队列（容量满即永久阻塞），{@code complete} 静默丢失，接收端永远等不齐发送方
      * ⇒ 终端 Consumer 挂起。按引用计数登记后，只有最后一个生产端释放才真正关闭流。</p>
      *
-     * <p>与 {@link #release} 成对调用；本地实现无资源（默认 no-op）。</p>
+     * <p>与 {@link #release} 成对调用；本地实现无资源（默认 no-op）。新代码应使用
+     * {@link #acquireLease}：句柄方式不会再按名字查全局流表，天然隔离代际。</p>
      */
     default void acquire(String exchangeId) {
     }
@@ -77,7 +130,7 @@ public interface ExchangeChannel {
      * flusher 线程 —— 否则每个查询的每条 (目标 Worker, exchangeId) 流都会永久留在通道里，
      * 随查询次数累积直接内存与线程。</p>
      *
-     * <p><b>引用计数</b>：共享流要被<b>全部</b>生产端释放（{@link #acquire} 登记数归零）才关闭；
+     * <p><b>引用计数</b>：共享流要被<b>全部</b>生产端释放（登记数归零）才关闭；
      * 未登记过的 exchange 保持旧语义（立即释放，兼容直接使用通道的测试 / 工具）。本地实现无
      * 资源可释放（默认 no-op）。</p>
      */

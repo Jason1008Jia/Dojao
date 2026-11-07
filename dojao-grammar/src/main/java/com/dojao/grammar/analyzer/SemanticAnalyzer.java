@@ -83,6 +83,15 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
         "CORR", "COVAR_POP", "COVAR_SAMP"
     );
 
+    /**
+     * 只能作为窗口函数使用的名字（{@code rank() / lag() …}）；{@code Planner.toWindowSpec}
+     * 认识的内置窗口函数全集。聚合函数另由 {@link #AGGREGATE_FUNCTIONS} / 自定义聚合注册表覆盖。
+     */
+    private static final Set<String> WINDOW_ONLY_FUNCTIONS = Set.of(
+        "ROW_NUMBER", "RANK", "DENSE_RANK", "PERCENT_RANK", "CUME_DIST",
+        "NTILE", "LAG", "LEAD", "NTH_VALUE"
+    );
+
     private static final Pattern NUMERIC_PATTERN = Pattern.compile("^\\d+(\\.\\d+)?$");
 
     /** 函数调用名提取（isAggregateExpression 扫描自定义聚合用）：标识符后紧跟左括号。 */
@@ -105,7 +114,25 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
 
     /** 已解析完成的窗口调用：{@code ctx} 用于判定它是否就是整个 SELECT 项。 */
     private record PendingWindowCall(SqlBaseParser.FunctionCallContext ctx,
-                                     Expression.WindowFunction window) {}
+                                     Expression.WindowFunction window,
+                                     String text) {
+        /** 常规形态：窗口调用原文 = {@code ctx} 的原文。 */
+        PendingWindowCall(SqlBaseParser.FunctionCallContext ctx, Expression.WindowFunction window) {
+            this(ctx, window, null);
+        }
+    }
+
+    /**
+     * 「包装形态」规范化后需要回写原文的片段。
+     *
+     * <p>{@code round(sum(amount), 2) OVER (PARTITION BY …)} 这类写法把返回标量的普通函数包在
+     * 窗口外面，语义等价于把 {@code OVER} 贴到参数里的聚合调用上：
+     * {@code round(sum(amount) OVER (PARTITION BY …), 2)}。分析阶段只做这层改写（窗口本体按
+     * 「嵌在表达式里的窗口」收集），执行由 Planner 既有的 {@code OpaqueExpr + windowCalls} 路径完成。</p>
+     */
+    private record WindowExprRewrite(ParserRuleContext ctx, String replacement) {}
+
+    private final List<WindowExprRewrite> pendingWindowExprRewrites = new ArrayList<>();
 
     /**
      * 是否正处于「允许出现窗口函数」的表达式里（只有 SELECT 项表达式允许）。
@@ -1155,27 +1182,35 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
 
     @Override public LogicalPlan visitQuery(SqlBaseParser.QueryContext ctx) {
         if (ctx.WITH() != null) {
-            // 解析 CTE，自上而下注册，嵌套 CTE 可引用已注册的 CTE
-            List<LogicalPlan.CteDef> cteDefs = new ArrayList<>();
-            for (SqlBaseParser.CommonTableExpressionContext cte : ctx.commonTableExpression()) {
-                String cteName = cte.identifier().getText();
-                LogicalPlan innerPlan = visit(cte.query());
-                List<String> columns;
-                if (cte.columnAliases() != null) {
-                    columns = cte.columnAliases().identifier().stream()
-                        .map(ParseTree::getText).toList();
-                } else {
-                    // 与内联派生表（deriveDerivedTableColumns）同一推导：有别名→别名；select *→按
-                    // FROM 展开；裸列→剥表限定符（r.user_id → user_id）。原来直接用表达式文本会
-                    // 把 "r.user_id" 整段当列标签 → CTE 内 join 后外层永远解析不到 user_id（bug）。
-                    columns = deriveDerivedTableColumns(innerPlan);
+            // 本层 WITH 是新的 CTE 作用域：外层 CTE 仍可见，本层同名定义遮蔽外层；离开本层恢复外层。
+            // 旧实现离开时直接 cteDefinitions.clear()，嵌套 WITH（CTE 体内 / 子查询内）会把外层
+            // 已注册的 CTE 一并抹掉 —— 之后主查询再引用兄弟 CTE 就变成「表不存在」。
+            Map<String, List<String>> savedScope = new LinkedHashMap<>(cteDefinitions);
+            try {
+                // 解析 CTE，自上而下注册，嵌套 CTE 可引用已注册的 CTE
+                List<LogicalPlan.CteDef> cteDefs = new ArrayList<>();
+                for (SqlBaseParser.CommonTableExpressionContext cte : ctx.commonTableExpression()) {
+                    String cteName = cte.identifier().getText();
+                    LogicalPlan innerPlan = visit(cte.query());
+                    List<String> columns;
+                    if (cte.columnAliases() != null) {
+                        columns = cte.columnAliases().identifier().stream()
+                            .map(ParseTree::getText).toList();
+                    } else {
+                        // 与内联派生表（deriveDerivedTableColumns）同一推导：有别名→别名；select *→按
+                        // FROM 展开；裸列→剥表限定符（r.user_id → user_id）。原来直接用表达式文本会
+                        // 把 "r.user_id" 整段当列标签 → CTE 内 join 后外层永远解析不到 user_id（bug）。
+                        columns = deriveDerivedTableColumns(innerPlan);
+                    }
+                    cteDefinitions.put(cteName, columns);
+                    cteDefs.add(new LogicalPlan.CteDef(cteName, columns, innerPlan));
                 }
-                cteDefinitions.put(cteName, columns);
-                cteDefs.add(new LogicalPlan.CteDef(cteName, columns, innerPlan));
+                LogicalPlan mainQuery = visit(ctx.queryNoWith());
+                return new LogicalPlan.With(cteDefs, mainQuery);
+            } finally {
+                cteDefinitions.clear();
+                cteDefinitions.putAll(savedScope);
             }
-            LogicalPlan mainQuery = visit(ctx.queryNoWith());
-            cteDefinitions.clear();
-            return new LogicalPlan.With(cteDefs, mainQuery);
         }
         return visit(ctx.queryNoWith());
     }
@@ -1388,28 +1423,34 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
     private LogicalPlan.SelectItem processSelectItem(SqlBaseParser.SelectItemContext ctx) {
         if (ctx instanceof SqlBaseParser.SelectSingleContext single) {
             List<PendingWindowCall> saved = List.copyOf(pendingWindowCalls);
+            List<WindowExprRewrite> savedRewrites = List.copyOf(pendingWindowExprRewrites);
             boolean savedWindowAllowed = windowAllowedInExpression;
             pendingWindowCalls.clear();
+            pendingWindowExprRewrites.clear();
             int mark = pendingResolvedColumns.size();
             try {
                 windowAllowedInExpression = true;
                 resolveExpressionColumns(single.expression());
                 List<Expression.ColumnRef> resolved = drainFrom(mark);
                 List<PendingWindowCall> calls = List.copyOf(pendingWindowCalls);
+                List<WindowExprRewrite> rewrites = List.copyOf(pendingWindowExprRewrites);
                 Expression expr;
-                if (calls.size() == 1 && isWindowCallRoot(single.expression(), calls.get(0).ctx())) {
+                if (rewrites.isEmpty() && calls.size() == 1
+                        && isWindowCallRoot(single.expression(), calls.get(0).ctx())) {
                     // 整项就是一个窗口调用：保持既有形态（Planner 的根窗口路径）。
                     expr = calls.get(0).window().withResolvedColumns(resolved);
                 } else {
                     // 窗口嵌在表达式里：保留完整原文，窗口调用按顺序附在 SelectItem 上，
                     // 否则 `+ - * /` 与外层运算会被静默丢弃。
-                    String text = originalText(single.expression());
+                    // 包装形态（`round(sum(x),2) OVER (…)`）在这里先回写成规范文本。
+                    String text = applyWindowExprRewrites(single.expression(), rewrites);
                     expr = new Expression.OpaqueExpr(text, resolved);
                     Optional<String> alias = single.identifier() != null
                         ? Optional.of(single.identifier().getText()) : Optional.empty();
                     List<LogicalPlan.WindowCall> windowCalls = new ArrayList<>(calls.size());
                     for (PendingWindowCall c : calls) {
-                        windowCalls.add(new LogicalPlan.WindowCall(originalText(c.ctx()), c.window()));
+                        windowCalls.add(new LogicalPlan.WindowCall(
+                            c.text() != null ? c.text() : originalText(c.ctx()), c.window()));
                     }
                     return new LogicalPlan.SelectItem(expr, alias, windowCalls);
                 }
@@ -1419,6 +1460,8 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
             } finally {
                 pendingWindowCalls.clear();
                 pendingWindowCalls.addAll(saved);
+                pendingWindowExprRewrites.clear();
+                pendingWindowExprRewrites.addAll(savedRewrites);
                 windowAllowedInExpression = savedWindowAllowed;
             }
         } else if (ctx instanceof SqlBaseParser.SelectAllContext all) {
@@ -1427,6 +1470,30 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
         }
         return new LogicalPlan.SelectItem(
             new Expression.OpaqueExpr(originalText(ctx)), Optional.empty());
+    }
+
+    /**
+     * 把 SELECT 项原文里的包装形态片段替换成规范化文本。
+     *
+     * <p>按下标从右往左替换，避免前面的替换让后面的区间位移；区间取 {@code ctx} 在原始输入里的
+     * 绝对字符下标，再减去 SELECT 项表达式的起点换算成相对位置。</p>
+     */
+    private String applyWindowExprRewrites(SqlBaseParser.ExpressionContext expr,
+                                           List<WindowExprRewrite> rewrites) {
+        String text = originalText(expr);
+        if (rewrites.isEmpty()) return text;
+        int base = expr.getStart().getStartIndex();
+        List<WindowExprRewrite> sorted = new ArrayList<>(rewrites);
+        sorted.sort((a, b) -> Integer.compare(
+            b.ctx().getStart().getStartIndex(), a.ctx().getStart().getStartIndex()));
+        StringBuilder sb = new StringBuilder(text);
+        for (WindowExprRewrite rw : sorted) {
+            int s = rw.ctx().getStart().getStartIndex() - base;
+            int e = rw.ctx().getStop().getStopIndex() - base + 1;
+            if (s < 0 || e > sb.length() || s >= e) continue;
+            sb.replace(s, e, rw.replacement());
+        }
+        return sb.toString();
     }
 
     /**
@@ -1510,6 +1577,14 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
     }
 
     private LogicalPlan.JoinType resolveJoinType(SqlBaseParser.JoinRelationContext join) {
+        // 语法层接受 SEMI JOIN，但执行层没有半连接语义：按 INNER/LEFT 执行会放大行数、
+        // SELECT * 还会多出右表列（静默错结果）。本版本显式拒绝，引导改写为 EXISTS / IN。
+        if (join.SEMI() != null) {
+            error(join, "当前版本不支持 SEMI JOIN（LEFT/RIGHT SEMI JOIN）；"
+                + "请改用 EXISTS 或 IN 子查询代替，例如："
+                + "WHERE EXISTS (SELECT 1 FROM 右表 WHERE 连接条件)，"
+                + "或 WHERE 左键 IN (SELECT 右键 FROM 右表)。");
+        }
         if (join.CROSS() != null) return LogicalPlan.JoinType.CROSS;
         if (join.LEFT()  != null) return LogicalPlan.JoinType.LEFT;
         if (join.RIGHT() != null) return LogicalPlan.JoinType.RIGHT;
@@ -1725,6 +1800,11 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
         // 「Column 'a' is not found in any table in scope」。
         if (innerPlan instanceof LogicalPlan.SetOperation so) {
             return deriveDerivedTableColumns(so.left());
+        }
+        // CTE 体内自带 WITH（嵌套 CTE）：列名取自最内层查询体，而不是 WITH 包装层。
+        // 旧实现落到 return List.of() ⇒ 外层引用该 CTE 任何列都报「not found in table (columns: [])」。
+        if (innerPlan instanceof LogicalPlan.With w) {
+            return deriveDerivedTableColumns(w.query());
         }
         return List.of();
     }
@@ -2032,8 +2112,9 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
             }
             String funcName = ctx.functionName.getText();
 
+            List<SqlBaseParser.ExpressionContext> argCtxs = ctx.expression();
             List<String> args = new ArrayList<>();
-            for (SqlBaseParser.ExpressionContext e : ctx.expression()) {
+            for (SqlBaseParser.ExpressionContext e : argCtxs) {
                 args.add(originalText(e));
             }
 
@@ -2059,12 +2140,55 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
                 windowFrame = Optional.of("WINDOW_REF:" + ref.windowName().getText());
             }
 
-            // 窗口定义（PARTITION BY / ORDER BY）与窗口参数都不允许聚合函数调用（Postgres 同样禁止）：
-            // 物理层 parseOrderKey / stripWindowArg 只能取单列，遇到 `order by sum(x)` 会以
+            // 窗口定义（PARTITION BY / ORDER BY）不允许聚合函数调用（Postgres 同样禁止）：
+            // 物理层 parseOrderKey 只能取单列，遇到 `order by sum(x)` 会以
             // UnsupportedOperationException 抛出 —— 这里在语义分析期直接拒绝（无 GROUP BY 也拒绝）。
-            rejectAggregateInWindow(ctx, funcName, args, false, "参数");
             rejectAggregateInWindow(ctx, funcName, partitionBy, false, "PARTITION BY");
             rejectAggregateInWindow(ctx, funcName, orderBy, true, "ORDER BY");
+
+            // 返回标量的普通函数包在窗口外面：`round(sum(amount), 2) OVER (PARTITION BY …)`。
+            // 语义等价于把 OVER 贴到参数里的聚合调用上：`round(sum(amount) OVER (PARTITION BY …), 2)`。
+            // 引擎本来就支持「窗口嵌在表达式里」（OpaqueExpr + windowCalls），这里只做规范化：
+            // 窗口本体按内层聚合调用登记，外层函数留给 Planner 的标量投影求值。
+            // 只处理「参数整体就是一个聚合调用」的形态；`round(sum(a)+1,2) OVER (…)` 之类仍走下面的拒绝。
+            if (!isWindowCapableFunction(funcName)) {
+                String specText = originalText(ws);
+                List<String> rewrittenArgs = new ArrayList<>(args.size());
+                List<PendingWindowCall> wrapped = new ArrayList<>();
+                boolean leftoverAggregate = false;   // 聚合嵌在参数表达式里（`sum(a)+1`）→ 不做规范化
+                for (int i = 0; i < args.size(); i++) {
+                    SqlBaseParser.FunctionCallContext inner = soleAggregateCall(argCtxs.get(i));
+                    if (inner == null) {
+                        if (isAggregateExpression(args.get(i))) leftoverAggregate = true;
+                        rewrittenArgs.add(args.get(i));
+                        continue;
+                    }
+                    List<String> innerArgs = new ArrayList<>();
+                    for (SqlBaseParser.ExpressionContext ie : inner.expression()) {
+                        innerArgs.add(originalText(ie));
+                    }
+                    String windowText = originalText(inner) + " OVER " + specText;
+                    wrapped.add(new PendingWindowCall(inner, new Expression.WindowFunction(
+                        inner.functionName.getText(), innerArgs, partitionBy, orderBy, windowFrame),
+                        windowText));
+                    rewrittenArgs.add(windowText);
+                }
+                if (!wrapped.isEmpty() && !leftoverAggregate) {
+                    pendingWindowCalls.addAll(wrapped);
+                    pendingWindowExprRewrites.add(new WindowExprRewrite(ctx,
+                        funcName + "(" + String.join(", ", rewrittenArgs) + ")"));
+                    windowSpecDepth++;
+                    try {
+                        return visitChildren(ctx);
+                    } finally {
+                        windowSpecDepth--;
+                    }
+                }
+            }
+
+            // 窗口参数（值参数）不允许聚合函数调用：物理层 stripWindowArg 只能取单列。
+            // 包装形态已在上面规范化并提前返回；走到这里说明没有可规范化的聚合参数。
+            rejectAggregateInWindow(ctx, funcName, args, false, "参数");
 
             pendingWindowCalls.add(new PendingWindowCall(ctx, new Expression.WindowFunction(
                 funcName, args, partitionBy, orderBy, windowFrame)));
@@ -2220,6 +2344,41 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
                     + "'，请先用子查询把聚合结果物化为列");
             }
         }
+    }
+
+    /** 该函数名能否直接作为窗口函数（内置聚合 / 自定义聚合 / 纯窗口函数）。 */
+    private static boolean isWindowCapableFunction(String name) {
+        String upper = name.toUpperCase(Locale.ROOT);
+        return AGGREGATE_FUNCTIONS.contains(upper)
+            || WINDOW_ONLY_FUNCTIONS.contains(upper)
+            || AggregateFunctionRegistry.hasGlobal(upper)
+            || CollectAggregateRegistry.hasGlobal(upper);
+    }
+
+    /**
+     * 参数表达式是否「整体就是一个聚合函数调用」（{@code sum(x)}，不含 {@code OVER}）。
+     * 是则返回内层调用上下文，否则 null（算术包裹 / 括号包裹 / 非聚合都返回 null）。
+     */
+    private SqlBaseParser.FunctionCallContext soleAggregateCall(SqlBaseParser.ExpressionContext arg) {
+        SqlBaseParser.FunctionCallContext fc = soleFunctionCall(arg);
+        if (fc == null || fc.OVER() != null) return null;
+        if (!isWindowCallRoot(arg, fc)) return null;   // 表达式里还有其它运算（算术 / 逗号…）
+        return isAggregateExpression(originalText(fc)) ? fc : null;
+    }
+
+    /** 返回表达式树里唯一的函数调用上下文；出现多个（或没有）则 null。 */
+    private static SqlBaseParser.FunctionCallContext soleFunctionCall(ParserRuleContext root) {
+        SqlBaseParser.FunctionCallContext found = null;
+        for (int i = 0; i < root.getChildCount(); i++) {
+            if (!(root.getChild(i) instanceof ParserRuleContext child)) continue;
+            SqlBaseParser.FunctionCallContext sub = (child instanceof SqlBaseParser.FunctionCallContext f)
+                ? f : soleFunctionCall(child);
+            if (sub != null) {
+                if (found != null) return null;
+                found = sub;
+            }
+        }
+        return found;
     }
 
     /** 剥掉窗口 ORDER BY 排序项尾部的 {@code ASC / DESC [NULLS FIRST|LAST]}，只留列表达式。 */

@@ -198,7 +198,7 @@ public class DistributedAggregationOperator extends AbstractDistributedOperator 
         for (FragmentSpec producer : stage.producers()) {
             dispatch(producer);
         }
-        return consumers.size();
+        return stage.finalConsumerCount();
     }
 
     @Override

@@ -5,8 +5,10 @@ import com.dojao.core.runtime.master.StageScheduler.JoinChainStage;
 import com.dojao.core.runtime.master.StageScheduler.JoinLink;
 import com.dojao.core.runtime.master.WorkerRegistration;
 import com.dojao.core.runtime.worker.WorkerGateway;
+import com.dojao.spi.bean.DojaoType;
 import com.dojao.spi.bean.ReadRequest;
 import com.dojao.spi.service.DojaoConnector;
+import com.dojao.spi.util.DojaoTypeMapper;
 import org.apache.arrow.vector.types.pojo.Field;
 
 import java.util.ArrayList;
@@ -53,7 +55,8 @@ import java.util.List;
  * @version 1.0
  * @date 2026/9/5
  */
-public class DistributedAggregateWindowOperator extends AbstractDistributedOperator {
+public class DistributedAggregateWindowOperator extends AbstractDistributedOperator
+        implements WindowChainCarrier {
 
     // ---- join 源（links != null）：基表 T0 + 左深 join 链 ----
     private final String firstCatalog, firstSchema, firstTable;
@@ -73,14 +76,26 @@ public class DistributedAggregateWindowOperator extends AbstractDistributedOpera
     private final List<String> groupKeys;
     private final List<AggregationSpec> aggregations;
     private final List<CaseProjection> caseProjections;
+    /**
+     * GROUP BY 表达式派生分组键（{@code year(created_at)} 等）；空 = 全部为裸列键。
+     * 由发送端在重分区前物化（Producer / 最末层 join 消费者），聚合端按派生列名分组。
+     */
+    private final List<GroupKeyExpression> groupKeyExpressions;
+    /**
+     * HAVING 谓词（沿用 Master 侧 {@code FilterOperator} 的原文）：聚合输出行级过滤，在
+     * Worker 内聚合之后、按窗口键重分区之前执行。null/空 = 无 HAVING。
+     */
+    private final String havingFilter;
     private final long memoryLimit;
 
     // ---- 窗口段 ----
-    private final List<String> windowPartitionBy, windowOrderBy;
-    private final List<Boolean> windowAscending;
-    private final List<WindowFunctionSpec> windowFunctions;
+    /**
+     * 窗口分组链（单组 = 长度 1；多组 = 聚合输出依次经过各组窗口，组间按下一组键重分区，
+     * 数据不回 Master）。顺序即 SELECT 中首次出现顺序。
+     */
+    private List<FragmentSpec.WindowStep> windowSteps;
 
-    /** join 源构造（上游 = DistributedJoinAggregationOperator）。 */
+    /** join 源构造（上游 = DistributedJoinAggregationOperator，单窗口组）。 */
     public DistributedAggregateWindowOperator(String queryId,
                                               String firstCatalog, String firstSchema, String firstTable,
                                               List<String> firstLeftKeys, DojaoConnector firstProbe,
@@ -93,15 +108,56 @@ public class DistributedAggregateWindowOperator extends AbstractDistributedOpera
                                               int numPartitions, WorkerGateway gateway,
                                               List<WorkerRegistration> workers,
                                               List<String> firstColumns) {
-        this(queryId, groupKeys, aggregations, caseProjections, memoryLimit,
-                windowPartitionBy, windowOrderBy, windowAscending, windowFunctions,
+        this(queryId, groupKeys, aggregations, caseProjections, List.of(), null, memoryLimit,
+                List.of(windowStep(windowPartitionBy, windowOrderBy, windowAscending, windowFunctions,
+                        memoryLimit, numPartitions)),
                 numPartitions, gateway, workers,
                 firstCatalog, firstSchema, firstTable, firstLeftKeys, firstProbe, firstFilter,
                 links == null ? List.of() : List.copyOf(links), firstColumns,
                 null, List.of(), null);
     }
 
-    /** scan 源构造（上游 = DistributedAggregationOperator）。 */
+    /** join 源构造（多窗口分组链）。 */
+    public DistributedAggregateWindowOperator(String queryId,
+                                              String firstCatalog, String firstSchema, String firstTable,
+                                              List<String> firstLeftKeys, DojaoConnector firstProbe,
+                                              String firstFilter,
+                                              List<JoinLink> links,
+                                              List<String> groupKeys, List<AggregationSpec> aggregations,
+                                              List<CaseProjection> caseProjections, long memoryLimit,
+                                              int numPartitions, WorkerGateway gateway,
+                                              List<WorkerRegistration> workers,
+                                              List<String> firstColumns,
+                                              List<FragmentSpec.WindowStep> windowSteps) {
+        this(queryId, groupKeys, aggregations, caseProjections, List.of(), null, memoryLimit,
+                List.copyOf(windowSteps), numPartitions, gateway, workers,
+                firstCatalog, firstSchema, firstTable, firstLeftKeys, firstProbe, firstFilter,
+                links == null ? List.of() : List.copyOf(links), firstColumns,
+                null, List.of(), null);
+    }
+
+    /** join 源构造（多窗口分组链）+ 表达式分组键 + HAVING 下沉。 */
+    public DistributedAggregateWindowOperator(String queryId,
+                                              String firstCatalog, String firstSchema, String firstTable,
+                                              List<String> firstLeftKeys, DojaoConnector firstProbe,
+                                              String firstFilter,
+                                              List<JoinLink> links,
+                                              List<String> groupKeys, List<AggregationSpec> aggregations,
+                                              List<CaseProjection> caseProjections,
+                                              List<GroupKeyExpression> groupKeyExpressions,
+                                              String havingFilter, long memoryLimit,
+                                              int numPartitions, WorkerGateway gateway,
+                                              List<WorkerRegistration> workers,
+                                              List<String> firstColumns,
+                                              List<FragmentSpec.WindowStep> windowSteps) {
+        this(queryId, groupKeys, aggregations, caseProjections, groupKeyExpressions, havingFilter,
+                memoryLimit, List.copyOf(windowSteps), numPartitions, gateway, workers,
+                firstCatalog, firstSchema, firstTable, firstLeftKeys, firstProbe, firstFilter,
+                links == null ? List.of() : List.copyOf(links), firstColumns,
+                null, List.of(), null);
+    }
+
+    /** scan 源构造（上游 = DistributedAggregationOperator，单窗口组）。 */
     public DistributedAggregateWindowOperator(String queryId,
                                               ReadRequest baseRequest, List<String> predicates, DojaoConnector probe,
                                               List<String> groupKeys, List<AggregationSpec> aggregations,
@@ -110,18 +166,50 @@ public class DistributedAggregateWindowOperator extends AbstractDistributedOpera
                                               List<Boolean> windowAscending, List<WindowFunctionSpec> windowFunctions,
                                               int numPartitions, WorkerGateway gateway,
                                               List<WorkerRegistration> workers) {
-        this(queryId, groupKeys, aggregations, caseProjections, memoryLimit,
-                windowPartitionBy, windowOrderBy, windowAscending, windowFunctions,
+        this(queryId, groupKeys, aggregations, caseProjections, List.of(), null, memoryLimit,
+                List.of(windowStep(windowPartitionBy, windowOrderBy, windowAscending, windowFunctions,
+                        memoryLimit, numPartitions)),
                 numPartitions, gateway, workers,
+                null, null, null, List.of(), null, null, null, null,
+                baseRequest, List.copyOf(predicates), probe);
+    }
+
+    /** scan 源构造（多窗口分组链）。 */
+    public DistributedAggregateWindowOperator(String queryId,
+                                              ReadRequest baseRequest, List<String> predicates, DojaoConnector probe,
+                                              List<String> groupKeys, List<AggregationSpec> aggregations,
+                                              List<CaseProjection> caseProjections, long memoryLimit,
+                                              int numPartitions, WorkerGateway gateway,
+                                              List<WorkerRegistration> workers,
+                                              List<FragmentSpec.WindowStep> windowSteps) {
+        this(queryId, groupKeys, aggregations, caseProjections, List.of(), null, memoryLimit,
+                List.copyOf(windowSteps), numPartitions, gateway, workers,
+                null, null, null, List.of(), null, null, null, null,
+                baseRequest, List.copyOf(predicates), probe);
+    }
+
+    /** scan 源构造（多窗口分组链）+ 表达式分组键 + HAVING 下沉。 */
+    public DistributedAggregateWindowOperator(String queryId,
+                                              ReadRequest baseRequest, List<String> predicates, DojaoConnector probe,
+                                              List<String> groupKeys, List<AggregationSpec> aggregations,
+                                              List<CaseProjection> caseProjections,
+                                              List<GroupKeyExpression> groupKeyExpressions,
+                                              String havingFilter, long memoryLimit,
+                                              int numPartitions, WorkerGateway gateway,
+                                              List<WorkerRegistration> workers,
+                                              List<FragmentSpec.WindowStep> windowSteps) {
+        this(queryId, groupKeys, aggregations, caseProjections, groupKeyExpressions, havingFilter,
+                memoryLimit, List.copyOf(windowSteps), numPartitions, gateway, workers,
                 null, null, null, List.of(), null, null, null, null,
                 baseRequest, List.copyOf(predicates), probe);
     }
 
     private DistributedAggregateWindowOperator(String queryId,
                                                List<String> groupKeys, List<AggregationSpec> aggregations,
-                                               List<CaseProjection> caseProjections, long memoryLimit,
-                                               List<String> windowPartitionBy, List<String> windowOrderBy,
-                                               List<Boolean> windowAscending, List<WindowFunctionSpec> windowFunctions,
+                                               List<CaseProjection> caseProjections,
+                                               List<GroupKeyExpression> groupKeyExpressions,
+                                               String havingFilter, long memoryLimit,
+                                               List<FragmentSpec.WindowStep> windowSteps,
                                                int numPartitions, WorkerGateway gateway,
                                                List<WorkerRegistration> workers,
                                                String firstCatalog, String firstSchema, String firstTable,
@@ -144,11 +232,19 @@ public class DistributedAggregateWindowOperator extends AbstractDistributedOpera
         this.groupKeys = List.copyOf(groupKeys);
         this.aggregations = List.copyOf(aggregations);
         this.caseProjections = caseProjections == null ? List.of() : List.copyOf(caseProjections);
+        this.groupKeyExpressions = groupKeyExpressions == null ? List.of() : List.copyOf(groupKeyExpressions);
+        this.havingFilter = havingFilter;
         this.memoryLimit = memoryLimit;
-        this.windowPartitionBy = List.copyOf(windowPartitionBy);
-        this.windowOrderBy = List.copyOf(windowOrderBy);
-        this.windowAscending = List.copyOf(windowAscending);
-        this.windowFunctions = List.copyOf(windowFunctions);
+        this.windowSteps = List.copyOf(windowSteps);
+    }
+
+    /** 单组窗口 → WindowStep（多组链由 Planner 直接构造，不再走这里）。 */
+    private static FragmentSpec.WindowStep windowStep(List<String> partitionBy, List<String> orderBy,
+                                                      List<Boolean> ascending,
+                                                      List<WindowFunctionSpec> functions,
+                                                      long memoryLimit, int numPartitions) {
+        return new FragmentSpec.WindowStep(partitionBy, orderBy, ascending, functions,
+                memoryLimit, Math.max(1, numPartitions));
     }
 
     @Override
@@ -174,6 +270,8 @@ public class DistributedAggregateWindowOperator extends AbstractDistributedOpera
         // ① 每 Worker 一个 WindowConsumer（先注册窗口交换读端）→ ② 每分区 MiddleAggregateConsumer
         //   （注册聚合交换读端，聚合输出按窗口键重哈希推窗口交换）→ ③ join 源：最末层 MiddleJoinConsumer
         //   → 中间层逆序 → 基表 Producers（build 先 probe）；scan 源：直接基表 Producers。
+        boolean single = windowSteps.size() == 1;
+        FragmentSpec.WindowStep first = windowSteps.get(0);
         JoinChainStage stage;
         if (links == null) {
             // scan 源：复算扫描生效请求（列 + 谓词，与原聚合算子 dispatchStage 一致），交给连接器再分区规划
@@ -182,25 +280,37 @@ public class DistributedAggregateWindowOperator extends AbstractDistributedOpera
                 if (p == null || p.isBlank()) continue;
                 effective = probe.pushdownPredicate(effective, p);
             }
-            stage = StageScheduler.planAggregateWindow(
-                    queryId, workers, numPartitions, effective,
-                    groupKeys, aggregations, caseProjections, memoryLimit, probe,
-                    windowPartitionBy, windowOrderBy, windowAscending, windowFunctions);
+            stage = single
+                    ? StageScheduler.planAggregateWindow(
+                            queryId, workers, numPartitions, effective,
+                            groupKeys, aggregations, caseProjections, memoryLimit, probe,
+                            first, havingFilter, groupKeyExpressions)
+                    : StageScheduler.planAggregateWindowChain(
+                            queryId, workers, numPartitions, effective,
+                            groupKeys, aggregations, caseProjections, memoryLimit, probe, windowSteps,
+                            havingFilter, groupKeyExpressions);
         } else {
-            stage = StageScheduler.planJoinAggregateWindow(
-                    queryId, workers, numPartitions,
-                    firstCatalog, firstSchema, firstTable, firstLeftKeys, firstProbe, firstFilter,
-                    links, memoryLimit, groupKeys, aggregations, caseProjections,
-                    windowPartitionBy, windowOrderBy, windowAscending, windowFunctions, firstColumns);
+            stage = single
+                    ? StageScheduler.planJoinAggregateWindow(
+                            queryId, workers, numPartitions,
+                            firstCatalog, firstSchema, firstTable, firstLeftKeys, firstProbe, firstFilter,
+                            links, memoryLimit, groupKeys, aggregations, caseProjections,
+                            firstColumns, first, havingFilter, groupKeyExpressions)
+                    : StageScheduler.planJoinAggregateWindowChain(
+                            queryId, workers, numPartitions,
+                            firstCatalog, firstSchema, firstTable, firstLeftKeys, firstProbe, firstFilter,
+                            links, memoryLimit, groupKeys, aggregations, caseProjections,
+                            firstColumns, windowSteps, havingFilter, groupKeyExpressions);
         }
         for (FragmentSpec fragment : withTerminal(stage.fragments())) {   // 分布式写 SinkStep + top-N 截断尾
 
             dispatch(fragment);
         }
         System.err.printf("[DistributedAggregateWindow] query=%s workers=%d partitions=%d join=%s groupKeys=%s "
-                        + "windowPartitionBy=%s consumers=%d fragments=%d%n",
+                        + "windowGroups=%s consumers=%d fragments=%d%n",
                 queryId, workers.size(), numPartitions, firstTable, groupKeys,
-                windowPartitionBy, stage.finalConsumerCount(), stage.fragments().size());
+                windowSteps.stream().map(FragmentSpec.WindowStep::partitionBy).toList(),
+                stage.finalConsumerCount(), stage.fragments().size());
         return stage.finalConsumerCount();
     }
 
@@ -239,8 +349,11 @@ public class DistributedAggregateWindowOperator extends AbstractDistributedOpera
                         link.rightSchema(), link.rightTable(), link.rightColumns());
                 wire = joinOutputFields(link.joinType(), wire, right, link.leftKeys(), link.rightKeys());
             }
-            aggOut.addAll(fieldsByNames(wire, groupKeys));
-            aggInputs = wire;
+            // 表达式派生分组键（如 year(created_at)）不在 join 输出里 —— 发送端物化后才有，类型按
+            // STRING 兜底（与 DistributedAggregationOperator / DistributedJoinAggregationOperator 同口径）。
+            List<Field> wireWithKeys = withDerivedKeyFields(wire);
+            aggOut.addAll(fieldsByNames(wireWithKeys, groupKeys));
+            aggInputs = wireWithKeys;
         }
         // CASE/IF/表达式派生列（聚合参数改写）不在扫描列里 —— 补上静态类型，
         // 否则 sum(CAST(x AS DECIMAL)) 的输出声明会退化。
@@ -248,10 +361,41 @@ public class DistributedAggregateWindowOperator extends AbstractDistributedOpera
         for (AggregationSpec a : aggregations) {
             aggOut.add(aggregationOutputField(a, aggInputs));
         }
-        List<Field> out = new ArrayList<>(aggOut);
-        for (WindowFunctionSpec s : windowFunctions) {
-            out.add(windowFunctionField(s, name -> fieldOf(aggOut, name)));
+        // 逐步按声明输出列重定基再追加函数列（K 形状投影吸收见基类 helper）。
+        return windowChainOutputFields(aggOut, windowSteps);
+    }
+
+    /** 把表达式派生分组键补成 STRING 静态列（发送端物化列，不在 join 输出里）。 */
+    private List<Field> withDerivedKeyFields(List<Field> wire) {
+        if (groupKeyExpressions.isEmpty()) return wire;
+        List<Field> out = new ArrayList<>(wire);
+        for (GroupKeyExpression g : groupKeyExpressions) {
+            if (fieldOf(out, g.derivedColumn()) == null) {
+                out.add(DojaoTypeMapper.toField(g.derivedColumn(), DojaoType.STRING));
+            }
         }
         return out;
     }
+
+    /** 是否多窗口分组链（诊断 / 测试用）。 */
+    public boolean hasWindowChain() { return windowSteps.size() > 1; }
+
+    /** 窗口分组链（单组时长度为 1）。 */
+    @Override
+    public List<FragmentSpec.WindowStep> windowSteps() { return windowSteps; }
+
+    @Override
+    public void replaceWindowSteps(List<FragmentSpec.WindowStep> steps) {
+        if (steps == null || steps.isEmpty()) return;
+        this.windowSteps = List.copyOf(steps);
+    }
+
+    /** GROUP BY 表达式派生分组键（空 = 全部裸列键）。 */
+    public List<GroupKeyExpression> groupKeyExpressions() { return groupKeyExpressions; }
+
+    /** Worker 侧聚合规格（窗口计算之前的聚合段；审计用）。 */
+    public List<AggregationSpec> aggregations() { return aggregations; }
+
+    /** 下沉到 Worker 聚合输出之后的 HAVING 谓词（null/空 = 无）。 */
+    public String havingFilter() { return havingFilter; }
 }

@@ -78,8 +78,14 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
      */
     private static final int FETCH_PER_KEYS = ResourceConfig.windowSpillFetchPerKeys();
 
-    /** Phase 1.5 K 路归并的路数上限：峰值内存 ≈ MAX_MERGE_K × 单批大小，恒有界。 */
-    private static final int MAX_MERGE_K = 16;
+    /**
+     * Phase 1.5 K 路归并的路数上限：峰值内存 ≈ MAX_MERGE_K × 单批大小，恒有界。
+     *
+     * <p>只是上限 —— 实际路数由「本次归并新增的分配器占用 &lt; 输入预算」动态决定（见
+     * {@link #mergeOneRound}）。取 32 是因为「一个槽位一个文件」后文件数通常只有几十个，
+     * 32 路一轮即可归并完成，避免多轮全量重写（写放大）。</p>
+     */
+    private static final int MAX_MERGE_K = 32;
 
     // ==================== 组合键 ====================
 
@@ -140,6 +146,9 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
         this.groupKeyColumns = groupKeyColumns;
         this.orderKeyColumns = orderKeyColumns;
         this.orderAscending = orderAscending;
+        // 下游 WindowFunctionOperator 按「相邻行 PARTITION BY 键」识别分区边界：同一工人持有多个桶时，
+        // 多分区并行吐页会把不同分区交错到一起而被误判为分区切换 ⇒ 吐页阶段必须按分区串行。
+        this.orderedEmit = true;
     }
 
     public WindowSortOperator(Operator upstream,
@@ -212,7 +221,9 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
 
     @Override
     protected void outputMemory(PartitionState<RowAccumulator> pa, int pid) {
+        beginOutput(pid);
         for (int s = 0; s < SLOT_COUNT; s++) {
+            checkCancelled();
             RowAccumulator acc = pa.slots.get(s);
             if (acc == null || acc.isEmpty()) continue;
             outputPagesFromAccumulator(acc, pid);
@@ -231,6 +242,8 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
         // 之所以必须有这一步（而不是像以前那样按 key 随机拉取）：随机拉取要按 key 反查批次，
         // 一个 key 批会命中几乎所有文件 ⇒ 把整份分区读进内存；归并后的文件是顺序读的，天然有界。
         compactPartition(pa, pid);
+        // 归并（磁盘重写）已可并行完成；从这里开始吐页 → 按活跃分区串行，避免下游按相邻行识别分区边界时被交错页打断。
+        beginOutput(pid);
         long tMid = System.nanoTime();
         // Phase 2：逐文件流式读取。
         //   · 无过滤：归并产物是全局 (分组键, ORDER BY) 有序，<b>整文件顺序成页</b>即可（不按组物化，
@@ -239,6 +252,7 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
         //   · 有过滤：窗口过滤要「整组一起算」，走逐组路径（组不跨批，由 Phase 1.5 保证）。
         boolean flatStream = filterConfig == null || !filterConfig.isActive();
         for (int bi = 0; bi < pa.batchFiles.size(); bi++) {
+            checkCancelled();
             if (flatStream) {
                 streamBatchFileFlat(pa, bi, pid);
             } else {
@@ -282,34 +296,62 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
         }
     }
 
-    /** 按 {@link #SPILL_BATCH_ROWS} 行一批，把 {@code order} 指定的行从累加器 gather 到独立文件；返回写入总字节。 */
+    /**
+     * 按 {@link #SPILL_BATCH_ROWS} 行一批，把 {@code order} 指定的行从累加器 gather 到
+     * <b>一个多批 Arrow 文件</b>；返回写入总字节。
+     *
+     * <p><b>为什么一个槽位只写一个文件、而不是每 10k 行一个文件</b>：Phase 1.5 的归并轮数约为
+     * {@code log_K(文件数)}，而每轮都会把全部数据重写一遍（真实 I/O，计入溢写总量）。旧实现把
+     * 一个槽位切成几十个文件后，91M 行级的窗口会产生上千个文件，K 路归并因此要多轮重写 ——
+     * 线上出现过「输入 6~7GB、监控溢写 217GB」的写放大。Arrow 文件天然支持「一个文件多个
+     * record batch」，Phase 2 的 {@link #streamBatchFile}/{@link #streamBatchFileFlat} 本来就按
+     * block 逐个读取，所以文件数从「行数/1万」降到「槽位溢写次数」，归并通常一轮即可完成，
+     * 而单批内存上限（{@link #SPILL_BATCH_ROWS}）保持不变。</p>
+     */
     private long writeSortedBatches(PartitionState<RowAccumulator> pa, RowAccumulator acc,
                                     int[] order, int pid) throws IOException {
         // ★ 用 order.length 而不是 acc.rowCount：{@link #pruneKeepRows()} 命中时 flattenGroupSortedIndices
         //   已按组裁到前 N 行，order 短于 rowCount；用 rowCount 会越界读 order 并写出垃圾行。
         int total = order.length;
+        if (total == 0) return 0;
         List<Field> fields = inputSchema.getFields();
-        long writtenBytes = 0;
-        int off = 0;
-        while (off < total) {
-            int rows = Math.min(SPILL_BATCH_ROWS, total - off);
-            List<FieldVector> outVectors = new ArrayList<>(fields.size());
-            for (Field field : fields) {
-                FieldVector dst = field.createVector(allocator);
-                dst.setInitialCapacity(rows);
-                dst.allocateNew();
-                outVectors.add(dst);
-            }
-            copyPagePermuted(acc.vectors, outVectors, order, off, rows, null, null);
-            for (FieldVector v : outVectors) v.setValueCount(rows);
-            VectorSchemaRoot chunk = new VectorSchemaRoot(fields, outVectors, rows);
-            try {
-                writtenBytes += writeBatchToArrow(pa, chunk, pid).bytes();
-            } finally {
-                chunk.close();
-            }
-            off += rows;
+
+        int batchIndex = pa.batchCount.getAndIncrement();
+        // 每次写溢写文件前查一次所在盘容量（超上限换盘，全超上限抛 SpillSpaceException）
+        Path file = spillDirForWrite().resolve("p" + pid + "_b" + batchIndex + ".arrow");
+        pa.batchFiles.add(file);
+        if (pa.dataFilePath == null) pa.dataFilePath = file;
+
+        List<FieldVector> outVectors = new ArrayList<>(fields.size());
+        for (Field field : fields) {
+            FieldVector dst = field.createVector(allocator);
+            dst.setInitialCapacity(Math.min(SPILL_BATCH_ROWS, total));
+            dst.allocateNew();
+            outVectors.add(dst);
         }
+        VectorSchemaRoot root = new VectorSchemaRoot(fields, outVectors, 0);
+        try (FileChannel ch = FileChannel.open(file, StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
+             ArrowFileWriter writer = new ArrowFileWriter(root, null, ch)) {
+            int off = 0;
+            while (off < total) {
+                int rows = Math.min(SPILL_BATCH_ROWS, total - off);
+                // 缓冲容量按实际 valueCapacity 判（Arrow 按字节取整，不同类型换算行数不同）
+                while (rows > minValueCapacity(outVectors)) {
+                    for (FieldVector v : outVectors) v.reAlloc();
+                }
+                copyPagePermuted(acc.vectors, outVectors, order, off, rows, null, null);
+                for (FieldVector v : outVectors) v.setValueCount(rows);
+                root.setRowCount(rows);
+                writer.writeBatch();
+                off += rows;
+            }
+        } finally {
+            root.close();
+        }
+        long writtenBytes = Files.size(file);
+        // 并发溢写线程共享该字段：同步累加（与 writeBatchToArrow 同口径）
+        synchronized (pa) { pa.dataFileSize += writtenBytes; }
         return writtenBytes;
     }
 
@@ -503,6 +545,7 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
         int offset = 0;
         int gi = 0;
         while (offset < total) {
+            checkCancelled();
             // 至少并入一个完整分组；随后继续并入，直到凑够一页（或没有更多分组）
             int end;
             do {
@@ -567,6 +610,7 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
         if (acc.hasIntKeys()) {
             int[] keys = acc.sortedIntKeys();
             for (int key : keys) {
+                checkCancelled();
                 List<Integer> indices = acc.getIntRowIndices(key);
                 if (indices == null || indices.isEmpty()) continue;
 
@@ -588,6 +632,7 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
         } else {
             var it = acc.keyToRowIndices.entrySet().iterator();
             while (it.hasNext()) {
+                checkCancelled();
                 var entry = it.next();
                 List<Integer> indices = entry.getValue();
                 if (indices.isEmpty()) { it.remove(); continue; }
@@ -910,9 +955,11 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
         long inputCap = mergeInputCap();
         int round = 0;
         while (sources.size() > 1) {
+            checkCancelled();
             List<Path> next = new ArrayList<>();
             int i = 0;
             while (i < sources.size()) {
+                checkCancelled();
                 int[] consumedOut = new int[1];
                 next.addAll(mergeOneRound(sources, i, pid, round, inputCap, consumedOut));
                 i += Math.max(1, consumedOut[0]);
@@ -989,10 +1036,16 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
         VectorSchemaRoot outRoot = null;
         boolean wroteAny = false;
         try {
+            // ★ 基线：只看「本次归并自己新装载的源」占了多少，而不是分配器的全局占用。
+            //   多个分区并发归并共享同一个算子分配器，若用全局占用跟 inputCap（已按并发分区数
+            //   摊薄）比较，别处分区占用的内存会把本次归并的路数直接压到 2 路 —— 文件数上千时
+            //   就要多轮重写（每轮都重写全量数据），线上表现为「溢写量 200+GB」。
+            long baseAlloc = allocator.getAllocatedMemory();
             while (cursor < n && loaded < MAX_MERGE_K) {
-                // ★ 用分配器「实时占用」判路数，而不是预估单批大小：Arrow 分配按 2 的幂向上取整，
-                //   预估会低估近一倍。至少放 2 路进来，保证多轮归并必然收敛。
-                if (loaded >= 2 && allocator.getAllocatedMemory() >= inputCap) break;
+                checkCancelled();
+                // 用分配器「实时占用（增量）」判路数，而不是预估单批大小：Arrow 分配按 2 的幂
+                // 向上取整，预估会低估近一倍。至少放 2 路进来，保证多轮归并必然收敛。
+                if (loaded >= 2 && allocator.getAllocatedMemory() - baseAlloc >= inputCap) break;
                 Path srcPath = sources.get(cursor++);
                 FileChannel ch = FileChannel.open(srcPath, StandardOpenOption.READ);
                 ArrowFileReader r = new ArrowFileReader(ch, allocator);
@@ -1000,6 +1053,8 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
                 if (blocks.isEmpty()) {
                     r.close();
                     ch.close();
+                    // 空溢写文件没有任何行，直接删掉回收磁盘（归并期间不再占用）
+                    try { Files.deleteIfExists(srcPath); } catch (IOException ignored) {}
                     continue;
                 }
                 // ★ 每个源可能是「一个文件多个 record batch」（上一轮的归并产物），首个批只是开头，
@@ -1048,6 +1103,9 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
                         || advanceBlock(i, readers, blockLists, blockIdx, roots, positions, rowCounts)) {
                     curKeys[i] = keyAt(roots[i], positions[i]);
                     heap.offer(i);
+                } else {
+                    // 空源：立即关句柄并删文件
+                    releaseSource(i, readers, channels, roots, loadedPaths);
                 }
             }
 
@@ -1059,6 +1117,7 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
             int groupOut = 0;   // 当前分组已写出的行数（用于每组只留前 keep 行）
 
             while (!heap.isEmpty()) {
+                checkCancelled();
                 int si = heap.poll();
                 VectorSchemaRoot src = roots[si];
                 int row = positions[si];
@@ -1118,6 +1177,12 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
                     if (advanceBlock(si, readers, blockLists, blockIdx, roots, positions, rowCounts)) {
                         curKeys[si] = keyAt(roots[si], positions[si]);
                         heap.offer(si);
+                    } else {
+                        // ★ 该源已读尽：立刻关句柄并删除溢写文件。
+                        //   归并产物与源同量，若等整轮结束再删，峰值 ≈ 2× 溢写量 ——
+                        //   盘上只剩 8GB 而溢写 18.8GB 时必然触发 SpillSpaceException。
+                        //   边读边删把峰值压回 ≈ 1×（源减少多少、产物增加多少）。
+                        releaseSource(si, readers, channels, roots, loadedPaths);
                     }
                 } else {
                     curKeys[si] = keyAt(roots[si], positions[si]);
@@ -1149,6 +1214,35 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
                 if (readers[i] != null) { try { readers[i].close(); } catch (Exception ignored) {} }
                 if (channels[i] != null) { try { channels[i].close(); } catch (Exception ignored) {} }
             }
+        }
+    }
+
+    /**
+     * 释放一个已读尽的归并源：关 root / reader / channel 后删除溢写文件。
+     *
+     * <p>删文件必须发生在关句柄之后（Windows 下打开中的文件不能删）。把「源读尽即删」放进
+     * 归并循环，是为了把 Phase 1.5 的磁盘峰值从 <b>≈2× 溢写量</b>（旧文件全留到整轮结束）
+     * 压到 <b>≈1×</b> —— 否则磁盘余量小于溢写量一半时，归并必然撞
+     * {@link SpillDirs.SpillSpaceException}。数组槽位随即置 null，外层 finally 不会重复关闭。</p>
+     */
+    private static void releaseSource(int i, ArrowFileReader[] readers, FileChannel[] channels,
+                                      VectorSchemaRoot[] roots, Path[] loadedPaths) {
+        if (roots[i] != null) {
+            try { roots[i].close(); } catch (Exception ignored) { }
+            roots[i] = null;
+        }
+        if (readers[i] != null) {
+            try { readers[i].close(); } catch (Exception ignored) { }
+            readers[i] = null;
+        }
+        if (channels[i] != null) {
+            try { channels[i].close(); } catch (Exception ignored) { }
+            channels[i] = null;
+        }
+        Path p = loadedPaths[i];
+        if (p != null) {
+            try { Files.deleteIfExists(p); } catch (IOException ignored) { }
+            loadedPaths[i] = null;
         }
     }
 
@@ -1246,11 +1340,13 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
             Phase2Out out = new Phase2Out(pid);
             try {
                 for (ArrowBlock block : reader.getRecordBlocks()) {
+                    checkCancelled();
                     reader.loadRecordBatch(block);
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
                     int n = root.getRowCount();
                     int from = 0;
                     while (from < n) {
+                        checkCancelled();
                         Object key = buildKeyFromSpill(root, from);
                         int to = from + 1;
                         while (to < n && keysEqual(key, buildKeyFromSpill(root, to))) to++;
@@ -1283,6 +1379,7 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
             FlatOut out = new FlatOut(pid);
             try {
                 for (ArrowBlock block : reader.getRecordBlocks()) {
+                    checkCancelled();
                     reader.loadRecordBatch(block);
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
                     int n = root.getRowCount();

@@ -134,6 +134,21 @@ public final class WindowExprArithmeticProbeTest {
                     + " FROM " + CATALOG + "." + SCHEMA + ".sales"
                     + " ORDER BY id";
 
+    /**
+     * S7：返回标量的普通函数包在窗口<b>外面</b>（{@code round(sum(gmv), 2) OVER (ORDER BY id)}）。
+     *
+     * <p>曾经被语义分析器直接拒绝（「窗口函数 round 的参数不支持聚合表达式」）。正确语义
+     * = OVER 贴到参数里的聚合调用上：{@code round(sum(gmv) OVER (ORDER BY id), 2)}，
+     * 与同一查询里的规范形态逐行一致（gmv = id*10 ⇒ 累计 = 5*id*(id+1)）。</p>
+     */
+    private static final String S7_SQL =
+            "SELECT id,"
+                    + " round(sum(gmv), 2) OVER (ORDER BY id) AS cum,"
+                    + " round(sum(gmv) OVER (ORDER BY id), 2) AS cum2,"
+                    + " round(sum(gmv), 0) OVER (ORDER BY id) + 1 AS cum_plus"
+                    + " FROM " + CATALOG + "." + SCHEMA + ".sales"
+                    + " ORDER BY id";
+
     private static int failures = 0;
     private static int checks = 0;
 
@@ -180,6 +195,8 @@ public final class WindowExprArithmeticProbeTest {
             runCase("S4：派生表内算占比 + 外层按占比过滤", S4_SQL, metaStore, context, WindowExprArithmeticProbeTest::checkS4);
             runCase("S5：窗口嵌在普通函数参数里 round(...)", S5_SQL, metaStore, context, WindowExprArithmeticProbeTest::checkS5);
             runCase("S6：星号展开 + 窗口算术", S6_SQL, metaStore, context, WindowExprArithmeticProbeTest::checkS6);
+            runCase("S7：标量函数包窗口 round(sum(gmv),2) OVER (...)", S7_SQL, metaStore, context,
+                    WindowExprArithmeticProbeTest::checkS7);
         } finally {
             for (String workerId : WORKERS) registry.unregister(workerId);
             for (WorkerManager wm : workerMap.values()) {
@@ -392,6 +409,25 @@ public final class WindowExprArithmeticProbeTest {
             allOk &= near(row.get(pctIdx), num(row.get(idIdx)) * 10.0 / TOTAL);
         }
         check("* 场景下 pct 仍按 gmv/780 求值（源列未被裁掉）", allOk);
+    }
+
+    private static void checkS7(Result r) {
+        check("行数 = 12", r.rows().size() == 12);
+        int idIdx = idx(r, "id"), cumIdx = idx(r, "cum");
+        int cum2Idx = idx(r, "cum2"), plusIdx = idx(r, "cum_plus");
+        check("输出列含 id / cum / cum2 / cum_plus",
+                idIdx >= 0 && cumIdx >= 0 && cum2Idx >= 0 && plusIdx >= 0);
+        boolean allCum = true, same = true, allPlus = true;
+        for (List<Object> row : r.rows()) {
+            double id = num(row.get(idIdx));
+            double expected = 5.0 * id * (id + 1);   // 累计 gmv = 10*(1+…+id)
+            allCum &= near(row.get(cumIdx), expected);
+            same &= near(row.get(cumIdx), num(row.get(cum2Idx)));
+            allPlus &= near(row.get(plusIdx), expected + 1.0);
+        }
+        check("round(sum(gmv),2) OVER (ORDER BY id) = 累计值", allCum);
+        check("包装形态与规范形态结果一致", same);
+        check("包装形态参与外层算术（+1）", allPlus);
     }
 
     // ==================== 工具 ====================

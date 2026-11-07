@@ -10,6 +10,9 @@ package com.dojao.ui.monitor;
  * <p>{@code diskReadBytesPerSec}/{@code diskWriteBytesPerSec} 是<b>进程级磁盘 IO 速率</b>
  * （字节/秒）—— 由 {@code ResourceSummary} 的累计字节按相邻采样点差分而来；首个采样点 / 非 Linux 为 0。
  *
+ * <p>{@code netRxBytesPerSec}/{@code netTxBytesPerSec} 是<b>节点网络带宽</b>（字节/秒），
+ * 口径为网络命名空间（{@code /proc/net/dev} 各非回环接口之和），同样由累计字节差分而来。
+ *
  * @param t                 采样时刻（wall clock 毫秒）
  * @param cpuPct            进程 CPU 使用率（0-100，-1 = 不可用）
  * @param heapUsedBytes     JVM 堆已用（字节）
@@ -20,8 +23,10 @@ package com.dojao.ui.monitor;
  * @param directUsedBytes   受管直接内存已用（字节）
  * @param diskReadBytesPerSec  进程级磁盘读速率（字节/秒；0 = 无数据）
  * @param diskWriteBytesPerSec 进程级磁盘写速率（字节/秒；0 = 无数据）
+ * @param netRxBytesPerSec  节点网络接收速率（字节/秒；0 = 无数据）
+ * @param netTxBytesPerSec  节点网络发送速率（字节/秒；0 = 无数据）
  * @author jiaxin
- * @version 1.1
+ * @version 1.2
  * @date 2026/9/29
  */
 public record MonitorSample(
@@ -34,5 +39,7 @@ public record MonitorSample(
         long totalMemoryBytes,
         long directUsedBytes,
         long diskReadBytesPerSec,
-        long diskWriteBytesPerSec) {
+        long diskWriteBytesPerSec,
+        long netRxBytesPerSec,
+        long netTxBytesPerSec) {
 }

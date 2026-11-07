@@ -122,8 +122,12 @@
                 i++;
                 while (i < n && !/^\s*(```|~~~)\s*$/.test(lines[i])) { buf.push(lines[i]); i++; }
                 i++; // 跳过收尾围栏
-                html.push('<pre class="md-pre"' + (lang ? ' data-lang="' + escAttr(lang) + '"' : '')
-                        + '><code>' + buf.join('\n') + '</code></pre>');
+                // 代码区：外层 .md-code 负责定位，右上角「复制全部」按钮由 dashboard.js
+                // 事件委托处理（流式回答每次增量重绘 innerHTML，按钮本身不绑事件）。
+                html.push('<div class="md-code"' + (lang ? ' data-lang="' + escAttr(lang) + '"' : '') + '>'
+                        + '<button type="button" class="md-code-copy" title="复制全部代码"'
+                        + ' aria-label="复制全部代码">\u590d\u5236</button>'
+                        + '<pre class="md-pre"><code>' + buf.join('\n') + '</code></pre></div>');
                 continue;
             }
             var h = line.match(/^(#{1,6})\s+(.*)$/);

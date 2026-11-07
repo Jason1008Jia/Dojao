@@ -526,7 +526,7 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
                 case LOST -> DistributedTask.LOST;
                 case SUBMITTED, RUNNING -> DistributedTask.RUNNING;
             };
-            out.add(new DistributedTask(t.taskId, t.workerId, "Scan", false,
+            out.add(new DistributedTask(t.taskId, t.workerId, "Scan", false, true,
                     st, t.rows.get(), t.dispatchNanos, t.finishNanos, t.cause, null));
         }
         out.sort((a, b) -> Long.compare(a.dispatchNanos(), b.dispatchNanos()));

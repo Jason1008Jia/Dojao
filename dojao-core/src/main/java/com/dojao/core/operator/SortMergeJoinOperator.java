@@ -17,7 +17,10 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicIntegerArray;
+import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 /**
@@ -110,13 +113,36 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
     private volatile boolean phase2Started;
     private ExecutorService phase2Pool;
     private final List<Future<?>> phase2Futures = new ArrayList<>();
-    /** 尚未归并完成的分区数（0 且输出队列空 = 真 EOF）。 */
-    private volatile int phase2Remaining;
+    /**
+     * 尚未归并完成的分区数（0 且输出队列空 = 真 EOF）。
+     *
+     * <p><b>必须是原子计数</b>：同一 Worker 常own 多个活跃分区，各分区归并线程在各自 finally
+     * 里递减。旧的 {@code volatile int} + {@code phase2Remaining--} 是读-改-写三步骤，两个线程
+     * 同时收尾会丢失一次递减 → 计数永远停在 1，{@code doNext()} 永久等待（Small data 下两个分区
+     * 近乎同时完成，几乎必现）。</p>
+     */
+    private final java.util.concurrent.atomic.AtomicInteger phase2Remaining =
+            new java.util.concurrent.atomic.AtomicInteger();
     /** 首个分区归并失败（fail-fast；旧实现把它印到 stderr 后当成正常结束 → 静默少行）。 */
     private final AtomicReference<Throwable> phase2Failure = new AtomicReference<>();
     private volatile boolean closed;
     private final BlockingQueue<Page> outputQueue = new ArrayBlockingQueue<>(OUTPUT_QUEUE_CAPACITY);
     private final int numPartitions;
+
+    /**
+     * 分区级<b>输出</b>计数 / 完成标记（遥测用）。
+     *
+     * <p>WebUI 上 SortMergeJoin 片段只有 1 个 task，且 Phase 1/2 期间全局 stats 增长缓慢 ——
+     * 用户只能看到「Join 框一直是 0」。这里按分区记行数 / 字节，Phase 2 分区线程退出时置 done，
+     * 由 {@code FragmentExecutor.trackJoinPartitions} 注册成 {@code <fragmentId>#p<k>} 子任务，
+     * 使排序归并 join 与哈希 join 一样逐分区可见。</p>
+     *
+     * <p>输入侧计数在两侧 {@link JoinSortOperator} 里（Phase 1 按页分区号累加），见
+     * {@link #partitionRowsIn(int)} / {@link #partitionBytesIn(int)}。</p>
+     */
+    private final AtomicLongArray partitionRowsOut;
+    private final AtomicLongArray partitionBytesOut;
+    private final AtomicIntegerArray partitionDone;
 
     // ==================== 构造函数 ====================
 
@@ -169,6 +195,9 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
         this.joinType = joinType;
         this.memoryLimit = memoryLimit;
         this.numPartitions = numPartitions;
+        this.partitionRowsOut = new AtomicLongArray(numPartitions);
+        this.partitionBytesOut = new AtomicLongArray(numPartitions);
+        this.partitionDone = new AtomicIntegerArray(numPartitions);
         this.declaredRightFields =
                 (declaredRightFields == null || declaredRightFields.isEmpty()) ? null : declaredRightFields;
         this.declaredLeftFields =
@@ -231,7 +260,7 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
             if (closed) return Page.eof();
             Throwable f = phase2Failure.get();
             if (f != null) throw asRuntime(f);   // fail-fast：分区失败绝不静默当成功（曾少行）
-            if (phase2Remaining == 0) return Page.eof();   // 全部分区归并完 + 队列空 = 真 EOF
+            if (phase2Remaining.get() == 0) return Page.eof();   // 全部分区归并完 + 队列空 = 真 EOF
         }
     }
 
@@ -268,10 +297,67 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
         return ticks;
     }
 
+    // ==================== 分区级遥测（WebUI 逐分区行数 / 字节 / 完成） ====================
+
+    /** 分区数（与 Master 下发的 shuffle 分区数一致）。 */
+    public int numPartitions() { return numPartitions; }
+
+    /** 指定分区已 join 输出的行数。 */
+    public long partitionRowsOut(int pid) {
+        return pid >= 0 && pid < partitionRowsOut.length() ? partitionRowsOut.get(pid) : 0L;
+    }
+
+    /** 指定分区已 join 输出的字节数。 */
+    public long partitionBytesOut(int pid) {
+        return pid >= 0 && pid < partitionBytesOut.length() ? partitionBytesOut.get(pid) : 0L;
+    }
+
+    /** 指定分区从两侧 shuffle 读入的行数（Phase 1 计数）。 */
+    public long partitionRowsIn(int pid) {
+        long n = 0L;
+        if (leftSort != null) n += leftSort.partitionRowsIn(pid);
+        if (rightSort != null) n += rightSort.partitionRowsIn(pid);
+        return n;
+    }
+
+    /** 指定分区从两侧 shuffle 读入的字节数（Phase 1 计数）。 */
+    public long partitionBytesIn(int pid) {
+        long n = 0L;
+        if (leftSort != null) n += leftSort.partitionBytesIn(pid);
+        if (rightSort != null) n += rightSort.partitionBytesIn(pid);
+        return n;
+    }
+
+    /** 指定分区的归并线程是否已结束。 */
+    public boolean partitionDone(int pid) {
+        return pid >= 0 && pid < partitionDone.length() && partitionDone.get(pid) != 0;
+    }
+
+    /** 全部分区的 join 输出行数之和（片段级遥测在窗口归并期间的行数兜底）。 */
+    public long rowsProduced() {
+        long sum = 0L;
+        for (int k = 0; k < partitionRowsOut.length(); k++) sum += partitionRowsOut.get(k);
+        return sum;
+    }
+
     private static RuntimeException asRuntime(Throwable t) {
         if (t instanceof RuntimeException re) return re;
         if (t instanceof Error err) throw err;
         return new RuntimeException("SortMergeJoin 分区归并失败", t);
+    }
+
+    /**
+     * 取消检查点 —— Phase 1 排序 / Phase 2 分区归并全是纯 CPU 循环，没有任何阻塞点。
+     * 任务取消时 {@code WorkerManager.cancelTask} 只打断任务线程并摘掉槽位（WebUI 立刻显示 0 个运行中），
+     * 若循环不抬头，线程会一直烧 CPU、溢写目录与 Arrow 内存也永不释放。
+     *
+     * <p>用非受检的 {@link CancellationException}：各归并方法签名各异（有的 throws IOException、有的无 throws），
+     * 统一在 {@link #startPhase2()} / 线程体收口，取消 ≠ 失败（绝不记 phase2Failure）。</p>
+     */
+    private void checkCancelled() {
+        if (closed || Thread.currentThread().isInterrupted()) {
+            throw new CancellationException("SortMergeJoin cancelled");
+        }
     }
 
     // ==================== Phase 1 ====================
@@ -284,14 +370,23 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
         AtomicReference<Throwable> sortFailure = new AtomicReference<>();
         Thread leftThread = new Thread(() -> {
             try { drainOperator(leftSort); }
+            catch (CancellationException ce) { /* 取消：静默收手，不算失败 */ }
             catch (Throwable t) { sortFailure.compareAndSet(null, new RuntimeException("Left sort failed", t)); }
         }, "sort-merge-left-sort");
         Thread rightThread = new Thread(() -> {
             try { drainOperator(rightSort); }
+            catch (CancellationException ce) { /* 取消：静默收手，不算失败 */ }
             catch (Throwable t) { sortFailure.compareAndSet(null, new RuntimeException("Right sort failed", t)); }
         }, "sort-merge-right-sort");
         leftThread.start(); rightThread.start();
-        leftThread.join();  rightThread.join();
+        try {
+            leftThread.join();  rightThread.join();
+        } catch (InterruptedException ie) {
+            // Future.cancel(true) 只打断任务线程；两个裸排序线程必须显式打断，否则会跑完整个排序。
+            leftThread.interrupt();
+            rightThread.interrupt();
+            throw ie;
+        }
         if (sortFailure.get() != null) throw asRuntime(sortFailure.get());
 
         System.err.printf("[SortMergeJoin] Phase 1 done: %d ms%n",
@@ -318,10 +413,10 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
 
         int[] activePids = collectActivePartitions();
         if (activePids.length == 0) {
-            phase2Remaining = 0;
+            phase2Remaining.set(0);
             return;
         }
-        phase2Remaining = activePids.length;
+        phase2Remaining.set(activePids.length);
         phase2Pool = Executors.newFixedThreadPool(activePids.length, r -> {
             Thread t = new Thread(r, "sort-merge-merge-join");
             t.setDaemon(true);
@@ -332,10 +427,14 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
             phase2Futures.add(phase2Pool.submit(() -> {
                 try {
                     mergeJoinPartition(p);
+                } catch (CancellationException ce) {
+                    // checkCancelled() 的收口点：取消 ≠ 失败，静默收手（绝不记 phase2Failure）。
                 } catch (Throwable t) {
                     phase2Failure.compareAndSet(null, t);
                 } finally {
-                    phase2Remaining--;
+                    // 分区归并线程退出 = 该分区不再产页（done 先于 remaining 递减，采样器不会读到「未完成但已停产」）
+                    if (p >= 0 && p < partitionDone.length()) partitionDone.set(p, 1);
+                    phase2Remaining.decrementAndGet();
                 }
             }));
         }
@@ -346,7 +445,11 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
 
     private void drainOperator(Operator op) {
         Page p;
-        while (!(p = op.next()).isEOF()) p.close();
+        while (true) {
+            checkCancelled();
+            if ((p = op.next()).isEOF()) break;
+            p.close();
+        }
     }
 
     /**
@@ -356,6 +459,12 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
      * 失败时消费者不再排空队列，{@code offer(超时)} + {@code closed} 复查保证线程能退出。
      */
     private void emit(Page page) {
+        // 分区级输出计数：所有 SortMerge 输出页都带 pid（Page.partitioned），按页归属累加。
+        int pid = page.getPartitionId().orElse(-1);
+        if (pid >= 0 && pid < partitionRowsOut.length()) {
+            partitionRowsOut.addAndGet(pid, page.getRowCount());
+            partitionBytesOut.addAndGet(pid, page.getSizeInBytes());
+        }
         while (!closed) {
             try {
                 if (outputQueue.offer(page, 100, TimeUnit.MILLISECONDS)) return;
@@ -400,6 +509,9 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
     private void streamingMergeJoin(int pid, PartitionState<RowAccumulator> leftPa,
                                      PartitionState<RowAccumulator> rightPa) {
         JoinOutputBuffer buf = new JoinOutputBuffer(pid);
+        FileIterator left = null;
+        FileIterator right = null;
+        boolean ok = false;
         try {
             // 单侧无数据 → 有数据侧全部当孤儿输出。走到这里说明 join 类型确实需要孤儿
             // （判定在 mergeJoinPartition：LEFT/FULL 缺右、RIGHT/FULL 缺左）——此处不再重复判断。
@@ -407,74 +519,129 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
                 requireSchema(leftSchema, "左（probe）", pid);
                 dumpAllAsOrphan(rightPa, findFieldIndex(rightSchema, rightKeyColumns.getFirst()),
                         false, pid, buf);
+                ok = true;
                 return;
             }
             if (rightPa == null) {
                 requireSchema(rightSchema, "右（build）", pid);
                 dumpAllAsOrphan(leftPa, findFieldIndex(leftSchema, leftKeyColumns.getFirst()),
                         true, pid, buf);
+                ok = true;
                 return;
             }
 
             int leftKeyIdx = findFieldIndex(leftSchema, leftKeyColumns.getFirst());
             int rightKeyIdx = findFieldIndex(rightSchema, rightKeyColumns.getFirst());
-            FileIterator left = createIterator(leftPa, leftKeyIdx);
-            FileIterator right = createIterator(rightPa, rightKeyIdx);
+            left = createIterator(leftPa, leftKeyIdx);
+            right = createIterator(rightPa, rightKeyIdx);
 
             boolean leftHasMore = left.nextBatch();
             boolean rightHasMore = right.nextBatch();
 
             while (leftHasMore && rightHasMore) {
+                checkCancelled();
                 Object lk = left.currentKey();
                 Object rk = right.currentKey();
                 int cmp = compareKeys(lk, rk);
 
                 if (cmp < 0) {
                     if (joinType == JoinType.LEFT || joinType == JoinType.FULL) {
-                        outputOrphanRows(left, left.collectCurrentKeyGroup(),
-                                right, right.cols(), buf);
+                        leftHasMore = consumeKeyGroup(left, (it, chunk) -> outputOrphanRows(it, chunk, buf));
                     } else {
-                        left.collectCurrentKeyGroup(); // 丢弃（INNER/RIGHT 不需要输出）
+                        leftHasMore = discardKeyGroup(left); // 丢弃（INNER/RIGHT 不需要输出）
                     }
-                    leftHasMore = left.ensureMore();
                 } else if (cmp > 0) {
                     if (joinType == JoinType.RIGHT || joinType == JoinType.FULL) {
-                        outputOrphanRight(right, right.collectCurrentKeyGroup(),
-                                left.cols(), buf);
+                        rightHasMore = consumeKeyGroup(right, (it, chunk) -> outputOrphanRight(it, chunk, buf));
                     } else {
-                        right.collectCurrentKeyGroup(); // 丢弃（INNER/LEFT 不需要输出）
+                        rightHasMore = discardKeyGroup(right); // 丢弃（INNER/LEFT 不需要输出）
                     }
-                    rightHasMore = right.ensureMore();
                 } else {
-                    // key 匹配 → cross join
-                    List<int[]> lRows = left.collectCurrentKeyGroup();
-                    List<int[]> rRows = right.collectCurrentKeyGroup();
-                    crossJoinInBuffer(left, lRows, right, rRows, buf);
-                    leftHasMore = left.ensureMore();
-                    rightHasMore = right.ensureMore();
+                    // key 匹配 → 逐块 cross join（组可能跨多个 record batch）
+                    crossJoinKeyGroup(left, right, buf);
+                    leftHasMore = left.hasCurrentRow();
+                    rightHasMore = right.hasCurrentRow();
                 }
             }
             // 剩余孤儿
             while (leftHasMore) {
+                checkCancelled();
                 if (joinType == JoinType.LEFT || joinType == JoinType.FULL)
-                    outputOrphanRows(left, left.collectCurrentKeyGroup(),
-                            right, right.cols(), buf);
+                    leftHasMore = consumeKeyGroup(left, (it, chunk) -> outputOrphanRows(it, chunk, buf));
                 else
-                    left.collectCurrentKeyGroup(); // 丢弃
-                leftHasMore = left.ensureMore();
+                    leftHasMore = discardKeyGroup(left);
             }
             while (rightHasMore) {
+                checkCancelled();
                 if (joinType == JoinType.RIGHT || joinType == JoinType.FULL)
-                    outputOrphanRight(right, right.collectCurrentKeyGroup(),
-                            left.cols(), buf);
+                    rightHasMore = consumeKeyGroup(right, (it, chunk) -> outputOrphanRight(it, chunk, buf));
                 else
-                    right.collectCurrentKeyGroup(); // 丢弃
-                rightHasMore = right.ensureMore();
+                    rightHasMore = discardKeyGroup(right);
             }
 
-            left.close(); right.close();
+            ok = true;
         } finally {
-            buf.flush();
+            // 取消 / 失败：迭代器占着回读的 Arrow 文件批，在途输出批也未成页 —— 都必须显式释放。
+            if (left != null) { try { left.close(); } catch (Exception ignored) {} }
+            if (right != null) { try { right.close(); } catch (Exception ignored) {} }
+            if (ok) buf.flush();
+            else buf.discard();
+        }
+    }
+
+    /**
+     * 消费<b>一个完整 key 组</b>（可能跨多个 record batch），逐块交给 {@code writer}。
+     *
+     * <p>旧实现把「本 batch 内连续同 key 的行」当作整组（组不跨批）。{@link JoinSortOperator#mergeOneRound}
+     * 原先也确实只在 key 换组时切批 —— 代价是单个热键组 &gt; 一批时会无限扩容输出向量直至 OOM。
+     * 现在切批只按缓冲大小，组可以跨批，消费端必须按「组跨批」推进：块内跑到批尾且下一批仍是同一 key
+     * 就继续。</p>
+     *
+     * @return 组消费完后迭代器是否还有当前行（false = 该侧已无数据）
+     */
+    private boolean consumeKeyGroup(FileIterator it, BiConsumer<FileIterator, List<int[]>> writer) {
+        Object key = it.currentKey();
+        while (true) {
+            checkCancelled();
+            writer.accept(it, it.collectKeyChunk());
+            if (!it.atBatchEnd()) break;                    // 同批内已到下一个 key
+            if (!it.nextBatch()) break;                     // 无更多数据
+            if (!keysEqual(key, it.currentKey())) break;    // 下一批已经是新 key
+        }
+        return it.hasCurrentRow();
+    }
+
+    /** 丢弃一个完整 key 组（INNER/RIGHT 不需要左孤儿、INNER/LEFT 不需要右孤儿）。 */
+    private boolean discardKeyGroup(FileIterator it) {
+        return consumeKeyGroup(it, (i, chunk) -> { });
+    }
+
+    /**
+     * 匹配 key 组的 cross join，两侧的组都可能跨多个 batch。
+     *
+     * <p>左组按块流式推进；每换一个左块，就把右迭代器 rewind 回右组起点、重新逐块扫描右组
+     * （跨批时从磁盘重读切片）。这样任一时刻只驻留左右各一个回读切片，内存与组大小无关。</p>
+     *
+     * <p>结束时 left 已越过左组、right 停在右组末尾（两者各自指向下一组起点或耗尽）。</p>
+     */
+    private void crossJoinKeyGroup(FileIterator left, FileIterator right, JoinOutputBuffer buf) {
+        Object key = left.currentKey();
+        FileIterator.Mark rightStart = right.mark();
+        while (true) {
+            checkCancelled();
+            List<int[]> lChunk = left.collectKeyChunk();
+            right.rewind(rightStart);
+            while (true) {
+                checkCancelled();
+                List<int[]> rChunk = right.collectKeyChunk();
+                crossJoinInBuffer(left, lChunk, right, rChunk, buf);
+                if (!right.atBatchEnd()) break;                     // 同批内已到下一个 key
+                if (!right.nextBatch()) break;                      // 右组结束（无更多数据）
+                if (!keysEqual(key, right.currentKey())) break;     // 下一批已经是新 key
+            }
+            if (!left.atBatchEnd()) break;              // 同批内已到下一个 key → 左组结束
+            if (!left.nextBatch()) break;               // 无更多数据
+            if (!keysEqual(key, left.currentKey())) break;
         }
     }
 
@@ -488,10 +655,14 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
         private final List<FieldVector> sourceVectors; // 零拷贝索引模式：直接引用 accumulator 向量
         private int fileIdx;
         private int nextBlock;      // 当前文件内下一个待读 record block
+        private int sliceFirstBlock; // 当前切片起始 block（rewind 复用/重载切片用）
         private boolean fileDone;   // 当前文件的 block 已读完
         private VectorSchemaRoot currentRoot;
         private int row;
         private int rowCount;
+
+        /** 迭代器位置快照：文件模式下按 (文件, 切片起始 block, 行偏移) 定位，供跨批 key 组重扫。 */
+        record Mark(int fileIdx, int sliceFirstBlock, int row) { }
 
         /** 文件模式：逐批加载 Arrow 文件 */
         FileIterator(PartitionState<RowAccumulator> pa, BufferAllocator allocator, int keyColIdx) {
@@ -542,7 +713,7 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
                 currentRoot = null;
             }
             if (inMemory || pa == null) return false;
-            // 每次只读「一个输出批」大小的 block 切片（block 边界 = key 组边界），
+            // 每次只读「一个输出批」大小的 block 切片（key 组可能跨切片，不能假设组不跨批），
             // 绝不再把一个文件的所有 block 拼成一个大 root（联邦全量 join 的单文件可达千万行，
             // setInitialCapacity(totalRows) 会一次申请 >100MB 连续 buffer 而撞分配器上限）。
             while (true) {
@@ -557,14 +728,16 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
                 }
                 if (fileIdx >= pa.batchFiles.size()) return false;
 
+                int firstBlock = nextBlock;
                 FileSlice slice = loadArrowFileSlice(
-                        pa.batchFiles.get(fileIdx), allocator, nextBlock, LOAD_BATCH_ROWS);
+                        pa.batchFiles.get(fileIdx), allocator, firstBlock, LOAD_BATCH_ROWS);
                 if (slice == null) {   // 读取失败：跳过该文件
                     fileIdx++;
                     nextBlock = 0;
                     fileDone = false;
                     continue;
                 }
+                sliceFirstBlock = firstBlock;
                 nextBlock = slice.nextBlock();
                 fileDone = slice.done();
                 if (slice.root() != null && slice.root().getRowCount() > 0) {
@@ -582,19 +755,69 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
             return RowAccumulator.readKeyValue(getVector(keyColIdx), phys);
         }
 
-        /** 收集当前 key 的全部行并前进游标（不跨 batch）。返回统一格式 [start, row) 的逻辑行范围。 */
-        List<int[]> collectCurrentKeyGroup() {
+        /**
+         * 收集当前 key 在<b>当前 batch 内</b>的连续行并前进游标（不跨批）。
+         * 返回 [start, row) 的逻辑行范围；组是否还有后续行由调用方按「批尾 + 同 key」判断。
+         */
+        List<int[]> collectKeyChunk() {
             int start = row;
             Object k = currentKey();
             while (row < rowCount && readAndEqual(k)) row++;
-            List<int[]> ranges = new ArrayList<>();
+            List<int[]> ranges = new ArrayList<>(1);
             ranges.add(new int[]{start, row});
             return ranges;
         }
 
-        boolean ensureMore() {
-            if (row < rowCount) return true;
-            return nextBatch();
+        /** 当前 batch 是否已消费到尾（尾后接下一批或已结束）。 */
+        boolean atBatchEnd() {
+            return row >= rowCount;
+        }
+
+        /** 迭代器是否还有当前行（尚未耗尽）。 */
+        boolean hasCurrentRow() {
+            if (sortedIndices != null) return row < rowCount;
+            return currentRoot != null && row < rowCount;
+        }
+
+        /** 记录当前位置（跨批 key 组重扫用）。 */
+        Mark mark() {
+            return new Mark(fileIdx, sliceFirstBlock, row);
+        }
+
+        /**
+         * 回到 {@link #mark()}：文件模式下若当前切片就是 mark 所在切片，直接复位行游标（不读盘）；
+         * 否则关闭当前切片并从 mark 的起始 block 重新加载（组跨批时右组需要被重扫）。
+         */
+        void rewind(Mark mark) {
+            if (inMemory || sortedIndices != null) {
+                row = mark.row;
+                return;
+            }
+            if (currentRoot != null && fileIdx == mark.fileIdx
+                    && sliceFirstBlock == mark.sliceFirstBlock) {
+                row = mark.row;
+                return;
+            }
+            if (currentRoot != null) {
+                currentRoot.close();
+                currentRoot = null;
+            }
+            fileIdx = mark.fileIdx;
+            nextBlock = mark.sliceFirstBlock;
+            fileDone = false;
+            FileSlice slice = loadArrowFileSlice(
+                    pa.batchFiles.get(fileIdx), allocator, mark.sliceFirstBlock, LOAD_BATCH_ROWS);
+            if (slice == null || slice.root() == null) {
+                row = 0;
+                rowCount = 0;
+                return;
+            }
+            sliceFirstBlock = mark.sliceFirstBlock;
+            nextBlock = slice.nextBlock();
+            fileDone = slice.done();
+            currentRoot = slice.root();
+            row = mark.row;
+            rowCount = currentRoot.getRowCount();
         }
 
         private boolean readAndEqual(Object k) {
@@ -626,8 +849,7 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
     }
 
     /** 输出左孤儿行（LEFT/FULL join） */
-    private void outputOrphanRows(FileIterator left, List<int[]> lRows,
-                                   FileIterator right, int rCols, JoinOutputBuffer buf) {
+    private void outputOrphanRows(FileIterator left, List<int[]> lRows, JoinOutputBuffer buf) {
         for (int[] range : lRows) {
             for (int li = range[0]; li < range[1]; li++) {
                 buf.appendLeftOrphanRow(left, left.physicalRow(li));
@@ -654,7 +876,9 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
                                   boolean isLeft, int pid, JoinOutputBuffer buf) {
         FileIterator fi = createIterator(pa, keyIdx);
         while (fi.nextBatch()) {
+            checkCancelled();
             while (fi.row < fi.rowCount) {
+                checkCancelled();
                 int phys = fi.physicalRow(fi.row);
                 if (isLeft) buf.appendLeftOrphanRow(fi, phys);
                 else buf.appendRightOrphanRow(fi, phys);
@@ -677,8 +901,7 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
     }
 
     /** 输出右孤儿行（RIGHT/FULL join） */
-    private void outputOrphanRight(FileIterator right, List<int[]> rRows,
-                                    int lCols, JoinOutputBuffer buf) {
+    private void outputOrphanRight(FileIterator right, List<int[]> rRows, JoinOutputBuffer buf) {
         for (int[] range : rRows) {
             for (int ri = range[0]; ri < range[1]; ri++) {
                 buf.appendRightOrphanRow(right, right.physicalRow(ri));
@@ -735,9 +958,9 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
     /**
      * 单次回读的最大行数（≈ 一个 {@link JoinSortOperator} 输出批）。
      *
-     * <p>JoinSort 的 block 只在 key 组边界切出（{@code mergeOneRound}），因此按 block 切片
-     * 不会把同一个 join key 组拆到两个切片里 —— {@code collectCurrentKeyGroup} 的「组不跨批」
-     * 前提仍然成立。</p>
+     * <p>JoinSort 的 block 只按缓冲大小切出（{@code mergeOneRound}），<b>同一个 join key 组可以跨
+     * 多个 block / 多个切片</b>（热键组的行数不设上限）。消费端必须用 {@code collectKeyChunk} +
+     * 「批尾且下一批同 key 则继续」的游标，不能假设组不跨批。</p>
      */
     private static final int LOAD_BATCH_ROWS = 50_000;
 
@@ -887,10 +1110,11 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
         Map<Integer, VectorSchemaRoot> leftCache = new LinkedHashMap<>();
         Map<Integer, VectorSchemaRoot> rightCache = new LinkedHashMap<>();
 
+        JoinOutputBuffer buf = new JoinOutputBuffer(pid);
+        boolean ok = false;
         try {
-            JoinOutputBuffer buf = new JoinOutputBuffer(pid);
-
             for (int start = 0; start < allKeys.size(); start += KEYS_PER_BATCH) {
+                checkCancelled();
                 int end = Math.min(start + KEYS_PER_BATCH, allKeys.size());
                 List<Object> keyBatch = allKeys.subList(start, end);
 
@@ -901,6 +1125,7 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
                 }
 
                 for (Object key : keyBatch) {
+                    checkCancelled();
                     List<Segment> ls = leftIdx.get(key);
                     List<Segment> rs = rightIdx.get(key);
 
@@ -922,7 +1147,9 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
                 buf.flushIfNeeded();
             }
             buf.flush();
+            ok = true;
         } finally {
+            if (!ok) buf.discard();   // 取消 / 失败：在途输出批未成页，必须显式关闭
             for (VectorSchemaRoot r : leftCache.values()) closeQuietly(r);
             for (VectorSchemaRoot r : rightCache.values()) closeQuietly(r);
         }
@@ -1559,6 +1786,18 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
             for (FieldVector v : outVectors) fields.add(v.getField());
             emit(Page.partitioned(
                     new VectorSchemaRoot(fields, new ArrayList<>(outVectors), filled), pid));
+            outVectors.clear();
+            filled = 0;
+        }
+
+        /**
+         * 丢弃在途输出批（取消 / 失败路径）—— 这些向量不属于任何 Page，也不登记在分区状态里，
+         * 不走 flush 就必须显式关闭，否则「停止任务」后这块 Arrow 内存永不释放。
+         */
+        void discard() {
+            for (FieldVector v : outVectors) {
+                try { v.close(); } catch (Exception ignored) {}
+            }
             outVectors.clear();
             filled = 0;
         }

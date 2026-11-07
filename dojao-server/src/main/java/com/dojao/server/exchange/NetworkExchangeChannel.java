@@ -5,6 +5,7 @@ import com.dojao.core.operator.RowAccumulator;
 import com.dojao.core.operator.ShuffleReader;
 import com.dojao.core.rpc.exchange.ExchangeControl;
 import com.dojao.core.runtime.worker.ExchangeChannel;
+import com.dojao.core.runtime.worker.ExchangeLease;
 import com.dojao.core.runtime.worker.WorkerNode;
 import com.dojao.server.worker.LocalExchangeChannel;
 import org.apache.arrow.flight.FlightClient;
@@ -34,6 +35,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Worker↔Worker 数据交换通道的<b>网络实现</b> —— 跨 JVM 进程的数据页传输（Arrow Flight）。
@@ -74,14 +77,20 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
     private final Map<String, WorkerNode> remoteWorkers;
     /** 每个远程 worker 一个 FlightClient（channel 复用）。 */
     private final ConcurrentHashMap<String, FlightClient> clients = new ConcurrentHashMap<>();
-    /** 每个 (worker#exchangeId) 一条懒建立的 doExchange 流。 */
+    /**
+     * 每个 (worker, exchangeId, epoch) 一条懒建立的 doExchange 流。
+     *
+     * <p>epoch 把「代」写进键里：上一代已收尾（flusher 还在轮询宽限）的流与新一代的流是
+     * <b>不同键</b>，新一代的 send 不可能复用旧流。epoch = 0 是遗留（无租约）路径。</p>
+     */
     private final ConcurrentHashMap<String, SenderStream> streams = new ConcurrentHashMap<>();
     /**
-     * exchangeId → 仍在用该 exchange 发送流的<b>生产端</b>数量（同 Worker 上多个 Producer 片段
-     * 共用一条流）。释放必须等最后一个生产端：先跑完的片段若直接关流，并行片段后续的
-     * {@code send}/{@code complete} 会被静默吞掉 → 接收端永远等不齐发送方。
+     * exchangeId → 当前代。0→1 登记创建新代（epoch 单调递增）；最后一个租约关闭时摘除本代并
+     * 收尾该代的全部流。登记 / 归零都在同一个 key 的 {@code compute} 锁内，两代不会交错。
      */
-    private final ConcurrentHashMap<String, AtomicInteger> activeSenders = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Generation> generations = new ConcurrentHashMap<>();
+    /** 代编号（遗留无租约路径固定 0）。 */
+    private final AtomicLong nextEpoch = new AtomicLong();
     private final BufferAllocator allocator;
 
     public NetworkExchangeChannel(String selfWorkerId,
@@ -103,12 +112,71 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
             local.send(toWorkerId, exchangeId, bucketId, page);
             return;
         }
-        // 先转到本 Worker 交换共享分配器再入队：发送端算子（HashPartition 分发线程）的分配器可能
-        // 在 flusher 拷贝前被关闭（awaitDistributedDone → doClose 时序），在途页若仍挂在算子分配器上
-        // 会被 Arrow 误报内存泄漏（与 local 路径 transferTo 同款）。transferTo 跨 root 退化为逐格拷贝
-        // 并同步关闭源页，此后 flusher 只与共享分配器打交道。
+        pushData(streamForName(toWorkerId, exchangeId), exchangeId, bucketId, page);
+    }
+
+    @Override
+    public void complete(String toWorkerId, String exchangeId, int bucketId) throws InterruptedException {
+        if (isSelf(toWorkerId)) {
+            local.complete(toWorkerId, exchangeId, bucketId);
+            return;
+        }
+        pushComplete(streamForName(toWorkerId, exchangeId), exchangeId, bucketId);
+    }
+
+    @Override
+    public void fail(String toWorkerId, String exchangeId, int bucketId, Throwable cause) {
+        if (isSelf(toWorkerId)) {
+            local.fail(toWorkerId, exchangeId, bucketId, cause);
+            return;
+        }
+        try {
+            pushFail(streamForName(toWorkerId, exchangeId), exchangeId, bucketId, cause);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // ---------- 租约路径：句柄固化「哪一代流」，不再按名字查全局表 ----------
+
+    private void sendVia(Generation gen, String toWorkerId, int bucketId, Page page) throws InterruptedException {
+        if (isSelf(toWorkerId)) {
+            local.send(toWorkerId, gen.exchangeId, bucketId, page);
+            return;
+        }
+        pushData(streamFor(gen, toWorkerId), gen.exchangeId, bucketId, page);
+    }
+
+    private void completeVia(Generation gen, String toWorkerId, int bucketId) throws InterruptedException {
+        if (isSelf(toWorkerId)) {
+            local.complete(toWorkerId, gen.exchangeId, bucketId);
+            return;
+        }
+        pushComplete(streamFor(gen, toWorkerId), gen.exchangeId, bucketId);
+    }
+
+    private void failVia(Generation gen, String toWorkerId, int bucketId, Throwable cause) {
+        if (isSelf(toWorkerId)) {
+            local.fail(toWorkerId, gen.exchangeId, bucketId, cause);
+            return;
+        }
+        try {
+            pushFail(streamFor(gen, toWorkerId), gen.exchangeId, bucketId, cause);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * 数据页入队：先把页转到本 Worker 交换共享分配器再入队 —— 发送端算子的分配器可能在
+     * flusher 拷贝前被关闭（{@code awaitDistributedDone → doClose} 时序），在途页若仍挂在算子
+     * 分配器上会被 Arrow 误报内存泄漏（与 local 路径 transferTo 同款）。transferTo 跨 root 退化为
+     * 逐格拷贝并同步关闭源页，此后 flusher 只与共享分配器打交道。
+     */
+    private void pushData(SenderStream stream, String exchangeId, int bucketId, Page page)
+            throws InterruptedException {
         Page owned = page.transferTo(allocator);
-        streamFor(toWorkerId, exchangeId).push(SenderStream.Msg.data(
+        stream.push(SenderStream.Msg.data(
                 ExchangeControl.newBuilder()
                         .setExchangeId(exchangeId)
                         .setBucketId(bucketId)
@@ -119,13 +187,8 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
                 owned));
     }
 
-    @Override
-    public void complete(String toWorkerId, String exchangeId, int bucketId) throws InterruptedException {
-        if (isSelf(toWorkerId)) {
-            local.complete(toWorkerId, exchangeId, bucketId);
-            return;
-        }
-        streamFor(toWorkerId, exchangeId).push(SenderStream.Msg.control(
+    private void pushComplete(SenderStream stream, String exchangeId, int bucketId) throws InterruptedException {
+        stream.push(SenderStream.Msg.control(
                 ExchangeControl.newBuilder()
                         .setExchangeId(exchangeId)
                         .setBucketId(bucketId)
@@ -133,23 +196,15 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
                         .build()));
     }
 
-    @Override
-    public void fail(String toWorkerId, String exchangeId, int bucketId, Throwable cause) {
-        if (isSelf(toWorkerId)) {
-            local.fail(toWorkerId, exchangeId, bucketId, cause);
-            return;
-        }
-        try {
-            streamFor(toWorkerId, exchangeId).push(SenderStream.Msg.control(
-                    ExchangeControl.newBuilder()
-                            .setExchangeId(exchangeId)
-                            .setBucketId(bucketId)
-                            .setKind(ExchangeControl.Kind.FAIL)
-                            .setCause(String.valueOf(cause))
-                            .build()));
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+    private void pushFail(SenderStream stream, String exchangeId, int bucketId, Throwable cause)
+            throws InterruptedException {
+        stream.push(SenderStream.Msg.control(
+                ExchangeControl.newBuilder()
+                        .setExchangeId(exchangeId)
+                        .setBucketId(bucketId)
+                        .setKind(ExchangeControl.Kind.FAIL)
+                        .setCause(String.valueOf(cause))
+                        .build()));
     }
 
     @Override
@@ -158,37 +213,102 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
     }
 
     /**
-     * 登记一个使用该 exchange 发送流的生产端（见 {@link #release} 的引用计数说明）。
+     * 旧接口：登记一个生产端（等价于丢弃 {@link #acquireLease} 返回的句柄）。
+     *
+     * <p>新代码应使用 {@link #acquireLease}：句柄把「使用哪一代」固化下来，send/complete 不再
+     * 按 exchangeId 查全局表。保留本方法仅为兼容直接使用通道的测试 / 工具。</p>
      */
     @Override
     public void acquire(String exchangeId) {
-        if (exchangeId == null) {
-            return;
+        if (exchangeId != null) {
+            acquireGeneration(exchangeId);
         }
-        activeSenders.computeIfAbsent(exchangeId, k -> new AtomicInteger()).incrementAndGet();
     }
 
     /**
-     * 释放该 exchange 的发送流：<b>仅当本通道上最后一个生产端释放时</b>才通知各 flusher 在待发
-     * 队列排空后关闭 doExchange 读端、释放流复用根并从 {@link #streams} 摘除自己。
+     * 获取发送租约：句柄持有 exchangeId + 当前代（epoch），之后所有 send/complete/fail 都经
+     * 句柄路由。{@link #acquireGeneration} 的 0→1 转换创建<b>新的一代</b>（epoch 单调递增），
+     * 上一代已收尾但 flusher 尚未退出的流不会被新一代复用。
+     */
+    @Override
+    public ExchangeLease acquireLease(String exchangeId) {
+        if (exchangeId == null) {
+            throw new IllegalArgumentException("exchangeId 不能为空");
+        }
+        return new GenerationLease(acquireGeneration(exchangeId));
+    }
+
+    /**
+     * 登记一个生产端：0→1 = 新一代（epoch 单调递增），计数 &gt;0 时共享当前代（引用计数 +1）。
      *
-     * <p>未 {@link #acquire} 登记过的 exchange（直接使用通道的测试 / 工具）保持旧语义：立即释放。</p>
+     * <p>与 {@link #releaseGeneration} 在同一 key 的 {@code compute} 锁内，登记与归零不会交错：
+     * 要么新代看到旧代已摘除而创建新代，要么旧代看到计数仍 &gt;0 而不收尾。</p>
+     */
+    private Generation acquireGeneration(String exchangeId) {
+        return generations.compute(exchangeId, (k, g) -> {
+            if (g == null) {
+                return new Generation(exchangeId, nextEpoch.incrementAndGet());
+            }
+            g.refs.incrementAndGet();
+            return g;
+        });
+    }
+
+    /**
+     * 旧接口：释放该 exchange 的发送侧资源（兼容未使用租约的直接调用）。
+     *
+     * <p>已登记（有当前代）时等价于归还一个引用计数；未登记（直接使用通道的测试 / 工具）
+     * 保持旧语义：立即收尾该 exchange 的全部遗留流。</p>
      */
     @Override
     public void release(String exchangeId) {
         if (exchangeId == null) {
             return;
         }
-        AtomicInteger count = activeSenders.get(exchangeId);
-        if (count != null) {
-            int left = count.decrementAndGet();
-            if (left > 0) {
-                return;   // 还有生产端在用这条共享流
-            }
-            activeSenders.remove(exchangeId, count);
+        Generation g = generations.get(exchangeId);
+        if (g != null) {
+            releaseGeneration(g);
+            return;
         }
         for (SenderStream s : streams.values()) {
             if (s.exchangeId.equals(exchangeId)) {
+                s.release();
+            }
+        }
+    }
+
+    /**
+     * 归还一个租约：引用计数 -1；归零时在 {@code generations} 的 compute 锁内摘除本代（下一次
+     * 登记自然创建新 epoch），并把本代创建的流全部置为 CLOSING（不打断 flusher，它仍需把在途
+     * 消息送完；排空后自行退到 RELEASED 并从 {@link #streams} 摘除）。
+     */
+    private void releaseGeneration(Generation gen) {
+        Generation[] closed = new Generation[1];
+        generations.computeIfPresent(gen.exchangeId, (k, g) -> {
+            if (g != gen) {
+                return g;   // 本代已被替换（代只在归零后摘除，正常不会走到）
+            }
+            if (g.refs.decrementAndGet() > 0) {
+                return g;
+            }
+            // 与 streamFor 的 gen 锁配对：置位 closed 后，迟到的 send 不可能再创建新流。
+            synchronized (g) {
+                g.closed = true;
+            }
+            closed[0] = g;
+            return null;    // 摘除 → 下一次登记创建新代
+        });
+        Generation gone = closed[0];
+        if (gone == null) {
+            return;
+        }
+        List<String> keys;
+        synchronized (gone) {
+            keys = new ArrayList<>(gone.streamKeys);
+        }
+        for (String k : keys) {
+            SenderStream s = streams.get(k);
+            if (s != null) {
                 s.release();
             }
         }
@@ -203,7 +323,7 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
     public void close() {
         streams.forEach((key, stream) -> stream.close());
         streams.clear();
-        activeSenders.clear();
+        generations.clear();
         clients.forEach((workerId, client) -> {
             try {
                 client.close();
@@ -215,10 +335,55 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
 
     // ==================== 内部 ====================
 
-    private SenderStream streamFor(String toWorkerId, String exchangeId) throws InterruptedException {
-        return streams.computeIfAbsent(key(toWorkerId, exchangeId),
-                k -> new SenderStream(toWorkerId, exchangeId, clientFor(toWorkerId), allocator,
-                        s -> streams.remove(k, s)));
+    /**
+     * 取本代到目标 Worker 的发送流（epoch 在键里，上一代的流不可见）。
+     * 与 {@link #releaseGeneration} 的 closed 置位在同一 gen 锁内，杜绝「归零后新建流」的孤儿。
+     */
+    private SenderStream streamFor(Generation gen, String toWorkerId) throws InterruptedException {
+        synchronized (gen) {
+            if (gen.closed) {
+                throw new IllegalStateException("exchange 发送租约已关闭 exchangeId=" + gen.exchangeId
+                        + "：send/complete 必须在 lease.close() 之前");
+            }
+            String k = key(toWorkerId, gen.exchangeId, gen.epoch);
+            SenderStream stream = streams.computeIfAbsent(k,
+                    key -> new SenderStream(toWorkerId, gen.exchangeId, clientFor(toWorkerId), allocator,
+                            s -> streams.remove(key, s)));
+            gen.streamKeys.add(k);
+            return stream;
+        }
+    }
+
+    /**
+     * 旧接口（未持有租约的 send/complete/fail）的流选择：有当前代就用当前代（与
+     * {@link #acquire}/{@link #release} 的引用计数配对），否则用固定的 epoch = 0 遗留流。
+     *
+     * <p>当前代可能在 {@code get} 与 {@code streamFor} 之间被归零摘除 —— 此时重试：要么读到
+     * 新代，要么退到遗留路径。仍在表里却已 closed 视为真错（租约契约被破坏），原样上抛。</p>
+     */
+    private SenderStream streamForName(String toWorkerId, String exchangeId) throws InterruptedException {
+        while (true) {
+            Generation g = generations.get(exchangeId);
+            if (g == null) {
+                return legacyStreamFor(toWorkerId, exchangeId);
+            }
+            try {
+                return streamFor(g, toWorkerId);
+            } catch (IllegalStateException e) {
+                if (generations.get(exchangeId) == g) {
+                    throw e;
+                }
+                // 代刚归零并被摘除：重试（新代 / 遗留流）
+            }
+        }
+    }
+
+    /** 遗留路径（未使用租约的 send/complete/fail）：固定 epoch = 0。 */
+    private SenderStream legacyStreamFor(String toWorkerId, String exchangeId) throws InterruptedException {
+        String k = key(toWorkerId, exchangeId, 0L);
+        return streams.computeIfAbsent(k,
+                key -> new SenderStream(toWorkerId, exchangeId, clientFor(toWorkerId), allocator,
+                        s -> streams.remove(key, s)));
     }
 
     private FlightClient clientFor(String toWorkerId) {
@@ -237,8 +402,72 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
                 .build();
     }
 
-    private static String key(String toWorkerId, String exchangeId) {
-        return toWorkerId + "\u0000" + exchangeId;
+    private static String key(String toWorkerId, String exchangeId, long epoch) {
+        return toWorkerId + "\u0000" + exchangeId + "\u0000" + epoch;
+    }
+
+    /**
+     * 一次登记代际：exchangeId + epoch + 租约引用计数 + 本代创建的流键。
+     *
+     * <p>{@code closed} 由 {@code gen} 监视器保护（{@link #streamFor} 在锁内检查，
+     * {@link #releaseGeneration} 在锁内置位），保证归零后不会再有新流被创建。</p>
+     */
+    private static final class Generation {
+        final String exchangeId;
+        final long epoch;
+        final AtomicInteger refs = new AtomicInteger(1);
+        final Set<String> streamKeys = ConcurrentHashMap.newKeySet();
+        boolean closed;
+
+        Generation(String exchangeId, long epoch) {
+            this.exchangeId = exchangeId;
+            this.epoch = epoch;
+        }
+    }
+
+    /**
+     * 发送租约：把「使用哪一代」固化在句柄里。关闭幂等；关闭后 send/complete/fail 立即 fail-fast
+     * （不会再把消息塞进无消费者的队列，也不会误用下一代 / 上一代的流）。
+     */
+    private final class GenerationLease implements ExchangeLease {
+        private final Generation gen;
+        private final AtomicBoolean closed = new AtomicBoolean();
+
+        GenerationLease(Generation gen) {
+            this.gen = gen;
+        }
+
+        @Override
+        public void send(String toWorkerId, int bucketId, Page page) throws InterruptedException {
+            requireOpen();
+            sendVia(gen, toWorkerId, bucketId, page);
+        }
+
+        @Override
+        public void complete(String toWorkerId, int bucketId) throws InterruptedException {
+            requireOpen();
+            completeVia(gen, toWorkerId, bucketId);
+        }
+
+        @Override
+        public void fail(String toWorkerId, int bucketId, Throwable cause) {
+            requireOpen();
+            failVia(gen, toWorkerId, bucketId, cause);
+        }
+
+        @Override
+        public void close() {
+            if (closed.compareAndSet(false, true)) {
+                releaseGeneration(gen);
+            }
+        }
+
+        private void requireOpen() {
+            if (closed.get()) {
+                throw new IllegalStateException("exchange 发送租约已关闭 exchangeId=" + gen.exchangeId
+                        + "（epoch=" + gen.epoch + "）：send/complete 必须在 lease.close() 之前");
+            }
+        }
     }
 
     /**
@@ -316,8 +545,21 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
         private final AtomicBoolean closed = new AtomicBoolean();
         /** 读写双子是否已关闭（flusher 收尾与 Worker 停止可能并发，只关一次）。 */
         private final AtomicBoolean streamClosed = new AtomicBoolean();
-        /** 生产端已收尾（不会再有新的 send/complete/fail）：队列排空后 flusher 自行退出并清理。 */
-        private volatile boolean released;
+        /**
+         * 发送流显式状态机：{@link State#OPEN}（接受 send/complete）→ {@link State#CLOSING}
+         * （最后一个租约已归还；拒绝新消息，flusher 排空在途消息）→ {@link State#RELEASED}
+         * （flusher 已退出、root/读端已释放、已从通道摘除）。
+         *
+         * <p>只有 CLOSING/RELEASED 才是「不可能再接受消息」；判定必须与 {@link #inFlightPushers}
+         * 配合 —— 见 {@link #drain()} 的退出条件。</p>
+         */
+        private enum State { OPEN, CLOSING, RELEASED }
+        private final AtomicReference<State> state = new AtomicReference<>(State.OPEN);
+        /**
+         * 正在 push 中（已通过 OPEN 检查、尚未完成入队）的线程数。flusher 只有在它归零后才退出，
+         * 否则「检查 OPEN → release 置 CLOSING → flusher 判空退出 → 该线程才入队」的窗口会丢消息。
+         */
+        private final AtomicInteger inFlightPushers = new AtomicInteger();
         /** flusher 收尾后回调（从通道的 streams 表摘除自己，避免按查询次数累积流 / root / 线程）。 */
         private final java.util.function.Consumer<SenderStream> onClosed;
         private final Thread flusher;
@@ -368,23 +610,35 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
          * 终端 Aggregate 挂起 10 分钟才被看门狗发现（线上「已收 4/6 个完成」）。</p>
          */
         void push(Msg msg) throws InterruptedException {
-            while (true) {
-                Throwable f = failure;
-                if (f != null) {
-                    closePage(msg);
-                    throw new RuntimeException("exchange 流已失败 toWorkerId=" + toWorkerId + "#" + exchangeId, f);
+            // 快路径拒绝：状态机已离开 OPEN。
+            State initial = state.get();
+            if (initial != State.OPEN) {
+                closePage(msg);
+                throw rejected(initial);
+            }
+            // 登记「push 进行中」：flusher 的退出条件会把这段窗口包含进去，杜绝在途消息被丢。
+            inFlightPushers.incrementAndGet();
+            try {
+                while (true) {
+                    Throwable f = failure;
+                    if (f != null) {
+                        closePage(msg);
+                        throw new RuntimeException("exchange 流已失败 toWorkerId=" + toWorkerId + "#" + exchangeId, f);
+                    }
+                    // 状态机已进入 CLOSING/RELEASED：不允许再入队（生产端生命周期错配 / 取消竞态）。
+                    // fail-fast 优于把消息塞进无 flusher 的有界队列后永久阻塞（接收端也因此
+                    // 永远等不齐发送方）。
+                    State st = state.get();
+                    if (st != State.OPEN) {
+                        closePage(msg);
+                        throw rejected(st);
+                    }
+                    if (pending.offer(msg, 100, TimeUnit.MILLISECONDS)) {
+                        break;
+                    }
                 }
-                // 流已释放 = 最后一个生产端已收尾；此处仍有 send/complete 说明生产端生命周期错配
-                // （另一个片段提前释放了共享流 / 取消路径与发送竞态）。fail-fast 优于把消息塞进
-                // 无 flusher 的有界队列后永久阻塞（接收端也因此永远等不齐发送方）。
-                if (released) {
-                    closePage(msg);
-                    throw new IllegalStateException("exchange 发送流已释放 toWorkerId=" + toWorkerId
-                            + "#" + exchangeId + "：send/complete 必须在 release 之前");
-                }
-                if (pending.offer(msg, 100, TimeUnit.MILLISECONDS)) {
-                    break;
-                }
+            } finally {
+                inFlightPushers.decrementAndGet();
             }
             CountDownLatch ack = msg.ack();
             if (ack == null) {
@@ -417,8 +671,13 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
                 while (true) {
                     Msg msg = pending.poll(100, TimeUnit.MILLISECONDS);
                     if (msg == null) {
-                        // 生产端已收尾且队列排空 → flusher 退出（finally 里收尾流、释放 root、摘除自己）。
-                        if (pending.isEmpty() && (released || closed.get())) {
+                        // 生产端已收尾（CLOSING/RELEASED）或通道停止，且「队列排空 + 没有 push 正在
+                        // 入队」→ flusher 退出（finally 里收尾流、释放 root、摘除自己）。
+                        // 必须等 inFlightPushers 归零：否则「push 通过 OPEN 检查 → release 置 CLOSING
+                        // → flusher 判空退出 → push 才入队」的窗口会丢消息。
+                        State st = state.get();
+                        if (pending.isEmpty() && inFlightPushers.get() == 0
+                                && (st != State.OPEN || closed.get())) {
                             break;
                         }
                         // 2s 宽限兜底：流一直未启动（只有 COMPLETE 的空 slice 流）且队列已空持续超时
@@ -459,6 +718,8 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             } finally {
+                // flusher 退出 = 状态机终点（此后 push 一律 fail-fast）。
+                state.set(State.RELEASED);
                 boolean halfClosed = false;
                 try {
                     // 流关闭兜底：仍有未启动流的暂存 COMPLETE（本 exchange 全程无 DATA）→ 空 schema 补发
@@ -683,9 +944,17 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
             listener.putNext(metaBuf);   // 同步序列化 + gRPC 流控背压（阻塞）
         }
 
-        /** 生产端收尾：待发队列排空后 flusher 自行完成流、释放 root 并从通道摘除。 */
+        /**
+         * 生产端收尾：OPEN → CLOSING。之后不再接受新消息；flusher 把已入队的在途消息送完后
+         * 自行完成流、释放 root、退到 RELEASED 并从通道摘除。幂等。
+         */
         void release() {
-            released = true;
+            state.compareAndSet(State.OPEN, State.CLOSING);
+        }
+
+        private IllegalStateException rejected(State st) {
+            return new IllegalStateException("exchange 发送流已释放（" + st + "）toWorkerId=" + toWorkerId
+                    + "#" + exchangeId + "：send/complete 必须在 release 之前");
         }
 
         void close() {

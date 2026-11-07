@@ -419,7 +419,7 @@ function doSubmitQuery(raw) {
     sqlBatchCount = sqlStatementCount(raw);   // >1 = 引擎侧按分号切分后串行执行
     var btn = document.getElementById('submit-btn');
     if (btn) btn.disabled = true;
-    // 记住「是哪个控制台提交的」：POST 在途时用户可能切走，返回时不能把结果画到新控制台
+    // 记住「是哪个控制台提交的」：POST 在途时用户可能切走，结果仍要能回到发起它的控制台
     var ownerId = (typeof activeConsoleId !== 'undefined') ? activeConsoleId : null;
     // 提交那一刻就进入「运行中」：POST 到 Master 也要一个往返，这段空窗里若画面完全静止，
     // 用户会怀疑「到底点上了没」。圆圈立刻转起来 = 明确的「已经在跑了」。
@@ -427,23 +427,42 @@ function doSubmitQuery(raw) {
     scrollResultIntoView();
     httpPost('/api/query', { sql: sent.sql })
         .then(function (r) {
-            if (typeof activeConsoleId !== 'undefined' && activeConsoleId !== ownerId) { refreshAll(); return; }
+            // 控制台已被关闭：查询仍在服务端跑，但结果已无处展示
+            var owner = (typeof findConsole === 'function') ? findConsole(ownerId) : null;
+            if (!owner) { refreshAll(); return; }
             if (r.state === 'FAILED' || r.state === 'REJECTED') {
-                errEl.textContent = '提交失败：' + (r.message || '未知错误');
-                finishSqlPreview();
-                var note = document.getElementById('sql-result-note');
-                if (note) { note.textContent = '提交失败'; note.style.color = UI.err; }
+                var p = consolePreview(owner);
+                p.submitPending = false;
+                p.running = false;
+                p.elapsedMs = Date.now() - p.startMs;
+                p.lastError = '提交失败：' + (r.message || '未知错误');
+                if (ownerId === activeConsoleId) {
+                    if (errEl) errEl.textContent = p.lastError;
+                    renderActivePreview();
+                }
+                maybeStopSqlTickTimer();
             } else {
                 // 注意：不清空输入框 —— 提交后 SQL 要留在编辑器里，便于改参数重跑
-                startSqlPreview(r.queryId);
+                startSqlPreview(r.queryId, ownerId);
             }
             refreshAll();
         })
         .catch(function (err) {
-            if (typeof activeConsoleId !== 'undefined' && activeConsoleId !== ownerId) return;
-            errEl.textContent = '提交失败：' + oneLine(err && err.message ? err.message : err, 120);
-            finishSqlPreview();
-            if (err && err.status === 503) setBanner('控制台未绑定查询监控（独立预览模式），SQL 执行不可用。');
+            var owner = (typeof findConsole === 'function') ? findConsole(ownerId) : null;
+            if (!owner) return;
+            var p = consolePreview(owner);
+            p.submitPending = false;
+            p.running = false;
+            p.elapsedMs = Date.now() - p.startMs;
+            p.lastError = '提交失败：' + oneLine(err && err.message ? err.message : err, 120);
+            if (ownerId === activeConsoleId) {
+                if (errEl) errEl.textContent = p.lastError;
+                if (err && err.status === 503) {
+                    setBanner('控制台未绑定查询监控（独立预览模式），SQL 执行不可用。');
+                }
+                renderActivePreview();
+            }
+            maybeStopSqlTickTimer();
         })
         .finally(function () { if (btn) btn.disabled = false; });
 }
@@ -451,7 +470,7 @@ function doSubmitQuery(raw) {
 function cancelSqlQuery() {
     if (!sqlQueryId) return;
     httpPost('/api/query/' + encodeURIComponent(sqlQueryId) + '/cancel').catch(function () { });
-    // 状态由 pollSqlResult 更新
+    // 状态由该控制台的 pollConsoleResult 更新
 }
 
 /** 任务列表：手动终止一个任务（仅 RUNNING/SUBMITTED 显示入口）。 */
@@ -527,70 +546,114 @@ function scrollResultIntoView() {
 }
 
 // ---------------- 结果预览：提交 → 「计算中」计时 → 结果表格 ----------------
+//
+// 状态归属：结果预览属于「发起查询的那个控制台」。
+//   - 每个控制台持有自己的 preview 模型（见 sql-console.js 的 makeConsolePreview）与自己的
+//     轮询定时器（sqlPreviewPolls[consoleId]）；
+//   - 全局 sqlQueryId / sqlLastResult / sqlSortCol … 只是「当前显示中」那个控制台的镜像，
+//     供导出 / 复制 / 排序 / 报错卡片这些只管界面的功能读取；
+//   - 切标签 = capture 旧控制台的界面态 → 切换 → restore 新控制台的预览，**不停任何轮询**。
+//
+// 旧实现把状态全放全局、切标签整块 reset：切走就丢了 queryId 与轮询，服务端却还在跑，
+// 跑完结果再也回不到页面（静默丢结果）。
+
+/** consoleId → 结果预览轮询定时器（每个控制台独立；切标签不停）。 */
+var sqlPreviewPolls = {};
+
+/** 取某控制台的 preview 模型（没有就懒建）。 */
+function consolePreview(c) {
+    if (!c) return null;
+    if (!c.preview && typeof makeConsolePreview === 'function') c.preview = makeConsolePreview();
+    return c.preview || null;
+}
+
+/** 当前激活控制台的 preview。 */
+function activePreview() {
+    return (typeof activeConsole === 'function') ? consolePreview(activeConsole()) : null;
+}
+
+/** 停某个控制台的结果轮询（不动其它控制台，也不改 preview 数据）。 */
+function stopPreviewPoll(consoleId) {
+    if (!consoleId) return;
+    var t = sqlPreviewPolls[consoleId];
+    if (t) { clearInterval(t); delete sqlPreviewPolls[consoleId]; }
+}
+
+/** 是否还有控制台在跑（决定 100ms 计时器要不要留着）。 */
+function anyPreviewRunning() {
+    var any = false;
+    (typeof consoles !== 'undefined' ? consoles : []).forEach(function (c) {
+        if (c && c.preview && c.preview.running) any = true;
+    });
+    return any;
+}
+
+function ensureSqlTickTimer() {
+    if (sqlTickTimer) return;
+    sqlTickTimer = setInterval(tickSqlElapsed, 100);
+}
+
+function maybeStopSqlTickTimer() {
+    if (!anyPreviewRunning() && sqlTickTimer) {
+        clearInterval(sqlTickTimer);
+        sqlTickTimer = null;
+    }
+}
 
 /**
  * 点「运行」的瞬间：把结果区切成「运行中」——圆圈转起来、计时跑起来。
  *
  * <p>这一步发生在 POST 之前，所以后端还没返回 queryId。轮询要等拿到 queryId 才起
- * （见 {@link startSqlPreview}），这里只负责视觉与计时。</p>
+ * （见 {@link startSqlPreview}），这里只负责模型与视觉。</p>
  */
 function beginSqlSubmit() {
-    stopSqlPreview();                 // 上一条的轮询 / 计时作废
-    sqlStartMs = Date.now();          // 计时从「点击」那刻起，而不是从拿到 queryId 起
-    sqlElapsedMs = 0;
+    var c = activeConsole();
+    var p = consolePreview(c);
+    if (!p) return;
+    if (c) stopPreviewPoll(c.id);     // 同一控制台重跑：旧查询的轮询作废（服务端仍在跑）
+    p.queryId = null;
+    p.submitPending = true;
+    p.running = true;
+    p.startMs = Date.now();           // 计时从「点击」那刻起，而不是从拿到 queryId 起
+    p.elapsedMs = 0;
+    p.errStreak = 0;
     // 新查询 = 新结果集：清掉上一条的排序状态，否则会「莫名其妙按上一列排着」
-    sqlSortCol = -1;
-    sqlSortDir = 0;
-    sqlLastResult = null;
+    p.sortCol = -1;
+    p.sortDir = 0;
+    p.lastResult = null;
+    p.lastError = '';
+    p.lastErrorDetail = '';
     sqlChartReset();                  // 结果换新：收起并销毁上一张图表
-    var box = document.getElementById('sql-result');
-    if (box) box.style.display = 'block';
-    var splitter = document.getElementById('sql-splitter');
-    if (splitter) splitter.style.display = 'block';   // 有结果才给高度调节把手
-    sqlErrStreak = 0;
-    sqlRunning = true;
-    setSqlRunning(true);
-    var idEl = document.getElementById('sql-result-id');
-    if (idEl) idEl.textContent = '';   // 清掉上一条的 queryId，免得新旧混淆（拿到新 id 由轮询补上）
-    var badge = document.getElementById('sql-result-badge');
-    if (badge) { badge.textContent = 'SUBMITTED'; badge.className = 'status-badge queued'; }
-    var note = document.getElementById('sql-result-note');
-    if (note) { note.textContent = '提交中\u2026'; note.style.color = ''; }
-    renderSqlTable({ state: 'RUNNING', columns: [], rows: [], totalRows: 0 });
-    tickSqlElapsed();
-    sqlTickTimer = setInterval(tickSqlElapsed, 100);
+    renderActivePreview();
+    ensureSqlTickTimer();
 }
 
 /**
- * 拿到 queryId 后接上结果轮询。
+ * 拿到 queryId 后接上结果轮询（绑定到发起它的控制台，即使用户已切走）。
  *
- * <p>{@link beginSqlSubmit} 已经摆好了「运行中」的样子（含计时器），此处不重置，
+ * <p>{@link beginSqlSubmit} 已经摆好了「运行中」的样子（含计时），此处不重置，
  * 只补上轮询 —— 否则计时会从「拿到 queryId」重新开始，肉眼看到时间往回跳。</p>
+ *
+ * @param {string} queryId
+ * @param {string} [consoleId] 发起查询的控制台（缺省 = 当前激活）
  */
-function startSqlPreview(queryId) {
-    if (sqlPollTimer) { clearInterval(sqlPollTimer); sqlPollTimer = null; }
-    sqlQueryId = queryId;
-    sqlErrStreak = 0;
-    if (!sqlRunning) {
-        // 兜底：直接进结果页（如从别处调用）时也要有完整的「运行中」形态
-        sqlStartMs = Date.now();
-        sqlRunning = true;
-        setSqlRunning(true);
-        tickSqlElapsed();
-        if (sqlTickTimer) clearInterval(sqlTickTimer);
-        sqlTickTimer = setInterval(tickSqlElapsed, 100);
-    }
-    var note = document.getElementById('sql-result-note');
-    if (note) { note.textContent = ''; note.style.color = ''; }
-    pollSqlResult();
-    sqlPollTimer = setInterval(pollSqlResult, 1000);
-}
-
-function stopSqlPreview() {
-    if (sqlPollTimer) { clearInterval(sqlPollTimer); sqlPollTimer = null; }
-    if (sqlTickTimer) { clearInterval(sqlTickTimer); sqlTickTimer = null; }
-    sqlQueryId = null;
-    sqlRunning = false;
+function startSqlPreview(queryId, consoleId) {
+    if (!consoleId && typeof activeConsoleId !== 'undefined') consoleId = activeConsoleId;
+    var c = (typeof findConsole === 'function') ? findConsole(consoleId) : null;
+    if (!c) return;
+    var p = consolePreview(c);
+    if (!p) return;
+    stopPreviewPoll(consoleId);
+    p.queryId = queryId;
+    p.submitPending = false;
+    p.running = true;
+    p.errStreak = 0;
+    if (!p.startMs) p.startMs = Date.now();
+    ensureSqlTickTimer();
+    if (consoleId === activeConsoleId) renderActivePreview();
+    // 先立刻打一拍（拿到首帧不等 1s），再挂该控制台自己的轮询
+    pollConsoleResult(consoleId);
+    sqlPreviewPolls[consoleId] = setInterval(function () { pollConsoleResult(consoleId); }, 1000);
 }
 
 /** 计算中 / 结束 的视觉切换（转圈 + 计时 + 取消按钮）。 */
@@ -603,36 +666,126 @@ function setSqlRunning(running) {
 
 /** 100ms 刷新一次「计算中」计时（毫秒 → min/s/h 分级，见 fmtDuration）。 */
 function tickSqlElapsed() {
+    var p = activePreview();
     var el = document.getElementById('sql-elapsed');
     if (!el) return;
-    if (!sqlRunning) return;          // 按状态而非 queryId 判活：提交在途时也照常计时
-    var ms = Date.now() - sqlStartMs;
-    el.textContent = '\u23f1 ' + fmtDuration(ms);
+    if (!p || !p.running) { maybeStopSqlTickTimer(); return; }   // 提交在途 / 运行中都照常计时
+    el.textContent = '\u23f1 ' + fmtDuration(Date.now() - p.startMs);
     el.classList.add('running');
 }
 
-/** 查询收尾：停表、显示最终耗时。 */
-function finishSqlPreview() {
-    sqlElapsedMs = Date.now() - sqlStartMs;
-    setSqlRunning(false);
-    var el = document.getElementById('sql-elapsed');
-    if (el) {
-        el.textContent = '\u23f1 ' + fmtDuration(sqlElapsedMs);
-        el.classList.remove('running');
+/** 结果区底部提示：列数 / 行数 / 估算表大小 / 执行形态。 */
+function resultNoteText(p, r) {
+    var cols = r.columns || [];
+    var rows = r.rows || [];
+    var parts = ['\u5217 ' + cols.length, '\u884c ' + fmtRows(r.totalRows)];
+    // 表数据量（连接器元数据估算，非精确 count）：单表查询时告诉用户「这张表大概多大」
+    if (r.sourceRows > 0) {
+        parts.push('\u8868\u6570\u636e\u91cf \u2248 ' + fmtRows(r.sourceRows) + ' \u884c\uff08\u4f30\uff09');
     }
-    stopSqlPreview();
+    if (p && p.ranSelection) {
+        parts.push('\u4ec5\u6267\u884c\u9009\u4e2d\u7247\u6bb5');
+    }
+    if (p && p.autoLimited) {
+        parts.push('\u5df2\u81ea\u52a8\u8865 limit ' + SQL_PREVIEW_LIMIT);
+    }
+    if (p && p.batchCount > 1) {
+        parts.push('\u6279\u91cf ' + p.batchCount + ' \u6761 \u00b7 \u4e32\u884c\u6267\u884c');
+    }
+    if (r.truncated) {
+        parts.push('\u4ec5\u9884\u89c8\u524d ' + rows.length + ' \u884c\uff08\u5df2\u622a\u65ad\uff09');
+    }
+    return parts.join(' \u00b7 ');
 }
 
 /**
- * 清空结果区及其全部状态（切换 / 关闭查询控制台时调用）。
+ * 把当前激活控制台的 preview 整块画到结果区（切换回该控制台 / 轮询更新共用）。
  *
- * <p>结果不跨控制台恢复：切走即清场 —— 否则会出现「切到 B，却还留着 A 的结果 / 报错」的错乱。
- * 正在跑的查询仍在服务端继续（此处只是停掉本地轮询），不打断它。</p>
+ * <p>只读模型、不碰任何轮询句柄 —— 轮询属于控制台，与「现在显示谁」解耦。</p>
  */
-function resetSqlResultUi() {
-    stopSqlPreview();
+function renderActivePreview() {
+    var p = activePreview();
+    var hasUi = !!(p && (p.queryId || p.submitPending || p.running || p.lastResult || p.lastError));
+    if (!hasUi) { clearSqlResultDom(); return; }
+
+    // 全局镜像：导出 / 复制 / 排序 / 报错卡片读这些
+    sqlQueryId = p.queryId;
+    sqlRunning = !!p.running;
+    sqlStartMs = p.startMs;
+    sqlElapsedMs = p.elapsedMs;
+    sqlErrStreak = p.errStreak;
+    sqlSortCol = p.sortCol;
+    sqlSortDir = p.sortDir;
+    sqlTransposed = !!p.transposed;
+    sqlLastResult = p.lastResult;
+    lastSqlText = p.lastSqlText;
+    sqlRanSelection = p.ranSelection;
+    sqlAutoLimited = p.autoLimited;
+    sqlBatchCount = p.batchCount;
+    lastSqlError = p.lastError;
+    lastSqlErrorDetail = p.lastErrorDetail;
+
+    var box = document.getElementById('sql-result');
+    if (box) box.style.display = 'block';
+    var splitter = document.getElementById('sql-splitter');
+    if (splitter) splitter.style.display = 'block';   // 有结果才给高度调节把手
+
+    var idEl = document.getElementById('sql-result-id');
+    if (idEl) idEl.textContent = p.queryId ? midStr(p.queryId, 16) : '';
+
+    var state = p.lastResult ? (p.lastResult.state || '?')
+        : (p.submitPending ? 'SUBMITTED' : (p.running ? 'RUNNING' : '?'));
+    var badge = document.getElementById('sql-result-badge');
+    if (badge) { badge.textContent = state; badge.className = 'status-badge ' + stCls(state); }
+
+    var el = document.getElementById('sql-elapsed');
+    if (el) {
+        if (p.running) {
+            el.textContent = '\u23f1 ' + fmtDuration(Date.now() - p.startMs);
+            el.classList.add('running');
+        } else if (p.elapsedMs > 0) {
+            el.textContent = '\u23f1 ' + fmtDuration(p.elapsedMs);
+            el.classList.remove('running');
+        } else {
+            el.textContent = '';
+            el.classList.remove('running');
+        }
+    }
+    setSqlRunning(!!p.running);
+    if (p.running) ensureSqlTickTimer();
+
+    var note = document.getElementById('sql-result-note');
+    if (note) {
+        if (!p.lastResult && p.lastError) {
+            // 提交失败时编辑器上方已显示完整原因，这里不重复长文案
+            var errEl = document.getElementById('query-error');
+            var shownAbove = !!(errEl && errEl.textContent === p.lastError);
+            note.textContent = shownAbove ? '提交失败' : p.lastError;
+            note.style.color = UI.err;
+        } else if (!p.lastResult) {
+            note.textContent = p.submitPending ? '提交中\u2026' : (p.running ? '\u6b63\u5728\u8ba1\u7b97\u2026' : '');
+            note.style.color = '';
+        } else {
+            // 报错不在这里重复：失败由中部「查询出错」卡片统一呈现（含复制 / AI 修复）
+            note.textContent = resultNoteText(p, p.lastResult);
+            note.style.color = '';
+        }
+    }
+
+    if (p.lastResult) {
+        renderSqlTable(p.lastResult);
+    } else {
+        renderSqlTable({ state: p.running || p.submitPending ? 'RUNNING' : '?', columns: [], rows: [], totalRows: 0 });
+    }
+}
+
+/** 清空结果区 DOM 与全局镜像（不动任何控制台的 preview / 轮询）。 */
+function clearSqlResultDom() {
+    sqlQueryId = null;
+    sqlRunning = false;
     sqlSortCol = -1;
     sqlSortDir = 0;
+    sqlTransposed = false;
     sqlLastResult = null;
     sqlElapsedMs = 0;
     sqlErrStreak = 0;
@@ -640,7 +793,6 @@ function resetSqlResultUi() {
     sqlRanSelection = false;
     sqlAutoLimited = false;
     sqlBatchCount = 0;
-    sqlChartReset();
 
     var box = document.getElementById('sql-result');
     if (box) box.style.display = 'none';
@@ -663,64 +815,93 @@ function resetSqlResultUi() {
     syncResultTools();
 }
 
-function pollSqlResult() {
-    var queryId = sqlQueryId;
-    if (!queryId) return;
+/**
+ * 切走前把「只存在于界面」的状态回写到当前控制台（目前只有表头排序）。
+ * queryId / running / lastResult / 报错由各自的轮询线程直接维护，不在这里覆盖。
+ */
+function captureSqlResultUi() {
+    var p = activePreview();
+    if (!p) return;
+    p.sortCol = sqlSortCol;
+    p.sortDir = sqlSortDir;
+    p.transposed = sqlTransposed;
+}
+
+/** 切回某控制台：恢复它的结果区（顶部临时错误不跨控制台，图表按新结果重建）。 */
+function restoreSqlResultUi() {
+    var errEl = document.getElementById('query-error');
+    if (errEl) errEl.textContent = '';
+    sqlChartReset();
+    renderActivePreview();
+}
+
+/**
+ * 重置当前控制台的结果预览（显式清场；切标签<b>不再</b>调用本函数）。
+ * 该控制台在服务端的查询不会被取消，只是不再展示 —— 需要取消请点「取消」。
+ */
+function resetSqlResultUi() {
+    var c = activeConsole();
+    if (c) {
+        stopPreviewPoll(c.id);
+        if (typeof makeConsolePreview === 'function') c.preview = makeConsolePreview();
+    }
+    sqlChartReset();
+    clearSqlResultDom();
+    maybeStopSqlTickTimer();
+}
+
+/**
+ * 轮询某个控制台的查询结果。控制台被关闭、或该控制台又提交了新查询时，
+ * 迟到的响应一律丢弃（用 preview 对象身份 + queryId 双重校验）。
+ */
+function pollConsoleResult(consoleId) {
+    var c = (typeof findConsole === 'function') ? findConsole(consoleId) : null;
+    var p = c ? consolePreview(c) : null;
+    if (!p || !p.queryId) return Promise.resolve();
+    var queryId = p.queryId;
     return httpGet('/api/query/' + encodeURIComponent(queryId) + '/rows?offset=0&limit=' + SQL_PREVIEW_LIMIT)
         .then(function (r) {
-            if (sqlQueryId !== queryId) return;   // 切了控制台 / 停了预览：这拍结果作废，别画到别的控制台
-            sqlErrStreak = 0;
-            var idEl = document.getElementById('sql-result-id');
-            if (idEl) idEl.textContent = midStr(r.queryId, 16);
-
-            var badge = document.getElementById('sql-result-badge');
-            if (badge) { badge.textContent = r.state || '?'; badge.className = 'status-badge ' + stCls(r.state); }
-
+            var cur = (typeof findConsole === 'function') ? findConsole(consoleId) : null;
+            if (!cur || cur.preview !== p || p.queryId !== queryId) return;   // 控制台关闭 / 查询被替换
+            p.errStreak = 0;
             var done = (r.state === 'FINISHED' || r.state === 'FAILED' || r.state === 'CANCELED');
-            if (done) finishSqlPreview();
-
-            var cols = r.columns || [];
-            var rows = r.rows || [];
-            var note = document.getElementById('sql-result-note');
-            if (note) {
-                var parts = ['\u5217 ' + cols.length, '\u884c ' + fmtRows(r.totalRows)];
-                // 表数据量（连接器元数据估算，非精确 count）：单表查询时告诉用户「这张表大概多大」
-                if (r.sourceRows > 0) {
-                    parts.push('\u8868\u6570\u636e\u91cf \u2248 ' + fmtRows(r.sourceRows) + ' \u884c\uff08\u4f30\uff09');
-                }
-                if (sqlRanSelection) {
-                    parts.push('\u4ec5\u6267\u884c\u9009\u4e2d\u7247\u6bb5');
-                }
-                if (sqlAutoLimited) {
-                    parts.push('\u5df2\u81ea\u52a8\u8865 limit ' + SQL_PREVIEW_LIMIT);
-                }
-                if (sqlBatchCount > 1) {
-                    parts.push('\u6279\u91cf ' + sqlBatchCount + ' \u6761 \u00b7 \u4e32\u884c\u6267\u884c');
-                }
-                if (r.truncated) {
-                    parts.push('\u4ec5\u9884\u89c8\u524d ' + rows.length + ' \u884c\uff08\u5df2\u622a\u65ad\uff09');
-                }
-                // 报错不在这里重复：失败由中部「查询出错」卡片统一呈现（含复制 / AI 修复）
-                note.textContent = parts.join(' \u00b7 ');
-                note.style.color = '';
+            p.lastResult = r;
+            p.running = !done;
+            p.submitPending = false;
+            if (done) {
+                p.elapsedMs = Date.now() - p.startMs;
+                stopPreviewPoll(consoleId);
+                maybeStopSqlTickTimer();
             }
-
-            renderSqlTable(r);
+            if (consoleId === activeConsoleId) renderActivePreview();
         })
         .catch(function (err) {
-            if (sqlQueryId !== queryId) return;   // 同上：迟到的失败也不该画到已切走的控制台
+            var cur = (typeof findConsole === 'function') ? findConsole(consoleId) : null;
+            if (!cur || cur.preview !== p || p.queryId !== queryId) return;
             // 不再静默吞错：把原因显示出来，否则「查了没反应」无从排查。
             // 单次抖动不清场，连续失败 SQL_ERR_STREAK_MAX 次才停表。
-            sqlErrStreak++;
-            var note = document.getElementById('sql-result-note');
+            p.errStreak++;
             var msg = oneLine(err && err.message ? err.message : err, 140);
-            if (note) { note.textContent = '结果预览获取失败：' + msg; note.style.color = UI.err; }
+            p.lastError = '结果预览获取失败：' + msg;
             if (err && err.status === 503) {
-                setBanner('控制台未绑定查询监控（独立预览模式），SQL 执行不可用。');
-                sqlErrStreak = SQL_ERR_STREAK_MAX;
+                if (consoleId === activeConsoleId) {
+                    setBanner('控制台未绑定查询监控（独立预览模式），SQL 执行不可用。');
+                }
+                p.errStreak = SQL_ERR_STREAK_MAX;
             }
-            if (sqlErrStreak >= SQL_ERR_STREAK_MAX) finishSqlPreview();
+            if (p.errStreak >= SQL_ERR_STREAK_MAX) {
+                p.running = false;
+                p.elapsedMs = Date.now() - p.startMs;
+                stopPreviewPoll(consoleId);
+                maybeStopSqlTickTimer();
+            }
+            if (consoleId === activeConsoleId) renderActivePreview();
         });
+}
+
+/** 刷新当前控制台的结果（顶栏刷新按钮 / 兼容旧调用）。 */
+function pollSqlResult() {
+    return pollConsoleResult(activeConsoleId);
 }
 
 // ---------------- 查询出错卡片：报错居中 + 复制 / AI 修复 ----------------
@@ -1242,14 +1423,13 @@ function sendAiMessage(text) {
     });
 }
 
-/** 切换发送键形态：空闲 = 「发送」；推理中 = 红色「停止」。
- *  注意用 textContent 整体替换（原按钮无子元素），不会丢图标（本按钮本就纯文本）。 */
+/** 切换发送键形态：空闲 = 圆形小飞机；推理中 = 红色方框（停止）。
+ *  图标由 CSS 按 .busy 切换，这里只改 class / 无障碍文案，不动子元素。 */
 function aiSetSendBusy(busy) {
     var btn = document.getElementById('ai-send');
     if (!btn) return;
     btn.classList.toggle('busy', !!busy);
-    btn.textContent = busy ? '停止' : '发送';
-    btn.title = busy ? '停止本次推理' : '';
+    btn.title = busy ? '停止本次推理' : '发送';
     btn.setAttribute('aria-label', busy ? '停止本次推理' : '发送');
 }
 
@@ -1535,8 +1715,39 @@ function aiUpdateLanding() {
     view.classList.toggle('ai-landing', reply.children.length === 0);
 }
 
+/**
+ * AI 代码区「复制全部」按钮（Markdown 代码块 .md-code / DDL 确认卡 .ai-confirm 共用）。
+ * 流式回答每帧重绘 innerHTML 会重建按钮，故用事件委托，按钮本身不绑事件。
+ */
+function bindAiCodeCopy() {
+    document.addEventListener('click', function (e) {
+        var btn = e.target && e.target.closest ? e.target.closest('.md-code-copy') : null;
+        if (!btn) return;
+        var box = btn.closest('.md-code') || btn.closest('.ai-confirm');
+        var pre = box ? box.querySelector('pre') : null;
+        if (!pre) return;
+        var codeEl = pre.querySelector('code') || pre;
+        var text = codeEl.textContent || '';
+        var done = function (ok) {
+            btn.textContent = ok ? '\u5df2\u590d\u5236' : '\u590d\u5236\u5931\u8d25';
+            btn.classList.toggle('copied', !!ok);
+            setTimeout(function () {
+                btn.textContent = '\u590d\u5236';
+                btn.classList.remove('copied');
+            }, 1500);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text)
+                .then(function () { done(true); }, function () { done(!!fallbackCopy(text)); });
+        } else {
+            done(!!fallbackCopy(text));
+        }
+    });
+}
+
 /** 绑定 AI 页交互：发送按钮 + Enter 发送 / Ctrl+Enter 换行 + 新对话 + 对话区滚动吸附。 */
 function bindAiChat() {
+    bindAiCodeCopy();
     var sendBtn = document.getElementById('ai-send');
     var input = document.getElementById('ai-input');
     if (sendBtn) {
@@ -1908,7 +2119,16 @@ function aiRenderConfirm(replyEl, ev) {
     box.className = 'ai-confirm';
     var head = document.createElement('div');
     head.className = 'ai-confirm-head';
-    head.textContent = '\u9700\u8981\u786e\u8ba4\uff1a\u5373\u5c06\u6267\u884c DDL';
+    var headText = document.createElement('span');
+    headText.textContent = '\u9700\u8981\u786e\u8ba4\uff1a\u5373\u5c06\u6267\u884c DDL';
+    var copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'md-code-copy';
+    copyBtn.title = '\u590d\u5236\u5168\u90e8 SQL';
+    copyBtn.setAttribute('aria-label', '\u590d\u5236\u5168\u90e8 SQL');
+    copyBtn.textContent = '\u590d\u5236';
+    head.appendChild(headText);
+    head.appendChild(copyBtn);
     var pre = document.createElement('pre');
     pre.className = 'ai-confirm-sql';
     pre.textContent = ev.sql || '';
@@ -1934,7 +2154,7 @@ function aiRenderConfirm(replyEl, ev) {
         okBtn.disabled = true;
         noBtn.disabled = true;
         box.classList.add(approve ? 'ai-confirm-approved' : 'ai-confirm-cancelled');
-        head.textContent = approve ? '\u5df2\u786e\u8ba4\u6267\u884c' : '\u5df2\u53d6\u6d88\u6267\u884c';
+        headText.textContent = approve ? '\u5df2\u786e\u8ba4\u6267\u884c' : '\u5df2\u53d6\u6d88\u6267\u884c';
         aiPendingConfirm = null;
         fetch('/api/ai/confirm', {
             method: 'POST',
@@ -2499,7 +2719,42 @@ function sqlResultView() {
             return sign * sqlValueCompare(x, y);
         });
     }
-    return { cols: names, rows: view, width: width };
+    var v = { cols: names, rows: view, width: width };
+    return sqlTransposed ? transposeSqlView(v) : v;
+}
+
+/**
+ * 列转行：把「列」变成「行」。
+ *
+ * <p>原视图 {@code 列名 | 第1行值 | 第2行值 …}；转置后每行 = 原一列：
+ * {@code 字段 | 第1行…}。行号列仍由渲染层统一添加。</p>
+ */
+function transposeSqlView(v) {
+    var cols = ['字段'];
+    for (var r = 0; r < v.rows.length; r++) cols.push('第' + (r + 1) + '行');
+    var rows = [];
+    for (var c = 0; c < v.width; c++) {
+        var out = [v.cols[c]];
+        for (var i = 0; i < v.rows.length; i++) {
+            var src = v.rows[i];
+            out.push(src && src[c] != null ? src[c] : '');
+        }
+        rows.push(out);
+    }
+    return { cols: cols, rows: rows, width: cols.length };
+}
+
+/** 切换结果区「列转行」视图（纯前端，不重跑 SQL；状态跟随控制台）。 */
+function toggleSqlTranspose() {
+    if (!sqlLastResult || !(sqlLastResult.rows || []).length) {
+        showToast('没有可转置的结果');
+        return;
+    }
+    sqlTransposed = !sqlTransposed;
+    var p = activePreview();
+    if (p) p.transposed = sqlTransposed;
+    renderSqlTable(sqlLastResult);
+    showToast(sqlTransposed ? '已列转行（再次按 Tab 恢复）' : '已恢复行列视图');
 }
 
 /** 有数据才让导出按钮可用（没结果可导）。 */
@@ -2925,6 +3180,21 @@ function copyAllResultData() {
 function bindSqlResultContextMenu() {
     var wrap = document.getElementById('sql-result-wrap');
     if (!wrap) return;
+
+    // 结果区「列转行」：在表格任意位置点过鼠标后按 Tab 切换（再按一次恢复）。
+    // 表格每秒重绘、单元格不可聚焦，故用「最后点击落在结果区」的标记 + document 级 keydown。
+    var pointerInside = false;
+    wrap.addEventListener('mousedown', function () { pointerInside = true; });
+    document.addEventListener('mousedown', function (e) {
+        if (!wrap.contains(e.target)) pointerInside = false;
+    }, true);
+    document.addEventListener('keydown', function (e) {
+        if (e.key !== 'Tab' || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+        if (!pointerInside) return;
+        e.preventDefault();            // 不把焦点移走
+        toggleSqlTranspose();
+    });
+
     wrap.addEventListener('contextmenu', function (e) {
         var t = e.target;
         if (!t || !t.closest) return;
@@ -3013,6 +3283,8 @@ function switchTab(name) {
     // 任务管理页轮询任务列表 / 集群卡片；监控页轮询资源快照 + 历史序列。切走即停。
     if (name === 'tasks') startDashboardPoll(); else stopDashboardPoll();
     if (name === 'monitor') startMonitorPoll(); else stopMonitorPoll();
+    // 回到首页：按当前控制台的 preview 即时重画（后台轮询期间可能已经跑完）
+    if (name === 'home') renderActivePreview();
     // AI 输入框在隐藏态量不到高度（scrollHeight=0），显示后按实际内容重算一次；
     // 同时把对话区滚到底，切回来直接看到最新回答。
     if (name === 'ai') {
@@ -3028,7 +3300,7 @@ function switchTab(name) {
 /** 从任务列表下钻到执行 DAG（归属「任务管理」tab）。 */
 function switchToDagView(queryId) {
     stopDashboardPoll();
-    // 注意：不 stopSqlPreview() —— 结果区轮询留在后台继续跑（查询结束时它自己会停表）。
+    // 注意：不动 SQL 结果区的轮询 —— 它按控制台各自跑（见 startSqlPreview）。
     // 之前在这里停表，「点任务列表进 DAG 看进度」就会永久掐死结果区：回到首页只剩切走前
     // 那一帧（GROUP BY 这类查询首块要到收尾才发，定格的就是「正在计算…」），而后台其实
     // 早已跑完 —— 表现成「后台执行完毕，结果出不来」。
@@ -3221,10 +3493,30 @@ function bindSqlEditor() {
         }
     });
 
-    // 右键：把整框内容保存为命名脚本（当前登录用户私有，见 manage.js 的「SQL 脚本管理」）
+    // 右键：剪切 / 复制 / 粘贴 / 全选 + 保存当前控制台为命名脚本（用户私有，见 manage.js「SQL 脚本管理」）
     input.addEventListener('contextmenu', function (e) {
         e.preventDefault();
-        showContextMenu([{ label: '保存当前 SQL 文件', onClick: saveSqlScript }], e.clientX, e.clientY);
+        var hasSel = input.selectionStart !== input.selectionEnd;
+        showContextMenu([
+            { label: '剪切', disabled: !hasSel, onClick: function () { cutSqlSelection(input); } },
+            { label: '复制', disabled: !hasSel, onClick: function () { copySqlSelection(input); } },
+            { label: '粘贴', onClick: function () { pasteIntoSqlEditor(input); } },
+            { label: '全选', onClick: function () { input.focus(); input.select(); } },
+            { sep: true },
+            { label: '保存当前 SQL 文件', onClick: saveSqlScript }
+        ], e.clientX, e.clientY);
+    });
+
+    // Ctrl+S / Cmd+S：保存当前控制台到 SQLite（从未保存 → 弹命名框；已绑定脚本 → 直接同名覆盖）。
+    // 只在首页拦截，其它页面保留浏览器默认行为。
+    document.addEventListener('keydown', function (e) {
+        if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+        if ((e.key || '').toLowerCase() !== 's') return;
+        if (typeof currentTab !== 'undefined' && currentTab !== 'home') return;
+        var overlay = document.getElementById('mg-overlay');
+        if (overlay && overlay.classList.contains('show')) return;   // 弹窗里按 Ctrl+S 不叠弹窗
+        e.preventDefault();
+        saveSqlScript();
     });
 
     // 暴露给「多控制台」切标签用。reset(text) 程序化回填正文并把撤销栈重置为「当前值」单快照，
@@ -3260,6 +3552,51 @@ function bindSqlEditor() {
  */
 function saveSqlScript() {
     saveConsoleToScript(activeConsole());
+}
+
+/** 编辑器「复制」：有选区复制选区，无选区复制全文。 */
+function copySqlSelection(input) {
+    var sel = input.value.slice(input.selectionStart, input.selectionEnd);
+    copyText(sel || input.value, function (ok) {
+        showToast(ok ? (sel ? '已复制选中 SQL' : '已复制全部 SQL') : '复制失败');
+    });
+}
+
+/** 编辑器「剪切」：先写剪贴板，成功后再删选区（剪贴板失败时不动内容）。 */
+function cutSqlSelection(input) {
+    var sel = input.value.slice(input.selectionStart, input.selectionEnd);
+    if (!sel) return;
+    copyText(sel, function (ok) {
+        if (!ok) { showToast('剪切失败：无法写入剪贴板'); return; }
+        replaceSqlSelection(input, '');
+        showToast('已剪切选中 SQL');
+    });
+}
+
+/** 编辑器「粘贴」：读取系统剪贴板（非安全上下文 / 未授权时提示改用 Ctrl+V）。 */
+function pasteIntoSqlEditor(input) {
+    if (!(navigator.clipboard && navigator.clipboard.readText)) {
+        showToast('当前浏览器不支持右键粘贴，请用 Ctrl+V');
+        return;
+    }
+    input.focus();
+    navigator.clipboard.readText().then(function (text) {
+        if (text) {
+            replaceSqlSelection(input, text);
+            showToast('已粘贴');
+        }
+    }, function () {
+        showToast('浏览器未授权读取剪贴板，请用 Ctrl+V');
+    });
+}
+
+/** 用 text 替换编辑器当前选区（无选区即插入光标处），派发 input 事件让撤销栈 / 高亮 / 脏态生效。 */
+function replaceSqlSelection(input, text) {
+    var s = input.selectionStart, e = input.selectionEnd;
+    input.value = input.value.slice(0, s) + text + input.value.slice(e);
+    var pos = s + text.length;
+    input.setSelectionRange(pos, pos);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
 /** 从「SQL 脚本管理」加载脚本 → <b>新开一个查询控制台</b>（不覆盖当前编辑器），并切回首页。 */

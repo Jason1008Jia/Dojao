@@ -39,7 +39,8 @@ import java.util.List;
  * @version 2.0
  * @date 2026/9/2
  */
-public class DistributedDerivedJoinOperator extends AbstractDistributedOperator implements Explainable {
+public class DistributedDerivedJoinOperator extends AbstractDistributedOperator
+        implements Explainable, WindowChainCarrier {
 
     /** 派生表基表扫描请求（已列裁剪 + 派生内层 WHERE 下推，谓词由 ScanStep 承载）。 */
     private final ReadRequest innerRequest;
@@ -47,6 +48,12 @@ public class DistributedDerivedJoinOperator extends AbstractDistributedOperator 
     private final List<String> innerKeys;
     /** 派生表聚合函数（AggregationSpec，输出列名 = 派生体输出列）。 */
     private final List<AggregationSpec> aggregations;
+    /**
+     * 两级聚合派生体的<b>外层</b>分组键 / 聚合规格（空 = 单级）。两级分组键须相同
+     * （分区键 = 分组键 ⇒ 每分区两级都是终态）；DA 中间层顺序执行内层聚合 → 外层聚合。
+     */
+    private final List<String> outerKeys;
+    private final List<AggregationSpec> outerAggregations;
     /** 派生内层聚合输入的 CASE/IF 派生列投影（SUM(CASE WHEN ...) 等；本地聚合前置逐行计算，可空）。 */
     private final List<CaseProjection> caseProjections;
     /** 派生表一侧的 join 键（ON 条件中引用派生体输出的列，须 ∈ 派生体输出列）。 */
@@ -73,6 +80,13 @@ public class DistributedDerivedJoinOperator extends AbstractDistributedOperator 
     private final StageScheduler.DerivedWindow window;
     /** 最终 join 的 Worker 侧算法（规划期选型：HASH 不可溢写；build 侧预估过大选 SORT_MERGE）。 */
     private final FragmentSpec.JoinAlgorithm joinAlgorithm;
+    /**
+     * 最末层 join 输出上的<b>窗口分组链</b>（派生源 join 上的窗口同样下沉）：空 = 无窗口链。
+     * 编排见 {@code StageScheduler.planDerivedJoin} 的窗口段。
+     */
+    private List<FragmentSpec.WindowStep> windowChain;
+    /** 外连接同名列消歧别名（空 = 无）：最终 join 之后、窗口重分区之前套用。 */
+    private final List<FragmentSpec.JoinAlias> outputAliases;
 
     public DistributedDerivedJoinOperator(String queryId,
                                           boolean derivedOnLeft,
@@ -153,11 +167,116 @@ public class DistributedDerivedJoinOperator extends AbstractDistributedOperator 
                                           List<StageScheduler.DerivedProjection> projections,
                                           StageScheduler.DerivedWindow window,
                                           FragmentSpec.JoinAlgorithm joinAlgorithm) {
+        this(queryId, derivedOnLeft, innerRequest, innerKeys, aggregations, caseProjections,
+                derivedJoinKeys, havingFilter, peerCatalog, peerSchema, peerTable, peerKeys, peerColumns,
+                peerFilter, joinType, memoryLimit, numPartitions, gateway, innerProbe, peerProbe,
+                workers, projections, window, joinAlgorithm, List.of());
+    }
+
+    /** 全参 + <b>窗口链</b>：join 输出在 Worker 内按首组窗口键重分区后依次执行各组窗口。 */
+    public DistributedDerivedJoinOperator(String queryId,
+                                          boolean derivedOnLeft,
+                                          ReadRequest innerRequest, List<String> innerKeys,
+                                          List<AggregationSpec> aggregations,
+                                          List<CaseProjection> caseProjections,
+                                          List<String> derivedJoinKeys, String havingFilter,
+                                          String peerCatalog, String peerSchema, String peerTable,
+                                          List<String> peerKeys, List<String> peerColumns, String peerFilter,
+                                          JoinType joinType,
+                                          long memoryLimit, int numPartitions,
+                                          WorkerGateway gateway,
+                                          DojaoConnector innerProbe, DojaoConnector peerProbe,
+                                          List<WorkerRegistration> workers,
+                                          List<StageScheduler.DerivedProjection> projections,
+                                          StageScheduler.DerivedWindow window,
+                                          FragmentSpec.JoinAlgorithm joinAlgorithm,
+                                          List<FragmentSpec.WindowStep> windowChain) {
+        this(queryId, derivedOnLeft, innerRequest, innerKeys, aggregations, caseProjections,
+                derivedJoinKeys, havingFilter, peerCatalog, peerSchema, peerTable, peerKeys, peerColumns,
+                peerFilter, joinType, memoryLimit, numPartitions, gateway, innerProbe, peerProbe,
+                workers, projections, window, joinAlgorithm, windowChain, List.of());
+    }
+
+    /** 全参 + 两级聚合派生体（外层分组键 / 聚合规格；分区键 = 分组键 ⇒ 每分区两级终态）。 */
+    public DistributedDerivedJoinOperator(String queryId,
+                                          boolean derivedOnLeft,
+                                          ReadRequest innerRequest, List<String> innerKeys,
+                                          List<AggregationSpec> aggregations,
+                                          List<CaseProjection> caseProjections,
+                                          List<String> derivedJoinKeys, String havingFilter,
+                                          String peerCatalog, String peerSchema, String peerTable,
+                                          List<String> peerKeys, List<String> peerColumns, String peerFilter,
+                                          JoinType joinType,
+                                          long memoryLimit, int numPartitions,
+                                          WorkerGateway gateway,
+                                          DojaoConnector innerProbe, DojaoConnector peerProbe,
+                                          List<WorkerRegistration> workers,
+                                          List<StageScheduler.DerivedProjection> projections,
+                                          StageScheduler.DerivedWindow window,
+                                          List<String> outerKeys,
+                                          List<AggregationSpec> outerAggregations,
+                                          FragmentSpec.JoinAlgorithm joinAlgorithm) {
+        this(queryId, derivedOnLeft, innerRequest, innerKeys, aggregations, caseProjections,
+                derivedJoinKeys, havingFilter, peerCatalog, peerSchema, peerTable, peerKeys, peerColumns,
+                peerFilter, joinType, memoryLimit, numPartitions, gateway, innerProbe, peerProbe,
+                workers, projections, window, joinAlgorithm, List.of(), List.of(),
+                outerKeys, outerAggregations);
+    }
+
+    /** 全参 + 窗口链 + 外连接同名列消歧别名（最终 join 之后、窗口重分区之前套用）。 */
+    public DistributedDerivedJoinOperator(String queryId,
+                                          boolean derivedOnLeft,
+                                          ReadRequest innerRequest, List<String> innerKeys,
+                                          List<AggregationSpec> aggregations,
+                                          List<CaseProjection> caseProjections,
+                                          List<String> derivedJoinKeys, String havingFilter,
+                                          String peerCatalog, String peerSchema, String peerTable,
+                                          List<String> peerKeys, List<String> peerColumns, String peerFilter,
+                                          JoinType joinType,
+                                          long memoryLimit, int numPartitions,
+                                          WorkerGateway gateway,
+                                          DojaoConnector innerProbe, DojaoConnector peerProbe,
+                                          List<WorkerRegistration> workers,
+                                          List<StageScheduler.DerivedProjection> projections,
+                                          StageScheduler.DerivedWindow window,
+                                          FragmentSpec.JoinAlgorithm joinAlgorithm,
+                                          List<FragmentSpec.WindowStep> windowChain,
+                                          List<FragmentSpec.JoinAlias> outputAliases) {
+        this(queryId, derivedOnLeft, innerRequest, innerKeys, aggregations, caseProjections,
+                derivedJoinKeys, havingFilter, peerCatalog, peerSchema, peerTable, peerKeys, peerColumns,
+                peerFilter, joinType, memoryLimit, numPartitions, gateway, innerProbe, peerProbe,
+                workers, projections, window, joinAlgorithm, windowChain, outputAliases,
+                List.of(), List.of());
+    }
+
+    /** 全参 + 窗口链 + 别名 + 两级聚合派生体（唯一真正赋值的构造）。 */
+    public DistributedDerivedJoinOperator(String queryId,
+                                          boolean derivedOnLeft,
+                                          ReadRequest innerRequest, List<String> innerKeys,
+                                          List<AggregationSpec> aggregations,
+                                          List<CaseProjection> caseProjections,
+                                          List<String> derivedJoinKeys, String havingFilter,
+                                          String peerCatalog, String peerSchema, String peerTable,
+                                          List<String> peerKeys, List<String> peerColumns, String peerFilter,
+                                          JoinType joinType,
+                                          long memoryLimit, int numPartitions,
+                                          WorkerGateway gateway,
+                                          DojaoConnector innerProbe, DojaoConnector peerProbe,
+                                          List<WorkerRegistration> workers,
+                                          List<StageScheduler.DerivedProjection> projections,
+                                          StageScheduler.DerivedWindow window,
+                                          FragmentSpec.JoinAlgorithm joinAlgorithm,
+                                          List<FragmentSpec.WindowStep> windowChain,
+                                          List<FragmentSpec.JoinAlias> outputAliases,
+                                          List<String> outerKeys,
+                                          List<AggregationSpec> outerAggregations) {
         super("DistributedDerivedJoin", queryId, numPartitions, gateway, workers);
         this.derivedOnLeft = derivedOnLeft;
         this.innerRequest = innerRequest;
         this.innerKeys = List.copyOf(innerKeys);
         this.aggregations = List.copyOf(aggregations);
+        this.outerKeys = outerKeys == null ? List.of() : List.copyOf(outerKeys);
+        this.outerAggregations = outerAggregations == null ? List.of() : List.copyOf(outerAggregations);
         this.caseProjections = caseProjections == null ? List.of() : List.copyOf(caseProjections);
         this.derivedJoinKeys = List.copyOf(derivedJoinKeys);
         this.havingFilter = havingFilter;
@@ -174,11 +293,80 @@ public class DistributedDerivedJoinOperator extends AbstractDistributedOperator 
         this.projections = projections == null || projections.isEmpty() ? null : List.copyOf(projections);
         this.window = window;
         this.joinAlgorithm = joinAlgorithm == null ? FragmentSpec.JoinAlgorithm.HASH : joinAlgorithm;
+        this.windowChain = windowChain == null ? List.of() : List.copyOf(windowChain);
+        this.outputAliases = outputAliases == null ? List.of() : List.copyOf(outputAliases);
+    }
+
+    /**
+     * 克隆本算子并挂上<b>窗口分组链</b>（join → 窗口#0 → 重分区 → 窗口#1 …，全留 Worker）：
+     * 派生流水线 / peer 扫描 / join 选型原样保留。返回的新算子替代原算子执行。
+     */
+    public DistributedDerivedJoinOperator withWindowChain(List<FragmentSpec.WindowStep> steps) {
+        return withWindowChain(steps, outputAliases);
+    }
+
+    /** 同上 + 外连接同名列消歧别名（最终 join 之后、窗口重分区之前套用）。 */
+    public DistributedDerivedJoinOperator withWindowChain(List<FragmentSpec.WindowStep> steps,
+                                                          List<FragmentSpec.JoinAlias> aliases) {
+        // 已有窗口链 ⇒ 本算子是不可再重建的边界（重建会把上一查询层的窗口整段顶掉）。
+        if (!windowChain.isEmpty()) {
+            throw new IllegalStateException(
+                    "DistributedDerivedJoinOperator 已携带窗口链（" + windowChain.size()
+                            + " 组），不能再叠加 windowChain —— 重建舞台会丢弃既有窗口");
+        }
+        return new DistributedDerivedJoinOperator(queryId, derivedOnLeft,
+                innerRequest, innerKeys, aggregations, caseProjections, derivedJoinKeys, havingFilter,
+                peerCatalog, peerSchema, peerTable, peerKeys, peerColumns, peerFilter, joinType,
+                memoryLimit, numPartitions, gateway, innerProbe, peerProbe, workers,
+                projections, window, joinAlgorithm, steps, aliases, outerKeys, outerAggregations);
+    }
+
+    /** 最末层 join 上的窗口分组链（空 = 无）。 */
+    public List<FragmentSpec.WindowStep> windowChain() {
+        return windowChain;
+    }
+
+    /** 派生表聚合规格（join 之前的内层聚合；审计用）。 */
+    public List<AggregationSpec> aggregations() {
+        return aggregations;
+    }
+
+    /** 两级聚合派生体的外层聚合规格（空 = 单级）。 */
+    public List<AggregationSpec> outerAggregations() {
+        return outerAggregations;
+    }
+
+    /** 两级聚合派生体的外层分组键（空 = 单级）。 */
+    public List<String> outerKeys() {
+        return outerKeys;
+    }
+
+    @Override
+    public List<FragmentSpec.WindowStep> windowSteps() { return windowChain; }
+
+    @Override
+    public void replaceWindowSteps(List<FragmentSpec.WindowStep> steps) {
+        if (steps == null || steps.isEmpty()) return;
+        this.windowChain = List.copyOf(steps);
     }
 
     /** 最终 join 的 Worker 侧算法（只读访问器，供探针用）。 */
     public FragmentSpec.JoinAlgorithm joinAlgorithm() {
         return joinAlgorithm;
+    }
+
+    /** 哈希分区数（只读访问器，供窗口链下沉规划用）。 */
+    public int numPartitions() {
+        return numPartitions;
+    }
+
+    /**
+     * 终端 join 输出的哈希分区键：两流（派生 / peer）都按 join 键分区，且 ON 条件相等 ⇒
+     * 任一侧键都是完整分区键。外层分组聚合键覆盖它时可下沉为「每分区终态聚合」。
+     */
+    @Override
+    public List<String> terminalPartitionKeys() {
+        return derivedJoinKeys;
     }
 
     /**
@@ -198,6 +386,13 @@ public class DistributedDerivedJoinOperator extends AbstractDistributedOperator 
                 + (req.filterExpression().filter(f -> !f.isBlank())
                         .map(f -> " filter=[" + f + "]").orElse(""))
                 + " algo=" + JoinExplain.distributed(joinAlgorithm, memoryLimit, numPartitions));
+        for (int g = 0; g < windowChain.size(); g++) {
+            FragmentSpec.WindowStep w = windowChain.get(g);
+            out.add("window-" + (g + 1) + ": partitionBy=" + w.partitionBy()
+                    + " orderBy=" + w.orderBy()
+                    + (w.filter() != null ? " preFilter=[" + w.filter().describe() + "]" : "")
+                    + (g == 0 ? " (join 输出重分区)" : " (上一组窗口输出重分区)"));
+        }
         return out;
     }
 
@@ -209,7 +404,8 @@ public class DistributedDerivedJoinOperator extends AbstractDistributedOperator 
                 innerRequest, innerKeys, aggregations, caseProjections, innerProbe,
                 derivedJoinKeys, havingFilter,
                 peerCatalog, peerSchema, peerTable, peerKeys, peerColumns, peerProbe, peerFilter,
-                joinType, memoryLimit, projections, window, joinAlgorithm);
+                joinType, memoryLimit, projections, window, joinAlgorithm, windowChain, outputAliases,
+                outerKeys, outerAggregations);
         // 片段已在 planDerivedJoin 内按反死锁顺序排好：
         // 最终 join Consumer → MiddleAggregateConsumer → Producer（build 侧先、probe 侧后）
         for (FragmentSpec fragment : withTerminal(stage.fragments())) {   // 分布式写 SinkStep + top-N 截断尾
@@ -294,11 +490,33 @@ public class DistributedDerivedJoinOperator extends AbstractDistributedOperator 
             for (AggregationSpec a : aggregations) {
                 derived.add(aggregationOutputField(a, innerFields));
             }
+            // 两级聚合（max(sum(x))）：外层聚合的输入是上一级聚合的输出列 —— 按内层输出列反推类型。
+            if (!outerAggregations.isEmpty()) {
+                List<Field> innerOut = new ArrayList<>(derived);
+                List<Field> outerOut = new ArrayList<>();
+                for (String k : outerKeys) {
+                    Field f = fieldOf(innerOut, k);
+                    if (f == null) {
+                        throw new IllegalStateException(
+                                "两级聚合派生体：外层分组键 " + k + " 不在内层输出列 " + innerOut);
+                    }
+                    outerOut.add(f);
+                }
+                for (AggregationSpec a : outerAggregations) {
+                    outerOut.add(aggregationOutputField(a, innerOut));
+                }
+                derived = outerOut;
+            }
         }
         List<Field> peer = scanFields(peerProbe, peerCatalog, peerSchema, peerTable,
                 peerColumns.isEmpty() ? null : peerColumns);
-        return derivedOnLeft
+        List<Field> wire = derivedOnLeft
                 ? joinOutputFields(joinType, derived, peer, derivedJoinKeys, peerKeys)
                 : joinOutputFields(joinType, peer, derived, peerKeys, derivedJoinKeys);
+        if (windowChain.isEmpty()) {
+            return wire;
+        }
+        // 窗口链：逐组按声明输出列重定基并追加窗口函数列（K 形状投影吸收见基类 helper）。
+        return windowChainOutputFields(wire, windowChain);
     }
 }

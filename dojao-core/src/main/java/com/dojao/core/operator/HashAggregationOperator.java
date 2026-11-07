@@ -254,19 +254,31 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
     @Override
     protected void outputMemory(PartitionState<Slot> pa, int pid) throws Exception {
         for (int s = 0; s < SLOT_COUNT; s++) {
+            checkCancelled();
             Slot slot = pa.slots.get(s);
             if (slot == null || slot.isEmpty()) continue;
             if (collectMode) {
                 outputCollectMemory((CollectHashTable) slot, pid);
             } else {
                 AggregationHashTable ht = (AggregationHashTable) slot;
-                List<VectorSchemaRoot> batches = ht.buildOutputBatches(AGG_PER_BATCH_KEYS);
-                for (VectorSchemaRoot batch : batches) {
-                    if (havingConfig != null) {
-                        batch = filterHaving(batch);
-                        if (batch == null) continue;
+                // 已构造但尚未 emit 的输出批次不登记在 PartitionState 里：取消检查点若在此处抛异常，
+                // 必须由本方法自己收尾，否则这些 Arrow 批次会泄漏（实测取消后 2.3MB 不回落）。
+                List<VectorSchemaRoot> pending = new ArrayList<>(ht.buildOutputBatches(AGG_PER_BATCH_KEYS));
+                try {
+                    for (int bi = 0; bi < pending.size(); bi++) {
+                        checkCancelled();
+                        VectorSchemaRoot batch = pending.get(bi);
+                        pending.set(bi, null);      // 所有权已交出（emit 或 filterHaving 内部接管）
+                        if (havingConfig != null) {
+                            batch = filterHaving(batch);
+                            if (batch == null) continue;
+                        }
+                        emitPage(Page.partitioned(batch, pid));
                     }
-                    emitPage(Page.partitioned(batch, pid));
+                } finally {
+                    for (VectorSchemaRoot b : pending) {
+                        if (b != null) { try { b.close(); } catch (Exception ignored) {} }
+                    }
                 }
             }
             slot.close();
@@ -355,6 +367,9 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
 
         List<ScalarRun> runs = new ArrayList<>(runPaths.size());
         List<Field> firstFields = null;
+        // 在途输出批：指向它的是本方法（不是 PartitionState），取消检查点抛异常时必须由 finally 收尾，
+        // 否则「停止任务」后这一批 Arrow 内存永不释放（实测 2.3MB 不回落）。
+        List<FieldVector> outVectors = null;
         try {
             for (Path p : runPaths) {
                 ScalarRun r = new ScalarRun(p);
@@ -370,11 +385,12 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                 if (runs.get(i).valid()) pq.add(i);
             }
 
-            List<FieldVector> outVectors = allocOutputVectors(outFields);
+            outVectors = allocOutputVectors(outFields);
             int outRow = 0;
             List<Integer> same = new ArrayList<>();
 
             while (!pq.isEmpty()) {
+                checkCancelled();
                 Object minKey = runs.get(pq.peek()).key();
 
                 Object[] mergedStates = new Object[aggregations.size()];
@@ -419,22 +435,28 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                 bumpMergeProgress();
 
                 if (outRow >= AGG_PER_BATCH_KEYS) {
-                    for (FieldVector v : outVectors) v.setValueCount(outRow);
-                    emitPage(Page.partitioned(
-                            new VectorSchemaRoot(outFields, outVectors, outRow), pid));
+                    List<FieldVector> batch = outVectors;
+                    outVectors = null;                  // 所有权移交给输出页
+                    for (FieldVector v : batch) v.setValueCount(outRow);
+                    emitPage(Page.partitioned(new VectorSchemaRoot(outFields, batch, outRow), pid));
                     outVectors = allocOutputVectors(outFields);
                     outRow = 0;
                 }
             }
 
             if (outRow > 0) {
-                for (FieldVector v : outVectors) v.setValueCount(outRow);
-                emitPage(Page.partitioned(
-                        new VectorSchemaRoot(outFields, outVectors, outRow), pid));
-            } else {
-                for (FieldVector v : outVectors) v.close();
+                List<FieldVector> batch = outVectors;
+                outVectors = null;                      // 所有权移交给输出页
+                for (FieldVector v : batch) v.setValueCount(outRow);
+                emitPage(Page.partitioned(new VectorSchemaRoot(outFields, batch, outRow), pid));
             }
         } finally {
+            if (outVectors != null) {
+                for (FieldVector v : outVectors) {
+                    try { v.close(); } catch (Exception ignored) {}
+                }
+                outVectors = null;
+            }
             for (ScalarRun r : runs) r.closeQuietly();
             // 归并产物不登记在 PartitionState（原始文件已在归并时删除），此处自行清理
             if (compacted) {
@@ -454,9 +476,11 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
         List<Path> runs = new ArrayList<>(input);
         int round = 0;
         while (runs.size() > MAX_SCALAR_MERGE_K) {
+            checkCancelled();
             List<Path> next = new ArrayList<>();
             int i = 0;
             while (i < runs.size()) {
+                checkCancelled();
                 int take = Math.min(runs.size() - i, laneCount(runs.get(i)));
                 if (take <= 1) {
                     next.add(runs.get(i));
@@ -517,6 +541,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                     StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
                  ArrowFileWriter writer = new ArrowFileWriter(out, null, outCh)) {
                 while (!pq.isEmpty()) {
+                    checkCancelled();
                     Object minKey = runs.get(pq.peek()).key();
 
                     Object[] mergedStates = new Object[aggregations.size()];
@@ -730,6 +755,8 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
         List<ScalarRun> scalarRuns = new ArrayList<>(runPaths.size());
         List<Field> firstFields = null;
         List<DistinctRun> runs = new ArrayList<>();
+        // 在途输出批：取消检查点抛异常时由 finally 收尾（同 mergeAndOutput）。
+        List<FieldVector> outVectors = null;
         try {
             for (Path p : runPaths) {
                 ScalarRun r = new ScalarRun(p);
@@ -754,11 +781,12 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                 if (runs.get(ri).valid()) pq.add(-ri - 1);
             }
 
-            List<FieldVector> outVectors = allocOutputVectors(outFields);
+            outVectors = allocOutputVectors(outFields);
             int outRow = 0;
             List<Integer> same = new ArrayList<>();
 
             while (!pq.isEmpty()) {
+                checkCancelled();
                 Object minKey = cursorKey(pq.peek(), scalarRuns, runs);
 
                 Object[] mergedStates = new Object[aggregations.size()];
@@ -810,22 +838,28 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                 bumpMergeProgress();
 
                 if (outRow >= AGG_PER_BATCH_KEYS) {
-                    for (FieldVector v : outVectors) v.setValueCount(outRow);
-                    emitPage(Page.partitioned(
-                            new VectorSchemaRoot(outFields, outVectors, outRow), pid));
+                    List<FieldVector> batch = outVectors;
+                    outVectors = null;                  // 所有权移交给输出页
+                    for (FieldVector v : batch) v.setValueCount(outRow);
+                    emitPage(Page.partitioned(new VectorSchemaRoot(outFields, batch, outRow), pid));
                     outVectors = allocOutputVectors(outFields);
                     outRow = 0;
                 }
             }
 
             if (outRow > 0) {
-                for (FieldVector v : outVectors) v.setValueCount(outRow);
-                emitPage(Page.partitioned(
-                        new VectorSchemaRoot(outFields, outVectors, outRow), pid));
-            } else {
-                for (FieldVector v : outVectors) v.close();
+                List<FieldVector> batch = outVectors;
+                outVectors = null;                      // 所有权移交给输出页
+                for (FieldVector v : batch) v.setValueCount(outRow);
+                emitPage(Page.partitioned(new VectorSchemaRoot(outFields, batch, outRow), pid));
             }
         } finally {
+            if (outVectors != null) {
+                for (FieldVector v : outVectors) {
+                    try { v.close(); } catch (Exception ignored) {}
+                }
+                outVectors = null;
+            }
             for (ScalarRun r : scalarRuns) r.closeQuietly();
             for (DistinctRun run : runs) run.closeQuietly();
             // 归并产物不登记在 PartitionState（原始文件已在归并时删除），此处自行清理
@@ -914,9 +948,11 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
         List<Path> runs = new ArrayList<>(input);
         int round = 0;
         while (runs.size() > 1) {
+            checkCancelled();
             List<Path> next = new ArrayList<>();
             int i = 0;
             while (i < runs.size()) {
+                checkCancelled();
                 int take = Math.min(runs.size() - i, laneCount(runs.get(i)));
                 if (take <= 1) {
                     next.add(runs.get(i));
@@ -995,6 +1031,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                     StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
                  ArrowFileWriter writer = new ArrowFileWriter(out, null, outCh)) {
                 while (!pq.isEmpty()) {
+                    checkCancelled();
                     int ri = pq.poll();
                     DistinctRun run = runs.get(ri);
                     Object k = run.key();
@@ -1222,6 +1259,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
 
         // 分块输出：每块 AGG_PER_BATCH_KEYS 个 key，拼接 N-key batch 一次交付
         for (int start = 0; start < segs.size(); start += AGG_PER_BATCH_KEYS) {
+            checkCancelled();
             int end = Math.min(start + AGG_PER_BATCH_KEYS, segs.size());
             List<CollectHashTable.CollectSeg> chunk = segs.subList(start, end);
             List<CollectHashTable.CollectGroup> groups = new ArrayList<>(chunk.size());
@@ -1257,10 +1295,12 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
 
         int start = 0;
         while (start < allKeys.size()) {
+            checkCancelled();
             // 按值总数预算切批（单 key 本身超预算也照常交付：collect 语义要求整组值一次性求值）
             long budgetValues = 0;
             int end = start;
             while (end < allKeys.size()) {
+                checkCancelled();
                 long sz = segmentRowCount(pa, allKeys.get(end));
                 if (end > start && budgetValues + sz > AGG_COLLECT_DELIVER_VALUES) break;
                 budgetValues += sz;
@@ -1305,6 +1345,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
         long[][] groupBytes = hasVarWidth ? new long[valueFields.size()][groupCount] : null;
 
         for (int g = 0; g < groupCount; g++) {
+            checkCancelled();
             List<Segment> segs = pa.index.get(keyBatch.get(g));
             if (segs == null) continue;
             for (int i = 0; i < segs.size(); i++) {
@@ -1321,6 +1362,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
             // 变长列第一遍：统计每組字节数（决定 child data buffer 容量与组内起始字节）
             if (groupBytes != null) {
                 for (Map.Entry<Integer, List<int[]>> e : byFile.entrySet()) {
+                    checkCancelled();
                     VectorSchemaRoot r = loadBatchFromArrow(pa, e.getKey(), pid);
                     if (r == null) continue;
                     try {
@@ -1343,6 +1385,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                     allocator, groupKeyFields, valueFields, keyBatch, groupSizes, groupBytes)) {
                 // 第二遍：文件升序逐个加载 → 直接写入交付列 → 立即关闭
                 for (Map.Entry<Integer, List<int[]>> e : byFile.entrySet()) {
+                    checkCancelled();
                     VectorSchemaRoot r = loadBatchFromArrow(pa, e.getKey(), pid);
                     if (r == null) continue;
                     try {
@@ -1380,6 +1423,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
         Map<Integer, VectorSchemaRoot> cache = new LinkedHashMap<>();
         try {
             for (Object key : keyBatch) {
+                checkCancelled();
                 List<Segment> segs = pa.index.get(key);
                 if (segs == null) continue;
                 for (int i = 0; i < segs.size(); i++) {

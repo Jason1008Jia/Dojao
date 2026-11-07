@@ -82,6 +82,8 @@ public final class ControlSerde {
                 .setDiskReadBytes(r.diskReadBytes())
                 .setDiskWriteBytes(r.diskWriteBytes())
                 .setProcessRssBytes(r.processRssBytes())
+                .setNetRxBytes(r.netRxBytes())
+                .setNetTxBytes(r.netTxBytes())
                 .addAllAllocators(r.allocators().stream()
                         .map(a -> AllocatorUsageMsg.newBuilder()
                                 .setCategory(a.category())
@@ -104,7 +106,8 @@ public final class ControlSerde {
                         .map(u -> new AllocatorUsage(u.getCategory(), u.getAllocatedBytes(),
                                 u.getPeakBytes(), u.getLimitBytes()))
                         .toList(),
-                m.getDiskReadBytes(), m.getDiskWriteBytes(), m.getProcessRssBytes());
+                m.getDiskReadBytes(), m.getDiskWriteBytes(), m.getProcessRssBytes(),
+                m.getNetRxBytes(), m.getNetTxBytes());
     }
 
     public static WorkerStateMsg toState(WorkerState s) {
@@ -219,16 +222,34 @@ public final class ControlSerde {
         if (leftIpc.length > 0) {
             b.setLeftSchemaIpc(ByteString.copyFrom(leftIpc));
         }
+        for (FragmentSpec.JoinAlias a : j.outputAliases()) {
+            b.addOutputAliases(JoinAliasMsg.newBuilder()
+                    .setSourceName(a.sourceName())
+                    .setOccurrence(a.occurrence())
+                    .setAliasName(a.aliasName()));
+        }
+        if (j.onLeftFilter() != null) {
+            b.setOnLeftFilter(j.onLeftFilter());
+        }
+        if (j.onRightFilter() != null) {
+            b.setOnRightFilter(j.onRightFilter());
+        }
         return b.build();
     }
 
     private static FragmentSpec.JoinStep fromJoinStep(JoinStepMsg m) {
         // 枚举名与 proto 值一一对应（HASH / SORT_MERGE）；缺省字段 = HASH → 旧发送方优雅降级
+        List<FragmentSpec.JoinAlias> aliases = new ArrayList<>(m.getOutputAliasesCount());
+        for (JoinAliasMsg a : m.getOutputAliasesList()) {
+            aliases.add(new FragmentSpec.JoinAlias(a.getSourceName(), a.getOccurrence(), a.getAliasName()));
+        }
         return new FragmentSpec.JoinStep(m.getLeftKeyColumnsList(), m.getRightKeyColumnsList(),
                 JoinType.valueOf(m.getJoinType().name()), m.getMemoryLimit(), m.getNumPartitions(),
                 FragmentSpec.JoinAlgorithm.valueOf(m.getAlgorithm().name()),
                 ArrowSchemaIpc.decode(m.getRightSchemaIpc().toByteArray()),
-                ArrowSchemaIpc.decode(m.getLeftSchemaIpc().toByteArray()));
+                ArrowSchemaIpc.decode(m.getLeftSchemaIpc().toByteArray()),
+                aliases,
+                m.getOnLeftFilter(), m.getOnRightFilter());
     }
 
     private static AggregationDtoMsg toAggregationDto(FragmentSpec.AggregationDto a) {
@@ -388,6 +409,10 @@ public final class ControlSerde {
         for (WindowFunctionSpec f : w.functions()) {
             b.addFunctions(toWindowFunction(f));
         }
+        for (GroupKeyExpression g : w.computed()) {
+            b.addComputed(toGroupKeyExpression(g));
+        }
+        b.addAllOutputColumns(w.outputColumns());
         if (w.filter() != null) b.setFilter(toWindowFilter(w.filter()));
         return b.build();
     }
@@ -415,7 +440,9 @@ public final class ControlSerde {
                 m.getAscendingList(),
                 m.getFunctionsList().stream().map(ControlSerde::fromWindowFunction).toList(),
                 m.getMemoryLimit(), m.getNumPartitions(),
-                m.hasFilter() ? fromWindowFilter(m.getFilter()) : null);
+                m.hasFilter() ? fromWindowFilter(m.getFilter()) : null,
+                m.getComputedList().stream().map(ControlSerde::fromGroupKeyExpression).toList(),
+                m.getOutputColumnsList());
     }
 
     private static SinkStepMsg toSinkStep(FragmentSpec.SinkStep s) {
@@ -478,6 +505,12 @@ public final class ControlSerde {
                         .setLeftIn(toExchangeIn(c.leftIn()))
                         .setRightIn(toExchangeIn(c.rightIn()))
                         .setJoin(toJoinStep(c.join()));
+                if (c.filterAfterJoin() != null && !c.filterAfterJoin().isBlank()) {
+                    cb.setFilterAfterJoin(c.filterAfterJoin());
+                }
+                if (c.partialFollowUp() != null) {
+                    cb.setPartialFollowUp(toAggregateStep(c.partialFollowUp()));
+                }
                 if (c.sink() != null) {
                     cb.setSink(toSinkStep(c.sink()));
                 }
@@ -509,6 +542,9 @@ public final class ControlSerde {
                         .setSelfWorkerId(w.selfWorkerId())
                         .setIn(toExchangeIn(w.in()))
                         .setWindow(toWindowStep(w.window()));
+                if (w.partialFollowUp() != null) {
+                    wb.setPartialFollowUp(toAggregateStep(w.partialFollowUp()));
+                }
                 if (w.sink() != null) {
                     wb.setSink(toSinkStep(w.sink()));
                 }
@@ -528,11 +564,20 @@ public final class ControlSerde {
                     case FragmentSpec.WindowStep w -> mb.setWindow(toWindowStep(w));
                     case FragmentSpec.AggregateStep a -> mb.setAggregate(toAggregateStep(a));
                 }
+                if (cj.partialFollowUp() != null) {
+                    mb.setPartialFollowUp(toAggregateStep(cj.partialFollowUp()));
+                }
                 if (cj.sink() != null) {
                     mb.setSink(toSinkStep(cj.sink()));
                 }
                 if (cj.tail() != null) {
                     mb.setTail(toSortLimitStep(cj.tail()));
+                }
+                if (cj.nextPartition() != null) {
+                    mb.setNextPartition(toPartitionStep(cj.nextPartition()));
+                }
+                for (GroupKeyExpression g : cj.nextComputed()) {
+                    mb.addNextComputed(toGroupKeyExpression(g));
                 }
                 b.setChainedJoinConsumer(mb.build());
             }
@@ -547,6 +592,9 @@ public final class ControlSerde {
                 if (mj.expand() != null) {
                     mjb.setExpand(toExpandStep(mj.expand()));
                 }
+                for (GroupKeyExpression g : mj.nextComputed()) {
+                    mjb.addNextComputed(toGroupKeyExpression(g));
+                }
                 b.setMiddleJoinConsumer(mjb.build());
             }
             case FragmentSpec.MiddleAggregateConsumer ma -> {
@@ -556,20 +604,28 @@ public final class ControlSerde {
                         .setIn(toExchangeIn(ma.in()))
                         .setAggregate(toAggregateStep(ma.aggregate()))
                         .setNextPartition(toPartitionStep(ma.nextPartition()));
+                if (ma.followUp() != null) {
+                    mb.setFollowUp(toAggregateStep(ma.followUp()));
+                }
                 if (ma.filterAfterAggregate() != null && !ma.filterAfterAggregate().isBlank()) {
                     mb.setFilterAfterAggregate(ma.filterAfterAggregate());
+                }
+                for (GroupKeyExpression g : ma.nextComputed()) {
+                    mb.addNextComputed(toGroupKeyExpression(g));
                 }
                 b.setMiddleAggregateConsumer(mb.build());
             }
             case FragmentSpec.MiddleWindowConsumer mw -> {
-                MiddleWindowConsumerMsg m = MiddleWindowConsumerMsg.newBuilder()
+                MiddleWindowConsumerMsg.Builder mwb = MiddleWindowConsumerMsg.newBuilder()
                         .setFragmentId(mw.fragmentId())
                         .setSelfWorkerId(mw.selfWorkerId())
                         .setIn(toExchangeIn(mw.in()))
                         .setWindow(toWindowStep(mw.window()))
-                        .setNextPartition(toPartitionStep(mw.nextPartition()))
-                        .build();
-                b.setMiddleWindowConsumer(m);
+                        .setNextPartition(toPartitionStep(mw.nextPartition()));
+                for (GroupKeyExpression g : mw.nextComputed()) {
+                    mwb.addNextComputed(toGroupKeyExpression(g));
+                }
+                b.setMiddleWindowConsumer(mwb.build());
             }
         }
         return b.build();
@@ -590,6 +646,12 @@ public final class ControlSerde {
                 FragmentSpec.Consumer c = new FragmentSpec.Consumer(m.getFragmentId(), m.getSelfWorkerId(),
                         fromExchangeIn(m.getLeftIn()), fromExchangeIn(m.getRightIn()),
                         fromJoinStep(m.getJoin()));
+                if (!m.getFilterAfterJoin().isBlank()) {
+                    c = c.withFilterAfterJoin(m.getFilterAfterJoin());
+                }
+                if (m.hasPartialFollowUp()) {
+                    c = c.withPartialFollowUp(fromAggregateStep(m.getPartialFollowUp()));
+                }
                 if (m.hasSink()) c = c.withSink(fromSinkStep(m.getSink()));
                 if (m.hasTail()) c = c.withTail(fromSortLimitStep(m.getTail()));
                 return c;
@@ -611,6 +673,9 @@ public final class ControlSerde {
                         fromExchangeIn(m.getIn()), fromWindowStep(m.getWindow()));
                 if (m.hasSink()) w = w.withSink(fromSinkStep(m.getSink()));
                 if (m.hasTail()) w = w.withTail(fromSortLimitStep(m.getTail()));
+                if (m.hasPartialFollowUp()) {
+                    w = w.withPartialFollowUp(fromAggregateStep(m.getPartialFollowUp()));
+                }
                 return w;
             }
             case CHAINED_JOIN_CONSUMER -> {
@@ -626,6 +691,13 @@ public final class ControlSerde {
                         fromJoinStep(m.getJoin()), followUp);
                 if (m.hasSink()) cj = cj.withSink(fromSinkStep(m.getSink()));
                 if (m.hasTail()) cj = cj.withTail(fromSortLimitStep(m.getTail()));
+                if (m.hasNextPartition()) {
+                    cj = cj.withNextPartition(fromPartitionStep(m.getNextPartition()),
+                            m.getNextComputedList().stream().map(ControlSerde::fromGroupKeyExpression).toList());
+                }
+                if (m.hasPartialFollowUp()) {
+                    cj = cj.withPartialFollowUp(fromAggregateStep(m.getPartialFollowUp()));
+                }
                 return cj;
             }
             case MIDDLE_JOIN_CONSUMER -> {
@@ -634,21 +706,30 @@ public final class ControlSerde {
                         m.getFragmentId(), m.getSelfWorkerId(),
                         fromExchangeIn(m.getLeftIn()), fromExchangeIn(m.getRightIn()),
                         fromJoinStep(m.getJoin()), fromPartitionStep(m.getNextPartition()));
-                return m.hasExpand() ? mjc.withExpand(fromExpandStep(m.getExpand())) : mjc;
+                if (m.hasExpand()) mjc = mjc.withExpand(fromExpandStep(m.getExpand()));
+                if (m.getNextComputedCount() > 0) {
+                    mjc = mjc.withNextComputed(m.getNextComputedList().stream()
+                            .map(ControlSerde::fromGroupKeyExpression).toList());
+                }
+                return mjc;
             }
             case MIDDLE_AGGREGATE_CONSUMER -> {
                 MiddleAggregateConsumerMsg m = msg.getMiddleAggregateConsumer();
                 String filter = m.getFilterAfterAggregate();
-                return new FragmentSpec.MiddleAggregateConsumer(m.getFragmentId(), m.getSelfWorkerId(),
+                FragmentSpec.MiddleAggregateConsumer ma = new FragmentSpec.MiddleAggregateConsumer(
+                        m.getFragmentId(), m.getSelfWorkerId(),
                         fromExchangeIn(m.getIn()), fromAggregateStep(m.getAggregate()),
                         fromPartitionStep(m.getNextPartition()),
-                        filter == null || filter.isBlank() ? null : filter);
+                        filter == null || filter.isBlank() ? null : filter,
+                        m.getNextComputedList().stream().map(ControlSerde::fromGroupKeyExpression).toList());
+                return m.hasFollowUp() ? ma.withFollowUp(fromAggregateStep(m.getFollowUp())) : ma;
             }
             case MIDDLE_WINDOW_CONSUMER -> {
                 MiddleWindowConsumerMsg m = msg.getMiddleWindowConsumer();
                 return new FragmentSpec.MiddleWindowConsumer(m.getFragmentId(), m.getSelfWorkerId(),
                         fromExchangeIn(m.getIn()), fromWindowStep(m.getWindow()),
-                        fromPartitionStep(m.getNextPartition()));
+                        fromPartitionStep(m.getNextPartition()),
+                        m.getNextComputedList().stream().map(ControlSerde::fromGroupKeyExpression).toList());
             }
             default -> throw new IllegalArgumentException("FragmentSpecMsg 缺 spec oneof: " + msg);
         }

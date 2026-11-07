@@ -69,8 +69,15 @@ public final class MaterializedCteScanOperator extends AbstractMeasurableOperato
         nextFile = 0;
     }
 
+    /**
+     * 顺序重放物化文件。{@code synchronized} 是必要的：本地派生 join 的两侧各有一个
+     * {@link HashPartitionOperator}，其 N 个分发线程会<b>并发</b>调用上游 {@code next()}
+     * （正常上游是 ParallelTableScan，可安全并发拉页）。本算子只有一个共享的 {@code nextFile}
+     * 游标，并发进入会让两个线程取到同一/越界下标 —— 表现为
+     * {@code IndexOutOfBoundsException: Index: 1 Size: 1}。重放本身是顺序 IO，串行化不损失能力。
+     */
     @Override
-    protected Page doNext() throws Exception {
+    protected synchronized Page doNext() throws Exception {
         while (nextFile < files.size()) {
             VectorSchemaRoot root = readFile(files.get(nextFile++));
             if (root == null || root.getRowCount() == 0) {
@@ -96,6 +103,7 @@ public final class MaterializedCteScanOperator extends AbstractMeasurableOperato
                 ok = true;
                 return null;
             }
+            MaterializedCteConnector.requireSingleBatch(file, blocks.size());
             reader.loadRecordBatch(blocks.get(0));
             loaded = reader.getVectorSchemaRoot();
             int rc = loaded.getRowCount();
@@ -161,11 +169,19 @@ public final class MaterializedCteScanOperator extends AbstractMeasurableOperato
         private PlannedBody body;
         /** null = 尚未物化；空列表 = 已物化但查询体零行。 */
         private List<Path> files;
+        /** 物化输出的真实 schema（首个非空页）；未物化 / 零行时为 null。 */
+        private List<org.apache.arrow.vector.types.pojo.Field> fields;
         private Throwable failure;
         private Path dir;
         private int scanners;
         private int closedScanners;
         private boolean cleaned;
+        /** wire 载荷（每个物化文件一份），首次取用编码一次后缓存，避免每个引用点重复编码。 */
+        private List<byte[]> wirePayloads;
+        /** 载荷编码次数（探针 / 遥测：多引用应只编码一次）。 */
+        private int wireEncodeCount;
+        /** 载荷总字节数（超限判定与遥测）。 */
+        private long wirePayloadBytes;
         /** EXPLAIN 里查询体明细只展开一次（其余引用点指回首个节点），避免「看起来又扫了 N 次」。 */
         private boolean bodyShown;
 
@@ -191,6 +207,11 @@ public final class MaterializedCteScanOperator extends AbstractMeasurableOperato
             return body().columns();
         }
 
+        /** 物化输出真实 schema（int 位宽 / decimal 精度）；未物化或零行时为 {@code null}。 */
+        public synchronized List<org.apache.arrow.vector.types.pojo.Field> fields() {
+            return fields;
+        }
+
         List<String> bodyExplain() {
             if (bodyShown) {
                 return List.of("body executed once for all references"
@@ -207,19 +228,94 @@ public final class MaterializedCteScanOperator extends AbstractMeasurableOperato
         }
 
         void scannerClosed() {
-            boolean remove;
+            boolean release;
             synchronized (lock) {
                 closedScanners++;
-                remove = !cleaned && closedScanners >= scanners;
-                if (remove) cleaned = true;
+                release = !cleaned && closedScanners >= scanners;
             }
-            if (remove) {
-                synchronized (lock) {
-                    if (dir != null) {
-                        SpillDirs.deleteRecursively(dir);
-                        SpillDirs.unregister(dir);
-                    }
+            if (release) {
+                release();
+            }
+        }
+
+        /**
+         * 显式回收物化目录与缓存载荷（幂等）。由查询收尾统一调用 —— 分布式路径不创建
+         * {@link MaterializedCteScanOperator}，不能依赖扫描算子的 {@link #scannerClosed()}，
+         * 否则物化文件只能等 JVM 退出时靠 {@code SpillDirs} 的 shutdown hook 清理，
+         * 长驻 Master 会随每次多引用 CTE 查询累积。
+         */
+        public void release() {
+            Path toDelete;
+            synchronized (lock) {
+                if (cleaned) {
+                    return;
                 }
+                cleaned = true;
+                toDelete = dir;
+                dir = null;
+                wirePayloads = null;
+                wirePayloadBytes = 0;
+            }
+            if (toDelete != null) {
+                SpillDirs.deleteRecursively(toDelete);
+                SpillDirs.unregister(toDelete);
+            }
+        }
+
+        /** 物化目录（未物化 / 已回收 = {@code null}）—— 探针与排障用。 */
+        public Path spillDirectory() {
+            synchronized (lock) {
+                return dir;
+            }
+        }
+
+        /** 载荷编码次数（探针：多个引用点共用同一次编码）。 */
+        public int wireEncodeCount() {
+            synchronized (lock) {
+                return wireEncodeCount;
+            }
+        }
+
+        /** 载荷总字节数（未编码 = 0）。 */
+        public long wirePayloadBytes() {
+            synchronized (lock) {
+                return wirePayloadBytes;
+            }
+        }
+
+        /**
+         * 全部物化文件的 wire 载荷（每个文件一份，首次调用编码并缓存）。
+         *
+         * <p>多个引用点共享同一份编码结果 —— 旧实现在每个引用点都重读并重编码全部文件，
+         * N 个引用即 N 倍 CPU / 内存峰值。总量超过 {@code query.cte.wire.maxBytes}
+         * 直接失败（不静默回退），避免一条查询吃穿 Master 堆。</p>
+         */
+        public List<byte[]> wirePayloads() throws Exception {
+            synchronized (lock) {
+                if (wirePayloads != null) {
+                    return wirePayloads;
+                }
+                List<Path> fs = materialize();
+                long max = ResourceConfig.cteWireMaxBytes();
+                long total = 0L;
+                List<byte[]> out = new ArrayList<>(fs.size());
+                for (Path file : fs) {
+                    byte[] payload = MaterializedCteConnector.encodeFile(file);
+                    if (payload.length == 0) {
+                        continue;
+                    }
+                    total += payload.length;
+                    if (max > 0 && total > max) {
+                        throw new IllegalStateException("物化 CTE 载荷超过上限（" + name + "）："
+                                + "已编码 " + total + " 字节 > " + ResourceConfig.QUERY_CTE_WIRE_MAX_BYTES
+                                + "=" + max + "；请调高该配置，或减少物化 CTE 的引用/结果规模。");
+                    }
+                    out.add(payload);
+                }
+                wireEncodeCount++;
+                wirePayloadBytes = total;
+                wirePayloads = List.copyOf(out);
+                return wirePayloads;
             }
         }
 
@@ -247,6 +343,9 @@ public final class MaterializedCteScanOperator extends AbstractMeasurableOperato
                                 Path file = dir.resolve("cte_" + written.size() + ".arrow");
                                 AbstractSpillableOperator.writeArrowFile(file, p.getRoot());
                                 written.add(file);
+                                if (fields == null) {
+                                    fields = List.copyOf(p.getRoot().getSchema().getFields());
+                                }
                             }
                         } finally {
                             p.close();

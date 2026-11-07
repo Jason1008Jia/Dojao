@@ -2,7 +2,7 @@
 //
 // 数据源两个（都在 2s 轮询里并行拉）：
 //   GET /api/cluster          —— 当前快照：Master + 各 Worker 节点卡 + 活动/最近查询
-//   GET /api/cluster/history  —— 时间序列：概览卡迷你趋势线 + 七张折线图
+//   GET /api/cluster/history  —— 时间序列：概览卡迷你趋势线 + 八张折线图
 //
 // 设计取舍：
 //   - 轮询只在「监控 tab 可见」时跑（switchTab 里 start/stop），切走即停，不占后台资源；
@@ -103,7 +103,40 @@ function monitorColorOf() {
     return map;
 }
 
-/** 图例用短名：worker 是完整 UUID，折线图图例里全写出来必然被截断。 */
+/**
+ * workerId → 展示名映射：worker 一律显示<b>所在机器的 hostname</b>（master 仍显示 master）。
+ *
+ * <p>同机多 Worker（开发时常在一台机器起多个进程）hostname 会重名，此时追加端口区分；
+ * 端口也拿不到就退回短 ID。快照里已下线、历史序列里仍有点的节点 → 短 ID 兜底。
+ * 任务管理页（{@code clusterData}）与监控页（{@code monitorData}）共用同一份映射来源。</p>
+ */
+function nodeLabelMap() {
+    var nodes = allNodes(monitorData);
+    if (!nodes.length) nodes = allNodes(clusterData);
+    var hostCount = {};
+    nodes.forEach(function (n) {
+        if (n && n.role !== 'master' && n.host) hostCount[n.host] = (hostCount[n.host] || 0) + 1;
+    });
+    var map = {};
+    nodes.forEach(function (n) {
+        if (!n || !n.workerId) return;
+        if (n.role === 'master') { map[n.workerId] = 'master'; return; }
+        if (!n.host) return;
+        map[n.workerId] = hostCount[n.host] > 1
+            ? n.host + (n.port > 0 ? ':' + n.port : ' #' + shortNodeId(n.workerId))   // 同机多 Worker：端口消歧
+            : n.host;
+    });
+    return map;
+}
+
+/** 单节点展示名（节点卡 / 折线图图例 / 执行 DAG 任务行共用）。 */
+function nodeLabelOf(id) {
+    if (!id) return '-';
+    if (id === 'master') return 'master';
+    return nodeLabelMap()[id] || shortNodeId(id);
+}
+
+/** 兜底短名：快照里找不到该 worker（已下线）时用 workerId 前 8 位。 */
 function shortNodeId(id) {
     if (!id) return '-';
     if (id === 'master') return 'master';
@@ -272,14 +305,16 @@ function renderNodeList(cluster) {
         container.innerHTML = '<div class="mon-empty">暂无节点（集群可能尚未启动 Worker）。</div>';
         return;
     }
+    var labels = nodeLabelMap();
     container.innerHTML = nodes.map(function (n) {
         var isMaster = n.role === 'master';
+        var label = labels[n.workerId] || shortNodeId(n.workerId);
         var memPct = memPctOf(n), heapPct = heapPctOf(n), diskPct = diskPctOf(n), directPct = directPctOf(n);
         var stateTxt = n.healthy ? esc(n.state) : 'UNHEALTHY';
         return '<div class="node-card">'
             + '<div class="node-head">'
             +   '<span class="node-dot ' + nodeStatus(n) + '"></span>'
-            +   '<span class="node-name" title="' + esc(n.workerId) + '">' + esc(n.workerId) + '</span>'
+            +   '<span class="node-name" title="' + esc(n.workerId) + '">' + esc(label) + '</span>'
             +   '<span class="node-role">' + (isMaster ? 'MASTER' : 'WORKER') + '</span>'
             + '</div>'
             + '<div class="node-meta">' + esc(n.host || '-') + (n.port ? ':' + n.port : '')
@@ -340,11 +375,12 @@ function metricRow(label, value, pct) {
         + '</div>';
 }
 
-// ---------------- 四张折线图 ----------------
+// ---------------- 八张折线图 ----------------
 
 function renderMonitorCharts(history) {
     var series = (history && history.series) || {};
     var colorOf = monitorColorOf();
+    var labels = nodeLabelMap();      // 图例显示 worker 所在机器 hostname
     var order = monitorNodeIds();
     var ids = Object.keys(series);
     ids.sort(function (a, b) {
@@ -355,13 +391,16 @@ function renderMonitorCharts(history) {
         return a < b ? -1 : a > b ? 1 : 0;
     });
 
-    var cpu = [], heap = [], thread = [], mem = [], direct = [], diskRead = [], diskWrite = [];
+    var cpu = [], net = [], heap = [], thread = [], mem = [], direct = [], diskRead = [], diskWrite = [];
     ids.forEach(function (id, i) {
         var pts = series[id] || [];
         var color = colorOf[id] || chartColor(i);
-        var label = shortNodeId(id);
+        var label = labels[id] || shortNodeId(id);
         cpu.push({ name: label, color: color, points: pts.map(function (p) {
             return { t: p.t, v: p.cpuPct >= 0 ? p.cpuPct : 0 };
+        }) });
+        net.push({ name: label, color: color, points: pts.map(function (p) {
+            return { t: p.t, v: (p.netRxBytesPerSec || 0) + (p.netTxBytesPerSec || 0) };
         }) });
         heap.push({ name: label, color: color, points: pts.map(function (p) {
             return { t: p.t, v: p.heapUsedBytes };
@@ -385,6 +424,8 @@ function renderMonitorCharts(history) {
 
     lineChart(document.getElementById('mon-chart-cpu'), cpu,
             { unit: 'pct', max: 100, min: 0, emptyText: 'CPU 采样积累中\u2026' });
+    lineChart(document.getElementById('mon-chart-net'), net,
+            { unit: 'bytesPerSec', emptyText: '网络采样积累中\u2026' });
     lineChart(document.getElementById('mon-chart-heap'), heap,
             { unit: 'bytes', emptyText: '堆采样积累中\u2026' });
     lineChart(document.getElementById('mon-chart-thread'), thread,

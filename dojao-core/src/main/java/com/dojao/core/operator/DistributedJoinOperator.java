@@ -42,7 +42,8 @@ import java.util.List;
  * @version 3.0
  * @date 2026/8/31
  */
-public class DistributedJoinOperator extends AbstractDistributedOperator implements Explainable {
+public class DistributedJoinOperator extends AbstractDistributedOperator
+        implements Explainable, WindowChainCarrier {
 
     private final String firstCatalog, firstSchema, firstTable;
     private final List<String> firstLeftKeys;
@@ -59,6 +60,18 @@ public class DistributedJoinOperator extends AbstractDistributedOperator impleme
      * 右表；元素 null = 该层普通基表扫描。null 列表 = 全普通（旧行为，逐字节不变）。
      */
     private final List<StageScheduler.DerivedSource> sources;
+    /**
+     * 最末层 join 输出上的<b>窗口分组链</b>（多 join 链 / 含派生源时同样下沉）：空 = 无窗口链。
+     * 与 {@link #followUp} 互斥（followUp 只承载同 key 聚合 / 单窗口后续计算）。
+     */
+    private List<FragmentSpec.WindowStep> windowChain;
+    /** 外连接同名列消歧别名（空 = 无）：最末层 join 片段在 join 之后、窗口重分区之前套用。 */
+    private final List<FragmentSpec.JoinAlias> outputAliases;
+    /**
+     * 二级聚合（外层全局聚合下沉）：最末层 join→聚合输出后同 Worker 零交换再聚一次，每分区只回传
+     * 1 行 partial，Master 侧 {@code PartialAggregationMergeOperator} 合并。null = 无。
+     */
+    private FragmentSpec.AggregateStep partialFollowUp;
 
     /**
      * 单 join 便捷构造：等价于 {@code links=[JoinLink(..., rightKeys, ...)]} 的 1 元素链。
@@ -121,6 +134,30 @@ public class DistributedJoinOperator extends AbstractDistributedOperator impleme
     }
 
     /**
+     * 带算法 + 列裁剪 + <b>ON 单侧残差谓词</b>的单 join 构造。
+     *
+     * <p>残差谓词只引用一侧（如 {@code FULL JOIN ... ON l.k = r.k AND l.dt = '...'}），
+     * 不能下推到扫描（保留侧的未匹配行仍须输出），由 Worker 内的 {@code HashJoinOperator}
+     * 在匹配阶段求值。带残差的 join 只能走 HASH（{@link JoinLink} 构造期已强制降级）。</p>
+     */
+    public DistributedJoinOperator(String queryId,
+                                   String leftCatalog, String leftSchema, String leftTable, List<String> leftKeys,
+                                   String rightCatalog, String rightSchema, String rightTable, List<String> rightKeys,
+                                   JoinType joinType, long memoryLimit, int numPartitions,
+                                   WorkerGateway gateway, DojaoConnector leftProbe, DojaoConnector rightProbe,
+                                   List<WorkerRegistration> workers,
+                                   String leftFilter, String rightFilter,
+                                   FragmentSpec.JoinAlgorithm algorithm,
+                                   List<String> leftColumns, List<String> rightColumns,
+                                   String onLeftFilter, String onRightFilter) {
+        this(queryId, leftCatalog, leftSchema, leftTable, leftKeys, leftProbe, leftFilter,
+                List.of(new JoinLink(leftKeys, rightKeys, joinType,
+                        rightCatalog, rightSchema, rightTable, rightProbe, rightFilter, algorithm,
+                        rightColumns, null, onLeftFilter, onRightFilter)),
+                memoryLimit, numPartitions, gateway, workers, null, leftColumns);
+    }
+
+    /**
      * 完整构造（多 join 链 / 带 followUp）：{@code followUp} 非 null 时最末层 Consumer 链式执行
      * 聚合 / 窗口（worker 本地 join → 本地后续计算 → 回传，零二次交换，master 不吸原始 join 行）。
      *
@@ -164,6 +201,37 @@ public class DistributedJoinOperator extends AbstractDistributedOperator impleme
                                    WorkerGateway gateway, List<WorkerRegistration> workers,
                                    FragmentSpec.FollowUp followUp, List<String> firstColumns,
                                    List<StageScheduler.DerivedSource> sources) {
+        this(queryId, firstCatalog, firstSchema, firstTable, firstLeftKeys, firstProbe, firstFilter,
+                links, memoryLimit, numPartitions, gateway, workers, followUp, firstColumns, sources,
+                List.of());
+    }
+
+    /** 完整构造 + 派生源 + 窗口链（多 join / 含派生源的窗口下沉）。 */
+    public DistributedJoinOperator(String queryId,
+                                   String firstCatalog, String firstSchema, String firstTable,
+                                   List<String> firstLeftKeys, DojaoConnector firstProbe,
+                                   String firstFilter,
+                                   List<JoinLink> links, long memoryLimit, int numPartitions,
+                                   WorkerGateway gateway, List<WorkerRegistration> workers,
+                                   FragmentSpec.FollowUp followUp, List<String> firstColumns,
+                                   List<StageScheduler.DerivedSource> sources,
+                                   List<FragmentSpec.WindowStep> windowChain) {
+        this(queryId, firstCatalog, firstSchema, firstTable, firstLeftKeys, firstProbe, firstFilter,
+                links, memoryLimit, numPartitions, gateway, workers, followUp, firstColumns, sources,
+                windowChain, List.of());
+    }
+
+    /** 同上 + 外连接同名列消歧别名：最末层 join 片段在 join 之后、窗口重分区之前套用。 */
+    public DistributedJoinOperator(String queryId,
+                                   String firstCatalog, String firstSchema, String firstTable,
+                                   List<String> firstLeftKeys, DojaoConnector firstProbe,
+                                   String firstFilter,
+                                   List<JoinLink> links, long memoryLimit, int numPartitions,
+                                   WorkerGateway gateway, List<WorkerRegistration> workers,
+                                   FragmentSpec.FollowUp followUp, List<String> firstColumns,
+                                   List<StageScheduler.DerivedSource> sources,
+                                   List<FragmentSpec.WindowStep> windowChain,
+                                   List<FragmentSpec.JoinAlias> outputAliases) {
         super("DistributedJoin", queryId, numPartitions, gateway, workers);
         this.firstCatalog = firstCatalog;
         this.firstSchema = firstSchema;
@@ -176,6 +244,8 @@ public class DistributedJoinOperator extends AbstractDistributedOperator impleme
         this.memoryLimit = memoryLimit;
         this.followUp = followUp;
         this.sources = sources;
+        this.windowChain = windowChain == null ? List.of() : List.copyOf(windowChain);
+        this.outputAliases = outputAliases == null ? List.of() : List.copyOf(outputAliases);
     }
 
     @Override
@@ -183,7 +253,8 @@ public class DistributedJoinOperator extends AbstractDistributedOperator impleme
         JoinChainStage stage = StageScheduler.planJoinChain(
                 queryId, workers, numPartitions,
                 firstCatalog, firstSchema, firstTable, firstLeftKeys, firstProbe, firstFilter,
-                links, memoryLimit, followUp, firstColumns, sources);
+                links, memoryLimit, followUp, firstColumns, sources, windowChain, outputAliases,
+                partialFollowUp);
         // 片段已在 planJoinChain 内按反死锁顺序排好：最终 Consumer → 中间层逆序 → 基表 Producers
         for (FragmentSpec fragment : withTerminal(stage.fragments())) {   // 分布式写 SinkStep + top-N 截断尾
 
@@ -226,6 +297,16 @@ public class DistributedJoinOperator extends AbstractDistributedOperator impleme
     public List<StageScheduler.DerivedSource> sources() { return sources; }
 
     /**
+     * 最末层 join 之后的同 key 后续阶段（聚合 / 单窗口）；null = 纯 join。
+     *
+     * <p><b>规划期不变量</b>：携带 followUp 的算子已是「后续计算边界」，Master 侧<b>不得</b>把它
+     * 当作可重建的 join 基 —— {@link #withAggregate} / {@link #withWindowChain} 都只从
+     * {@code links} 重建新算子，会把既有 followUp 静默丢弃（聚合套聚合 → 内层聚合消失、
+     * 外层引用其别名恒 NULL）。见 {@code Planner#isBareJoin}。</p>
+     */
+    public FragmentSpec.FollowUp followUp() { return followUp; }
+
+    /**
      * EXPLAIN 明细：probe 侧来源 + 逐层 join 的连接类型 / build 侧表 / 连接键 / 算法。
      *
      * <p>多表链在 Master 侧只是一个节点，看不出「每层用了什么」—— 把
@@ -251,7 +332,17 @@ public class DistributedJoinOperator extends AbstractDistributedOperator impleme
                     + " keys=" + keys
                     + " algo=" + JoinExplain.distributed(link.algorithm(), memoryLimit, numPartitions)
                     + (link.rightFilter() != null && !link.rightFilter().isBlank()
-                            ? " filter=[" + link.rightFilter() + "]" : ""));
+                            ? " filter=[" + link.rightFilter() + "]" : "")
+                    // ON 单侧残差：未下推到扫描（保留侧还要输出孤儿行），在 Worker 的匹配阶段求值
+                    + (link.onLeftFilter() != null ? " onLeft=[" + link.onLeftFilter() + "]" : "")
+                    + (link.onRightFilter() != null ? " onRight=[" + link.onRightFilter() + "]" : ""));
+        }
+        for (int g = 0; g < windowChain.size(); g++) {
+            FragmentSpec.WindowStep w = windowChain.get(g);
+            out.add("window-" + (g + 1) + ": partitionBy=" + w.partitionBy()
+                    + " orderBy=" + w.orderBy()
+                    + (w.filter() != null ? " preFilter=[" + w.filter().describe() + "]" : "")
+                    + (g == 0 ? " (join 输出重分区)" : " (上一组窗口输出重分区)"));
         }
         return out;
     }
@@ -319,14 +410,89 @@ public class DistributedJoinOperator extends AbstractDistributedOperator impleme
      * 最末层 join 的分区键（last link 左键）——分区键 ⊆ 分组键 → 每个分组完全落在同一分区，
      * worker 本地聚合即为最终结果，master 零合并。
      */
+    /**
+     * 克隆本算子并挂上<b>窗口分组链</b>（join → 窗口#0 → 重分区 → 窗口#1 …，全留 Worker）：
+     * links / sources / 各层过滤与列裁剪原样保留（派生流水线不丢）。返回的新算子替代原算子执行。
+     */
+    public DistributedJoinOperator withWindowChain(List<FragmentSpec.WindowStep> steps) {
+        return withWindowChain(steps, outputAliases);
+    }
+
+    /**
+     * 同上 + 外连接同名列消歧：{@code outputAliases} 由最末层 join 片段在 join 之后、窗口重分区
+     * 之前套用（窗口键 / 值表达式经 {@code aliasOuterJoinKeyRefs} 改写为引用 {@code __jk_*}）。
+     */
+    public DistributedJoinOperator withWindowChain(List<FragmentSpec.WindowStep> steps,
+                                                   List<FragmentSpec.JoinAlias> aliases) {
+        requireBare("windowChain");
+        return new DistributedJoinOperator(queryId, firstCatalog, firstSchema, firstTable,
+                firstLeftKeys, firstProbe, firstFilter, links, memoryLimit, numPartitions,
+                gateway, workers, null, firstColumns, sources, steps, aliases);
+    }
+
+    /**
+     * 本算子必须仍是<b>纯 join</b>（无 followUp / windowChain）才能向上叠加新阶段。
+     *
+     * <p>从 {@code links} 重建的构造器不复制既有阶段 —— 一旦被误用在「已有后续计算」的算子上，
+     * 会把内层聚合 / 窗口整段顶掉（历史缺陷：三表 join 下聚合套聚合静默返回 NULL）。这里改为
+     * 规划期直接抛错，让任何未来的错误调用都显式失败，而不是产出错误数据。</p>
+     */
+    private void requireBare(String stage) {
+        if (followUp != null || !windowChain.isEmpty()) {
+            throw new IllegalStateException(
+                    "DistributedJoinOperator 已携带后续阶段（followUp="
+                            + (followUp == null ? "null" : followUp.getClass().getSimpleName())
+                            + ", windowGroups=" + windowChain.size()
+                            + "），不能再叠加 " + stage + " —— 重建舞台会丢弃既有阶段");
+        }
+    }
+
+    /** 最末层 join 上的窗口分组链（空 = 无）。 */
+    public List<FragmentSpec.WindowStep> windowChain() { return windowChain; }
+
+    /** 外连接同名列消歧别名（空 = 无）。 */
+    public List<FragmentSpec.JoinAlias> outputAliases() { return outputAliases; }
+
+    /**
+     * <b>全状态复制</b>：links / sources / followUp / windowChain / outputAliases 原样保留。
+     *
+     * <p>叠加阶段一律基于本方法再替换目标字段，禁止再用「只传 links + 部分字段」的位置参数
+     * 构造器 —— 那正是历史上静默丢内层阶段的根因。</p>
+     */
+    public DistributedJoinOperator copy() {
+        DistributedJoinOperator copy = new DistributedJoinOperator(queryId, firstCatalog, firstSchema,
+                firstTable, firstLeftKeys, firstProbe, firstFilter, links, memoryLimit, numPartitions,
+                gateway, workers, followUp, firstColumns, sources, windowChain, outputAliases);
+        copy.partialFollowUp = this.partialFollowUp;
+        return copy;
+    }
+
+    /** 设置二级聚合（外层全局聚合下沉；Planner 在 doOpen 前调用，null = 无）。 */
+    public void setPartialFollowUp(FragmentSpec.AggregateStep f) { this.partialFollowUp = f; }
+
+    /** 已设置的二级聚合（可空；审计 / EXPLAIN 只读）。 */
+    public FragmentSpec.AggregateStep partialFollowUp() { return partialFollowUp; }
+
+    @Override
+    public List<FragmentSpec.WindowStep> windowSteps() { return windowChain; }
+
+    @Override
+    public void replaceWindowSteps(List<FragmentSpec.WindowStep> steps) {
+        if (steps == null || steps.isEmpty()) return;
+        this.windowChain = List.copyOf(steps);
+    }
+
     public DistributedJoinOperator withAggregate(List<String> keys, List<AggregationSpec> aggs,
                                                  List<CaseProjection> caseProjections) {
+        requireBare("aggregate");
         FragmentSpec.AggregateStep step = new FragmentSpec.AggregateStep(
                 keys, aggs.stream().map(FragmentSpec.AggregationDto::of).toList(),
                 caseProjections, memoryLimit, numPartitions);
+        // 全状态构造：sources / windowChain / outputAliases 原样保留（禁止只传 links 的便捷
+        // 构造器 —— 它会把派生流水线与别名静默清空，三表 join 静默 NULL 的历史根因）。
         return new DistributedJoinOperator(queryId, firstCatalog, firstSchema, firstTable,
                 firstLeftKeys, firstProbe, firstFilter, links, memoryLimit, numPartitions,
-                gateway, workers, step, firstColumns);
+                gateway, workers, step, firstColumns, sources, windowChain, outputAliases);
     }
 
     @Override
@@ -345,6 +511,10 @@ public class DistributedJoinOperator extends AbstractDistributedOperator impleme
                     link.rightTable(), link.rightColumns());
             wire = joinOutputFields(link.joinType(), wire, right, link.leftKeys(), link.rightKeys());
             idx++;
+        }
+        if (!windowChain.isEmpty()) {
+            // 窗口链：逐组按声明输出列重定基并追加窗口函数列（K 形状投影吸收见基类 helper）。
+            return windowChainOutputFields(wire, windowChain);
         }
         if (followUp == null) {
             return wire;   // 普通 Consumer：join 输出页即最终页

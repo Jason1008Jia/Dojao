@@ -23,6 +23,15 @@ function statePillBg(state) {
         : UI.neutral;
 }
 
+/**
+ * Worker 展示名：任务卡 / 任务详情统一显示 worker 所在机器的 hostname（与监控页图例同一映射），
+ * 快照里已下线、拿不到 host 时退回 workerId 短串。
+ */
+function workerLabel(workerId) {
+    if (!workerId) return '';
+    return (typeof nodeLabelOf === 'function') ? nodeLabelOf(workerId) : midStr(workerId, 8);
+}
+
 // ==================== 算子详情 ====================
 
 /** 双击 DAG 节点进入（node.idx）。 */
@@ -220,7 +229,7 @@ function renderTaskPage(page) {
                         + '<span class="task-dot2 ' + (running ? 'run' : 'done') + '"></span>'
                         + '<span class="task-name" title="' + esc(t.taskId) + '">' + midStr(t.taskId, 14) + '</span>'
                         + kind
-                        + '<span style="font-size:11px;color:' + UI.faint + ';max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(t.workerId) + '">@' + midStr(t.workerId, 8) + '</span>'
+                        + '<span style="font-size:11px;color:' + UI.faint + ';max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(t.workerId) + '">@' + esc(workerLabel(t.workerId)) + '</span>'
                         + '<span class="task-status" style="color:' + stateTextColor(t.state) + '">' + esc(t.state) + '</span>'
                         + '<span class="task-metrics" style="font-size:11px;color:' + UI.faint + '">' + fmtRows(t.rows) + ' 行 · ' + fmtDuration(t.elapsedMs) + '</span>'
                         + '</div>';
@@ -282,7 +291,7 @@ function refreshTaskDetail() {
 
     setTextIfChanged(document.getElementById('task-detail-label'), midStr(t.taskId, 20));
     setTextIfChanged(document.getElementById('task-detail-sub'), (t.kind || 'task')
-        + (t.producer ? ' · producer' : ' · consumer') + '   @' + (t.workerId || ''));
+        + (t.producer ? ' · producer' : ' · consumer') + '   @' + workerLabel(t.workerId));
 
     var tag = document.getElementById('task-detail-tag');
     setTextIfChanged(tag, t.state || '?');
@@ -303,7 +312,7 @@ function refreshTaskDetail() {
             + metricRow('状态', esc(t.state || ''))
             + metricRow('类型', esc(t.kind || ''))
             + metricRow('角色', t.producer ? 'producer（生成方）' : 'consumer（消费方）')
-            + metricRow('Worker', esc(t.workerId || ''))
+            + metricRow('Worker', esc(workerLabel(t.workerId)))
             + metricRow('输出行数', fmtRows(t.rows))
             + metricRow('已用耗时', fmtDuration(t.elapsedMs))
             + '</div></div>';

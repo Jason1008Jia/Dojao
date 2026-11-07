@@ -148,6 +148,7 @@ public class QueryServiceImpl {
                     queryId, parallelism, explain.analyze());
             if (!explain.analyze()) {
                 emit(chunkSink, respondExplain(queryId, physical.explainText(), startNanos));
+                physical.close();   // 未执行也可能已规划出物化 CTE：释放目录 / 载荷
                 return;
             }
             // EXPLAIN ANALYZE：真正执行一次语句，再把各节点实际输出行数回填到计划树。
@@ -157,15 +158,19 @@ public class QueryServiceImpl {
                 throw new UnsupportedOperationException(
                         "EXPLAIN ANALYZE 只支持只读查询（不支持 INSERT / CTAS）");
             }
-            Map<String, Long> sourceRows = probeSourceRows(explain.statement());
-            QueryManager qm = new QueryManager(queryId, sql, physical, 0, sourceRows);
-            QueryManagerRegistry.get().register(qm);
-            // 直接消费算子链并把结果丢弃（EXPLAIN ANALYZE 只回传计划文本，不回传数据行）
-            respondRows(queryId, physical, qm, startNanos, ignored -> { });
-            String analyzed = com.dojao.core.planner.PhysicalPlanPrinter.print(
-                    physical.root(), qm.actualRows());
-            emit(chunkSink, respondExplain(queryId, analyzed, startNanos));
-            return;
+            try {
+                Map<String, Long> sourceRows = probeSourceRows(explain.statement());
+                QueryManager qm = new QueryManager(queryId, sql, physical, 0, sourceRows);
+                QueryManagerRegistry.get().register(qm);
+                // 直接消费算子链并把结果丢弃（EXPLAIN ANALYZE 只回传计划文本，不回传数据行）
+                respondRows(queryId, physical, qm, startNanos, ignored -> { });
+                String analyzed = com.dojao.core.planner.PhysicalPlanPrinter.print(
+                        physical.root(), qm.actualRows());
+                emit(chunkSink, respondExplain(queryId, analyzed, startNanos));
+                return;
+            } finally {
+                physical.close();
+            }
         }
         if (plan instanceof LogicalPlan.CreateFunction cf) {
             // CREATE FUNCTION：后端解析 → 冒烟校验（失败 fail-fast 不落库）→ 内存注册 + 持久化
@@ -229,8 +234,9 @@ public class QueryServiceImpl {
         }
         // 扫描源总量探查（Progress 分母）：与并行度探查同源，供 QueryManager 挂到 Producer 任务
         Map<String, Long> sourceRows = probeSourceRows(plan);
+        Planner effective = null;
         try {
-            Planner effective = planner.withParallelism(localScan ? 1 : granted);
+            effective = planner.withParallelism(localScan ? 1 : granted);
             if (localScan) {
                 effective = effective.withLocalScanOnly(true);
                 log.info("Master 本地执行命中: queryId={}, sql={}", queryId, sql);
@@ -251,6 +257,10 @@ public class QueryServiceImpl {
             }
             respondRows(queryId, physical, qm, startNanos, chunkSink);
         } finally {
+            // 物化 CTE 的目录 / 载荷随查询生命周期回收（成功、失败、取消、规划期异常都覆盖）。
+            if (effective != null) {
+                effective.releaseMaterializedCtes();
+            }
             if (admitted) {
                 budget.release(queryId);
             }

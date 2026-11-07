@@ -148,6 +148,18 @@ public abstract class AbstractSpillableOperator<S extends Slot>
     private volatile ExecutorService phase2Executor;
 
     /**
+     * 子类置 true：Phase 2 各分区<b>并行归并</b>，但「吐页」阶段按活跃分区升序<b>串行</b>。
+     *
+     * <p>为什么需要：下游 {@link WindowFunctionOperator} 依据「相邻行的 PARTITION BY 键」识别分区边界。
+     * 同一工人持有多个 shuffle 桶时，多分区 WindowSort 并发吐出的页若交错，下游会把同一分区误判成
+     * 多次分区切换 → 静默算错 RANK / 累计帧。聚合类下游不按相邻行感知分区，保持并行即可。</p>
+     */
+    protected boolean orderedEmit;
+
+    /** Phase 2 有序输出门（{@link #orderedEmit} 开启时创建；null = 无序，可自由交错）。 */
+    private volatile EmitGate emitGate;
+
+    /**
      * 当前溢写目录（{@code <root>/<spillDirName>}）。<b>可变</b>：所在盘达到使用率上限时，
      * {@link #spillDirForWrite()} 会换到 {@code query.spill.dir} 里另一块合格的盘（见 {@link SpillDirs}）。
      */
@@ -445,6 +457,25 @@ public abstract class AbstractSpillableOperator<S extends Slot>
         this.groupKeyColumns = resolveGroupKeyColumns();
     }
 
+    /**
+     * <b>取消检查点</b> —— Phase 1 收页循环与 Phase 2 归并 / 压缩 / 交付循环每轮调用一次。
+     *
+     * <p>取消只靠线程中断传播，但纯 CPU 循环（K 路归并、多轮压缩、collect 交付、排序拼接）
+     * 没有任何阻塞点，中断标记永远不会被读到：{@link #doClose()} 的 {@code shutdownNow()} 只能
+     * 「请求」退出，线程照样把整份溢写归并烧完 —— 表现就是任务已停（WebUI Running=0）、
+     * 各 Worker CPU 仍 98~99%、堆外内存不释放。这里显式抬头，让取消立刻生效。</p>
+     *
+     * <p>抛的是 <b>unchecked</b> 的 {@link CancellationException}：子类的归并 / 压缩方法签名各异
+     * （{@code throws IOException} / 无 throws），受检异常会把改动扩散到每个私有方法。收口点
+     * （{@link #startPhase2()} 的归并任务、{@code JoinSortOperator} 的并行线程）都显式捕获它并
+     * 静默收手，<b>不会</b>记成「分区归并失败」。</p>
+     */
+    protected void checkCancelled() {
+        if (closed || Thread.currentThread().isInterrupted()) {
+            throw new CancellationException("operator cancelled: " + getStats().getOperatorId());
+        }
+    }
+
     @Override
     protected synchronized Page doNext() throws Exception {
         // ====== Phase 1: 消费上游，三缓冲异步溢写 ======
@@ -455,6 +486,9 @@ public abstract class AbstractSpillableOperator<S extends Slot>
         // 聚合累积本质串行，锁只让消费线程排队，无死锁（上游 scan 生产线程独立、phase2
         // 任务不重入 next()）。
         while (!upstreamExhausted && outputQueue.isEmpty()) {
+            // 取消检查：不能等上游自己发现（它可能把中断吞成 EOF），否则取消后仍会跑完整份
+            // Phase 2 溢写归并 —— 这正是「停了任务 CPU 仍 100%」的主要来源。
+            checkCancelled();
             Page input = upstream.next();
             if (input.isEOF()) { upstreamExhausted = true; break; }
             recordInput(input);
@@ -470,6 +504,8 @@ public abstract class AbstractSpillableOperator<S extends Slot>
 
         // ====== Phase 2: 分区级并行归并（流式，不在本方法内等完成） ======
         if (upstreamExhausted && !phase2Started) {
+            // 取消恰好发生在最后一批之后：绝不再起 Phase 2（否则整份溢写归并会在取消后跑完）。
+            checkCancelled();
             startPhase2();
         }
 
@@ -502,6 +538,18 @@ public abstract class AbstractSpillableOperator<S extends Slot>
      * <p>失败记入 {@link #phase2Failure}（不吞），由消费者 fail-fast 抛出；每个任务在 finally 里递减
      * {@link #phase2Remaining}，归零且队列排空即真 EOF。</p>
      */
+    /**
+     * 进入「吐页」阶段前的有序门（仅 {@link #orderedEmit} 开启且活跃分区 &gt; 1 时生效）：
+     * 等待前一个活跃分区吐完再开始。归并本身（{@code compactPartition}）在调用之前完成，仍并行。
+     *
+     * <p>不可中断等待：被取消时补回中断标记并立即返回，由后续阻塞点（{@link #emitPage}）收手；
+     * 后继分区由任务 finally 的门 {@code endTurn} 放行，不会死锁。</p>
+     */
+    protected void beginOutput(int pid) {
+        EmitGate g = emitGate;
+        if (g != null) g.awaitTurn(pid);
+    }
+
     private void startPhase2() {
         phase2Started = true;
         long t1 = System.currentTimeMillis();
@@ -525,6 +573,11 @@ public abstract class AbstractSpillableOperator<S extends Slot>
         for (PartitionState<S> pa : partitions) {
             if (pa != null && pa.hasData()) activeCount++;
         }
+        int[] activePids = new int[activeCount];
+        for (int pid = 0, k = 0; pid < partitions.length; pid++) {
+            PartitionState<S> pa = partitions[pid];
+            if (pa != null && pa.hasData()) activePids[k++] = pid;
+        }
         phase2Remaining.set(activeCount);
         if (activeCount == 0) {
             // 空输入收尾：默认不产出（分组聚合 / 去重 / 排序空输入本就该是空结果）；
@@ -539,6 +592,10 @@ public abstract class AbstractSpillableOperator<S extends Slot>
             return;
         }
 
+        // 有序输出门只在「子类要求 + 多活跃分区」时建立；单分区 / 无序下游不引入任何等待。
+        final EmitGate gate = (orderedEmit && activeCount > 1) ? new EmitGate(activePids) : null;
+        this.emitGate = gate;
+
         ExecutorService exec = Executors.newFixedThreadPool(activeCount);
         phase2Executor = exec;
         for (int pid = 0; pid < partitions.length; pid++) {
@@ -547,6 +604,7 @@ public abstract class AbstractSpillableOperator<S extends Slot>
             if (pa == null || !pa.hasData()) continue;
             exec.submit(() -> {
                 try {
+                    checkCancelled();
                     // 分区任务开跑 → 归并推进。子类在归并循环内还有更细粒度的 bump；
                     // 这里兜住「子类未细分」的实现（如 JoinSortOperator），保证心跳不断档。
                     bumpMergeProgress();
@@ -561,11 +619,16 @@ public abstract class AbstractSpillableOperator<S extends Slot>
                     // 被取消（shutdownNow / future.cancel(true)）≠ 失败：不记 failure、不打失败日志，
                     // 恢复中断标记后收手（emitPage 内部吞中断，这里兜住子类归并循环抛出的中断）。
                     Thread.currentThread().interrupt();
+                } catch (CancellationException ce) {
+                    // checkCancelled() 的收口点：取消 ≠ 失败，静默收手（绝不记 phase2Failure）。
+                    Thread.currentThread().interrupt();
                 } catch (Throwable e) {
                     System.err.printf("[%s] Partition %d failed: %s%n",
                             getClass().getSimpleName(), p, e.getMessage());
                     phase2Failure.compareAndSet(null, e);
                 } finally {
+                    // 先放行下一个活跃分区的吐页（失败 / 取消也放行，否则后继永等）
+                    if (gate != null) gate.endTurn(p);
                     try { pa.close(); } catch (Exception ignored) {}
                     partitions[p] = null;
                     phase2Remaining.decrementAndGet();   // 最后一个动作：归零即「不会再 emit」
@@ -1146,4 +1209,47 @@ public abstract class AbstractSpillableOperator<S extends Slot>
     @Override public void setMemoryBudget(long b) {}
     @Override public SpillResult spill(long t) { return SpillResult.noOp(); }
     @Override public boolean isSpilling() { return false; }
+
+    /**
+     * 有序输出门：按活跃分区升序串行「吐页」。分区 j 等前驱 j-1 的 {@link #endTurn} 后才开始吐页；
+     * 每个任务在 finally 里（无论成功 / 失败 / 取消）都放行后继，保证不会因某个分区异常而卡死。
+     */
+    private static final class EmitGate {
+
+        /** 每个活跃分区一把「已吐完」闸；任务 j 完成时 countDown，解锁 j+1。 */
+        private final CountDownLatch[] turns;
+        private final Map<Integer, Integer> indexByPid;
+
+        EmitGate(int[] activePids) {
+            int n = activePids.length;
+            this.turns = new CountDownLatch[n];
+            this.indexByPid = new HashMap<>(n * 2);
+            for (int i = 0; i < n; i++) {
+                turns[i] = new CountDownLatch(1);
+                indexByPid.put(activePids[i], i);
+            }
+        }
+
+        /** 等待前一个活跃分区吐完（首个活跃分区直接通过；未登记的 pid 直接通过）。 */
+        void awaitTurn(int pid) {
+            Integer idx = indexByPid.get(pid);
+            if (idx == null || idx == 0) return;
+            while (true) {
+                try {
+                    turns[idx - 1].await();
+                    return;
+                } catch (InterruptedException ie) {
+                    // 被取消：补回标记后立即返回，由后续 emitPage 的 closed 检查收手；后继由 endTurn 放行
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+
+        /** 本分区吐页结束：放行下一个活跃分区。 */
+        void endTurn(int pid) {
+            Integer idx = indexByPid.get(pid);
+            if (idx != null) turns[idx].countDown();
+        }
+    }
 }
