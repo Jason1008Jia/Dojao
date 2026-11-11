@@ -25,9 +25,16 @@ import java.util.List;
  *
  * <h3>Join 特有内存</h3>
  * <ol start="4">
- *   <li>{@code rowIndices} —— rowIndices[groupIdx] = 该 group 的 build 侧行索引列表</li>
+ *   <li>{@code groupHead/groupTail/nextRow} —— 每组一条 build 行号的<b>数组化单链表</b>
+ *       （groupHead[g] 首行、nextRow[r] 组内下一行、-1 结束）</li>
  *   <li>{@code buildVectors} —— 存储 build 侧所有列的所有行（按插入顺序）</li>
  * </ol>
+ *
+ * <p><b>为什么不用 {@code List<List<Integer>>}</b>：高基数 build 键（如唯一 event_id / member_code，
+ * 数百万行）时每组一个 {@code ArrayList} + 每行一个装箱 {@code Integer}，实测 2M 行约 200MB
+ * <b>Java 堆</b>，而 {@link #estimateMemoryBytes()} 只算 Arrow 向量 ⇒ 预算闸门看不见它，
+ * 进程在「堆外才 216/218MB」时先被堆 OOM 打死（线上 2026-11-11 三表 join 回退 Master 的实锤）。
+ * 数组化后同样的 2M 行只要 ~24MB，且如实计入预算。</p>
  *
  * <h3>与 AggregationHashTable 的核心区别</h3>
  * <ul>
@@ -43,9 +50,13 @@ public class JoinHashTable extends RowHashTable {
     private final Schema buildSchema;
     private final int buildColumnCount;
 
-    // ==================== 行索引 ====================
-    // rowIndices[groupIdx] = list of row indices in buildVectors
-    private final List<List<Integer>> rowIndices;
+    // ==================== 行索引（数组化单链表）====================
+    /** groupIdx → 该组首个 build 行号（-1 = 空组）。 */
+    private int[] groupHead;
+    /** groupIdx → 该组末个 build 行号（-1 = 空组），追加时 O(1) 接链。 */
+    private int[] groupTail;
+    /** build 行号 → 组内下一个 build 行号（-1 = 组结束）。 */
+    private int[] nextRow;
 
     // ==================== Build 侧全量数据 ====================
     private List<FieldVector> buildVectors;
@@ -65,7 +76,11 @@ public class JoinHashTable extends RowHashTable {
         super(allocator, keyColumns, keyFields);
         this.buildSchema = buildSchema;
         this.buildColumnCount = buildSchema.getFields().size();
-        this.rowIndices = new ArrayList<>();
+        this.groupHead = new int[INITIAL_CAPACITY];
+        this.groupTail = new int[INITIAL_CAPACITY];
+        Arrays.fill(groupHead, -1);
+        Arrays.fill(groupTail, -1);
+        this.nextRow = new int[DEFAULT_VECTOR_CAPACITY];
         this.buildRowCount = 0;
         this.buildVectors = null;
         this.buildTransfers = null;
@@ -79,7 +94,16 @@ public class JoinHashTable extends RowHashTable {
      */
     @Override
     protected void appendToGroup(Page input, int rowIndex, int groupIdx) {
-        rowIndices.get(groupIdx).add(buildRowCount);
+        int row = buildRowCount;   // afterRow 才 ++，这里正是本 build 行号
+        ensureNextRowCapacity(row);
+        nextRow[row] = -1;
+        int tail = groupTail[groupIdx];
+        if (tail < 0) {
+            groupHead[groupIdx] = row;
+        } else {
+            nextRow[tail] = row;
+        }
+        groupTail[groupIdx] = row;
     }
 
     /**
@@ -111,10 +135,12 @@ public class JoinHashTable extends RowHashTable {
         buckets[bucket] = newGroupIdx;
         groupCount++;
 
-        // 行索引列表
-        List<Integer> indices = new ArrayList<>();
-        indices.add(buildRowCount);
-        rowIndices.add(indices);
+        // 行索引：该组链表首尾都指向当前 build 行（appendToGroup 之后 O(1) 接链）
+        ensureGroupCapacity(newGroupIdx);
+        ensureNextRowCapacity(buildRowCount);
+        nextRow[buildRowCount] = -1;
+        groupHead[newGroupIdx] = buildRowCount;
+        groupTail[newGroupIdx] = buildRowCount;
 
         return newGroupIdx;
     }
@@ -148,9 +174,19 @@ public class JoinHashTable extends RowHashTable {
         return -1;
     }
 
-    /** 获取某个 group 对应的所有 build 侧行索引列表。 */
-    public List<Integer> getMatchingRows(int groupIdx) {
-        return rowIndices.get(groupIdx);
+    /** 该 group 首个 build 行号（-1 = 该组无行，正常不会出现）。 */
+    public int firstMatchingRow(int groupIdx) {
+        return groupIdx >= 0 && groupIdx < groupHead.length ? groupHead[groupIdx] : -1;
+    }
+
+    /**
+     * 组内下一个 build 行号（-1 = 组结束）。
+     *
+     * <p>与 {@link #firstMatchingRow(int)} 配对遍历，<b>零分配</b> —— probe 热路径逐行调用，
+     * 不能返回装箱列表/数组副本。</p>
+     */
+    public int nextMatchingRow(int buildRow) {
+        return nextRow[buildRow];
     }
 
     // ==================== 行提取 ====================
@@ -198,6 +234,10 @@ public class JoinHashTable extends RowHashTable {
         long total = super.estimateMemoryBytes();
         if (buildVectors != null)
             for (FieldVector vec : buildVectors) total += vec.getBufferSize();
+        // 行索引是 Java 堆（Arrow 分配器看不见），必须如实计入 —— 否则 build 闸门放行后堆先炸。
+        total += (long) groupHead.length * Integer.BYTES;
+        total += (long) groupTail.length * Integer.BYTES;
+        total += (long) nextRow.length * Integer.BYTES;
         return total;
     }
 
@@ -213,10 +253,29 @@ public class JoinHashTable extends RowHashTable {
             buildVectors.clear();
             buildTransfers.clear();
         }
-        rowIndices.clear();
     }
 
     // ==================== 内部方法 ====================
+
+    /** 组索引数组扩容（扩容后新槽位必须是 -1 = 空组）。 */
+    private void ensureGroupCapacity(int groupIdx) {
+        if (groupIdx < groupHead.length) return;
+        int cap = groupHead.length;
+        while (cap <= groupIdx) cap <<= 1;
+        int old = groupHead.length;
+        groupHead = Arrays.copyOf(groupHead, cap);
+        groupTail = Arrays.copyOf(groupTail, cap);
+        Arrays.fill(groupHead, old, cap, -1);
+        Arrays.fill(groupTail, old, cap, -1);
+    }
+
+    /** 行链表数组扩容（新槽位由调用方在写入时置 -1，无需预填）。 */
+    private void ensureNextRowCapacity(int buildRow) {
+        if (buildRow < nextRow.length) return;
+        int cap = nextRow.length;
+        while (cap <= buildRow) cap <<= 1;
+        nextRow = Arrays.copyOf(nextRow, cap);
+    }
 
     @Override
     protected void ensureTransfers(Page input) {

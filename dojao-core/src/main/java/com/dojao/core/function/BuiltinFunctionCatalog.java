@@ -18,7 +18,8 @@ import java.util.Map;
  *       （{@code cosine_similarity / l2_distance / inner_product / if}），
  *       {@code detail} 取 {@link com.dojao.spi.function.Function#display()}。</li>
  *   <li><b>标量（表达式内置）</b>：{@link ExprBuiltins#names()}（日期/数学/字符串共 15 个）。</li>
- *   <li><b>聚合（内建快速路径）</b>：{@code count / count_distinct / sum / avg / min / max}，
+ *   <li><b>聚合（内建快速路径）</b>：{@code count / count_distinct / sum / avg / min / max}
+ *       与条件聚合 {@code count_if / sum_if / max_if / min_if}，
  *       与 {@code FragmentExecutor.aggregateFor} / {@code AggregationSpec} 的硬编码 switch 同源。</li>
  *   <li><b>窗口</b>：{@link WindowFunctionType} 全部枚举名（小写），跳过仅作占位的 {@code AGGREGATE}。</li>
  * </ul>
@@ -61,7 +62,8 @@ public final class BuiltinFunctionCatalog {
 
     /** 内建聚合（与 FragmentExecutor.aggregateFor / AggregationSpec 的 switch 同源）。 */
     private static final List<String> AGGREGATES = List.of(
-            "count", "count_distinct", "sum", "avg", "min", "max");
+            "count", "count_distinct", "sum", "avg", "min", "max",
+            "count_if", "sum_if", "max_if", "min_if");
 
     private BuiltinFunctionCatalog() {
     }

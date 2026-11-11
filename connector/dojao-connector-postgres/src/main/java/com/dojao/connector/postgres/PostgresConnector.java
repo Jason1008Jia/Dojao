@@ -5,6 +5,7 @@ import com.dojao.common.data.Page;
 import com.dojao.common.memory.NodeMemory;
 import com.dojao.spi.bean.*;
 import com.dojao.spi.service.DojaoConnector;
+import com.dojao.spi.util.ArrowJdbcValues;
 import com.dojao.spi.util.JdbcArrowConverter;
 import com.dojao.spi.util.JdbcSizeEstimator;
 import com.dojao.spi.util.NestedTypeSupport;
@@ -921,7 +922,7 @@ public class PostgresConnector implements DojaoConnector {
                         // PG 数组：转成 Java 数组后由驱动按元素类型编码（多维数组同样适用）
                         value = NestedTypeSupport.toJavaValue(vector, row);
                     } else {
-                        value = vector.getObject(row);
+                        value = ArrowJdbcValues.toJdbc(vector, row);
                     }
                     // Arrow Text → String
                     if (value instanceof Text textValue) {

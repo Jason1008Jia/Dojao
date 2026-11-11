@@ -21,10 +21,33 @@
             <artifactId>dojao-spi</artifactId>
         </dependency>
 
-        <!-- ClickHouse JDBC（自包含 shaded 驱动，HTTP 协议） -->
+        <!-- ClickHouse JDBC（HTTP 协议） -->
         <dependency>
             <groupId>com.clickhouse</groupId>
             <artifactId>clickhouse-jdbc</artifactId>
+        </dependency>
+
+        <!-- ClickHouse JDBC 默认用 Apache HttpClient 5 连接池；精简 jar 不带该客户端，
+             缺失时会打印「NoClassDefFoundError: org/apache/hc/core5/http/HttpRequest」
+             并降级到 HttpURLConnection。显式补齐后恢复连接复用。
+             slf4j-api 排除：沿用引擎的 2.x，禁止 HttpClient 的 1.7.x 传递版本覆盖。 -->
+        <dependency>
+            <groupId>org.apache.httpcomponents.client5</groupId>
+            <artifactId>httpclient5</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-api</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
+        <!-- ClickHouse JDBC 默认 compress=lz4，编解码实现（net.jpountz.lz4 包）不在精简 jar 内；
+             缺失时连接/查询直接抛「LZ4 is not supported」。引入后保留默认压缩，
+             不必降级为 gzip，也不必在 URL 上加 compress=0。 -->
+        <dependency>
+            <groupId>org.lz4</groupId>
+            <artifactId>lz4-java</artifactId>
         </dependency>
     </dependencies>
 

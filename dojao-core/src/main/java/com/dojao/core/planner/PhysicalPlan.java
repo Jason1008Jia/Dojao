@@ -3,21 +3,35 @@ package com.dojao.core.planner;
 import com.dojao.core.operator.Operator;
 
 import java.util.List;
+import java.util.Set;
 
 /**
  * 物理执行计划 —— 由 {@link Planner} 生成，承载算子树根节点与可读的 EXPLAIN 文本。
  *
  * <p>执行入口：拿到 {@link #operator()} 后依次调用 {@code open()} / {@code next()} / {@code close()}。
  *
+ * <p>{@code auxiliaryOperatorIds} 是主计划树之外、执行期惰性规划的分布式算子 jobId（物化 CTE /
+ * 物化派生体查询体），由 {@link Planner} 持有的<b>实时可变视图</b>提供：查询体在派发前才规划，
+ * 登记随执行推进追加。查询归属判定（QueryManager）据此认可这些 jobId，避免僵尸片段回收误杀。
+ *
  * @author jiaxin
  * @version 1.0
  * @date 2026/8/2
  */
-public record PhysicalPlan(PhysicalNode root, String explainText, Runnable cleanup) {
+public record PhysicalPlan(PhysicalNode root, String explainText, Runnable cleanup,
+                           Set<String> auxiliaryOperatorIds) {
+
+    public PhysicalPlan {
+        auxiliaryOperatorIds = auxiliaryOperatorIds == null ? Set.of() : auxiliaryOperatorIds;
+    }
 
     /** 无附加资源的计划（测试 / 手工构造）。 */
     public PhysicalPlan(PhysicalNode root, String explainText) {
         this(root, explainText, () -> { });
+    }
+
+    public PhysicalPlan(PhysicalNode root, String explainText, Runnable cleanup) {
+        this(root, explainText, cleanup, Set.of());
     }
 
     /**

@@ -16,7 +16,6 @@ import org.slf4j.LoggerFactory;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -69,7 +68,27 @@ public final class QueryManager {
      * {@link #queryId()}（yyyyMMddHHmmss_UUID）不同构 —— Master 侧归并遥测时靠它反查归属本查询
      * （{@link #ownsOperatorQueryId}），否则 Worker 上抛的组因键不匹配被整组丢弃。
      */
-    private final Set<String> operatorQueryIds = new HashSet<>();
+    private final Set<String> operatorQueryIds = ConcurrentHashMap.newKeySet();
+
+    /**
+     * 执行期派发登记入口（由 {@link com.dojao.core.runtime.master.DispatchScope} 在片段派发时回调）：
+     * 主计划树之外、执行期才规划的分布式子计划（物化 CTE / 物化派生体查询体）也把自己的 jobId
+     * 归到本查询。并发安全 —— 派发在执行线程，归属判定在 Flight 遥测线程。
+     */
+    public void registerOperatorQueryId(String operatorQueryId) {
+        if (operatorQueryId != null) {
+            operatorQueryIds.add(operatorQueryId);
+        }
+    }
+
+    /**
+     * 主计划树<b>之外</b>、执行期惰性规划的分布式算子 jobId（物化 CTE / 物化派生体查询体）。
+     *
+     * <p>这些片段由查询体自己的算子派发，jobId 不在 {@link #operatorQueryIds} 里；若不参与归属判定，
+     * Master 的僵尸片段回收会把正在跑的查询体片段误判成残留并取消（Worker 表现为
+     * {@code Master 已不认该查询 → 回收残留片段} + 中间片段 {@code InterruptedException}）。</p>
+     */
+    private final Set<String> auxiliaryOperatorIds;
 
     private final long submitTimeNanos;
     private volatile long startTimeNanos;
@@ -170,6 +189,7 @@ public final class QueryManager {
         this.sourceExpectedRows = sourceExpectedRows == null ? Map.of() : Map.copyOf(sourceExpectedRows);
         this.retryLimit = Math.max(0, retryLimit);
         this.submitTimeNanos = System.nanoTime();
+        this.auxiliaryOperatorIds = physical.auxiliaryOperatorIds();
         this.operatorNodes = new ArrayList<>();
         collect(this.operatorNodes, physical.root());
         this.measuredNodes = this.operatorNodes.stream()
@@ -322,6 +342,12 @@ public final class QueryManager {
         // 若让 rows=0 的心跳帧覆盖，会把监控上的真实行数清零。
         for (PhysicalNode node : operatorNodes) {
             if (node.operator() instanceof DistributedScanOperator dso && dso.markAlive(taskId)) {
+                // done=true = Worker 侧扫描线程的收尾帧：此后不再有存活心跳，但 ScanFinished 终态
+                // 事件可能还堵在满的 Master 事件队列里。告知算子「Worker 已完工」，看门狗改用长宽限期，
+                // 避免把已完成的扫描判成 LOST 并 fail-fast（2026-11-11 偶发假死的第二个病根）。
+                if (done) {
+                    dso.markWorkerFinished(taskId);
+                }
                 return;
             }
         }
@@ -654,6 +680,8 @@ public final class QueryManager {
 
     /** 该查询是否拥有某 operator queryId（Worker 遥测分组键 = 派发 jobId）。 */
     public boolean ownsOperatorQueryId(String operatorQueryId) {
-        return operatorQueryId != null && operatorQueryIds.contains(operatorQueryId);
+        return operatorQueryId != null
+                && (operatorQueryIds.contains(operatorQueryId)
+                    || auxiliaryOperatorIds.contains(operatorQueryId));
     }
 }

@@ -6,6 +6,7 @@ import com.dojao.common.memory.NodeMemory;
 import com.dojao.spi.bean.*;
 import com.dojao.spi.service.DojaoConnector;
 import com.dojao.spi.service.OverwriteEnable;
+import com.dojao.spi.util.ArrowJdbcValues;
 import com.dojao.spi.util.JdbcArrowConverter;
 import com.dojao.spi.util.JdbcSizeEstimator;
 import com.dojao.spi.util.NestedTypeSupport;
@@ -64,6 +65,56 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
     /** Arrow 内存分配器，用于 JDBC → Arrow 转换。 */
     private final BufferAllocator allocator;
 
+    /** 集群建表布局（是否分布式建表 / 集群名 / 引擎等）；默认单表本地建表。 */
+    private final ClusterLayout layout;
+
+    /**
+     * 建表布局（catalog 级配置）。
+     *
+     * @param cluster           集群名（如 {@code ch_cluster}），分布式建表时必填
+     * @param distributed       {@code true} 时同时在 view 库与 local 库建表（{@code ON CLUSTER}）
+     * @param engine            本地表引擎，默认 {@code MergeTree}
+     * @param localSchemaSuffix local 库后缀，默认 {@code _LOCAL}（{@code ADS} → {@code ADS_LOCAL}）
+     * @param orderBy           本地表 ORDER BY 表达式；空则取第一个非容器列
+     * @param partitionBy       本地表 PARTITION BY 表达式；空则在存在 {@code data_insert_time} 时自动用
+     *                          {@code toYYYYMMDD(data_insert_time)}
+     * @param shardingKey       Distributed 分片表达式；空则按第一个非容器列自动生成
+     */
+    public record ClusterLayout(String cluster, boolean distributed, String engine,
+                                String localSchemaSuffix, String orderBy,
+                                String partitionBy, String shardingKey) {
+
+        public static final String DEFAULT_ENGINE = "MergeTree";
+        public static final String DEFAULT_LOCAL_SUFFIX = "_LOCAL";
+
+        /** 默认：单表本地建表（非分布式）。 */
+        public static final ClusterLayout LOCAL_ONLY =
+                new ClusterLayout(null, false, DEFAULT_ENGINE, DEFAULT_LOCAL_SUFFIX, null, null, null);
+
+        public ClusterLayout {
+            engine = (engine == null || engine.isBlank()) ? DEFAULT_ENGINE : engine.trim();
+            localSchemaSuffix = (localSchemaSuffix == null || localSchemaSuffix.isBlank())
+                    ? DEFAULT_LOCAL_SUFFIX : localSchemaSuffix.trim();
+            cluster = blankToNull(cluster);
+            orderBy = blankToNull(orderBy);
+            partitionBy = blankToNull(partitionBy);
+            shardingKey = blankToNull(shardingKey);
+        }
+
+        private static String blankToNull(String s) {
+            return s == null || s.isBlank() ? null : s.trim();
+        }
+
+        /** 对应的 local 库名：{@code schema + localSchemaSuffix}。 */
+        public String localSchema(String schema) {
+            return schema + localSchemaSuffix;
+        }
+
+        public static ClusterLayout nonDistributed(String engine) {
+            return new ClusterLayout(null, false, engine, DEFAULT_LOCAL_SUFFIX, null, null, null);
+        }
+    }
+
     // ==================== 游标状态（多页读取） ====================
     private Connection readConnection;
     private PreparedStatement readPreparedStatement;
@@ -78,11 +129,23 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
 
     public ClickHouseConnector(String catalogName, String jdbcUrl, String username, String password,
                                BufferAllocator allocator) {
+        this(catalogName, jdbcUrl, username, password, allocator, ClusterLayout.LOCAL_ONLY);
+    }
+
+    public ClickHouseConnector(String catalogName, String jdbcUrl, String username, String password,
+                               ClusterLayout layout) {
+        this(catalogName, jdbcUrl, username, password,
+                NodeMemory.shared().newChildAllocator("connector/clickhouse", 0), layout);
+    }
+
+    public ClickHouseConnector(String catalogName, String jdbcUrl, String username, String password,
+                               BufferAllocator allocator, ClusterLayout layout) {
         this.catalogName = catalogName;
         this.jdbcUrl = jdbcUrl;
         this.username = username;
         this.password = password;
         this.allocator = allocator;
+        this.layout = layout == null ? ClusterLayout.LOCAL_ONLY : layout;
     }
 
     public ClickHouseConnector(String jdbcUrl, String username, String password) {
@@ -95,6 +158,7 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
     public String getJdbcUrl() { return jdbcUrl; }
     public String getUsername() { return username; }
     public String getPassword() { return password; }
+    public ClusterLayout getLayout() { return layout; }
 
     /**
      * 独立副本：JDBC 游标状态挂在连接器实例上（{@link #read} 连续调用接着上次读），
@@ -103,7 +167,7 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
     @Override
     public ClickHouseConnector copy() {
         return new ClickHouseConnector(catalogName, jdbcUrl, username, password,
-                NodeMemory.shared().newChildAllocator("connector/clickhouse", 0));
+                NodeMemory.shared().newChildAllocator("connector/clickhouse", 0), layout);
     }
 
     // ==================== Connection ====================
@@ -118,14 +182,24 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
      */
     @Override
     public void probeConnectivity(String catalog) {
-        try (Connection conn = getConnection()) {
-            if (!conn.isValid(5)) {
-                throw new RuntimeException("无法连接到数据源 " + catalog + "（" + jdbcUrl
-                        + "）：连接校验失败");
+        String who = "无法连接到数据源 " + catalog + "（" + jdbcUrl + "）：";
+        // 不用 Connection.isValid：clickhouse-jdbc 的实现是发 HTTP 健康检查 /ping，
+        // 部分网关只放行/鉴权真实查询路径，/ping 失败但查询可用（反过来也可能）。
+        // 这里执行一次真实的最小查询，异常原样带出，用户才能看到 Access denied / Unknown database 等真因。
+        try (Connection conn = getConnection();
+             Statement st = conn.createStatement()) {
+            try {
+                st.setQueryTimeout(10);
+            } catch (SQLException ignored) {
+                // 驱动不支持查询超时则忽略，不影响正常探测
+            }
+            try (ResultSet rs = st.executeQuery("SELECT 1")) {
+                if (!rs.next()) {
+                    throw new RuntimeException(who + "连接校验未返回结果");
+                }
             }
         } catch (SQLException e) {
-            throw new RuntimeException("无法连接到数据源 " + catalog + "（" + jdbcUrl + "）: "
-                    + e.getMessage(), e);
+            throw new RuntimeException(who + e.getMessage(), e);
         }
     }
 
@@ -642,7 +716,7 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
     }
 
     /** ClickHouse 标识符反引号转义（反引号自身翻倍）。 */
-    private String quoteIdent(String ident) {
+    private static String quoteIdent(String ident) {
         // 幂等：入参可能已是转义形态（ReadRequest.columns() 复用）→ 先剥引号再转义
         return "`" + SqlIdentifiers.unquote(ident).replace("`", "``") + "`";
     }
@@ -920,7 +994,7 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
                 throw new IllegalArgumentException("写入列数不匹配：目标列 " + targets.size()
                         + "，数据列 " + colCount);
             }
-            cols = targets.stream().map(this::quoteIdent).toList();
+            cols = targets.stream().map(ClickHouseConnector::quoteIdent).toList();
         } else {
             cols = new ArrayList<>();
             for (var field : root.getSchema().getFields()) {
@@ -949,7 +1023,7 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
                         // Array / Map：转成 Java 数组 / LinkedHashMap，由 clickhouse-jdbc 递归渲染
                         value = NestedTypeSupport.toJavaValue(vector, row);
                     } else {
-                        value = vector.getObject(row);
+                        value = ArrowJdbcValues.toJdbc(vector, row);
                     }
                     if (value instanceof Text textValue) {
                         value = textValue.toString();
@@ -987,19 +1061,18 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
         if (tableExists(catalog, schema, table)) {
             if (ifNotExists) return false;
         }
-        StringBuilder sb = new StringBuilder("CREATE TABLE ");
-        if (ifNotExists) sb.append("IF NOT EXISTS ");
-        sb.append(quoteIdent(schema)).append('.').append(quoteIdent(table)).append(" (");
-        List<String> defs = new ArrayList<>();
-        for (Field f : fields) {
-            defs.add(quoteIdent(f.getName()) + " " + arrowTypeToClickHouse(f));
-        }
-        // MergeTree 必须带 ORDER BY；无排序键用 tuple()（空排序键）
-        sb.append(String.join(", ", defs)).append(") ENGINE = MergeTree ORDER BY tuple()");
-
+        List<String> statements = createTableStatements(schema, table, fields, layout, ifNotExists);
         try (Connection conn = getConnection();
              Statement stmt = conn.createStatement()) {
-            stmt.executeUpdate(sb.toString());
+            for (int i = 0; i < statements.size(); i++) {
+                try {
+                    stmt.executeUpdate(statements.get(i));
+                } catch (SQLException e) {
+                    // 分布式建表：local 表已建好、view 表失败 → 回滚 local，避免留下半套表。
+                    if (i > 0) rollbackCreatedLocalTable(stmt, schema, table);
+                    throw e;
+                }
+            }
         } catch (SQLException e) {
             throw new RuntimeException("Failed to create table: "
                     + schema + "." + table, e);
@@ -1007,10 +1080,22 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
         return true;
     }
 
+    /** 分布式建表失败时清理已创建的 local 表（best-effort，不掩盖原始错误）。 */
+    private void rollbackCreatedLocalTable(Statement stmt, String schema, String table) {
+        try {
+            stmt.executeUpdate("DROP TABLE IF EXISTS " + q(layout.localSchema(schema), table)
+                    + " ON CLUSTER " + quoteIdent(layout.cluster()));
+        } catch (SQLException ignored) {
+            // 清理失败不影响原始异常
+        }
+    }
+
     @Override
     public void dropTable(String catalog, String schema, String table) {
         try (Connection conn = getConnection(); Statement stmt = conn.createStatement()) {
-            stmt.executeUpdate("DROP TABLE IF EXISTS " + q(schema, table));
+            for (String sql : dropTableStatements(schema, table, layout)) {
+                stmt.executeUpdate(sql);
+            }
         } catch (SQLException e) {
             throw new RuntimeException("Failed to drop table: " + schema + "." + table, e);
         }
@@ -1019,10 +1104,155 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
     @Override
     public void truncateTable(String catalog, String schema, String table) {
         try (Connection conn = getConnection(); Statement stmt = conn.createStatement()) {
-            stmt.executeUpdate("TRUNCATE TABLE " + q(schema, table));
+            for (String sql : truncateTableStatements(schema, table, layout)) {
+                stmt.executeUpdate(sql);
+            }
         } catch (SQLException e) {
             throw new RuntimeException("Failed to truncate table: " + schema + "." + table, e);
         }
+    }
+
+    // ==================== 建 / 删 / 清表 DDL 构造（纯函数，便于离线验证） ====================
+
+    /**
+     * CTAS 建表语句列表。
+     *
+     * <p>非分布式：单条 {@code CREATE TABLE schema.table (...) ENGINE = <engine> ORDER BY tuple()}，
+     * 与历史行为一致。</p>
+     *
+     * <p>分布式（{@code layout.distributed()}）：
+     * <ol>
+     *   <li>先建 local 表 {@code localSchema.table ON CLUSTER <cluster>}，
+     *       {@code ENGINE = MergeTree ORDER BY <key> [PARTITION BY ...] SETTINGS index_granularity = 8192}；</li>
+     *   <li>再建 view 库里的 Distributed 表 {@code schema.table ON CLUSTER <cluster>}，
+     *       {@code ENGINE = Distributed('<cluster>', '<localSchema>', '<table>', <shard>)}。</li>
+     * </ol></p>
+     */
+    static List<String> createTableStatements(String schema, String table, List<Field> fields,
+                                              ClusterLayout layout, boolean ifNotExists) {
+        ClusterLayout l = layout == null ? ClusterLayout.LOCAL_ONLY : layout;
+        List<String> defs = new ArrayList<>();
+        for (Field f : fields) {
+            // 顶层列也必须尊重 Arrow 可空性：源列是 Nullable(T) 时目标列要保持可空，
+            // 否则真实 NULL 会在 INSERT 时被驱动拒绝
+            // （Cannot set null to non-nullable column）——CTAS 的列应能承载 SELECT 的全部结果。
+            defs.add(quoteIdent(f.getName()) + " " + ddlColumnType(f));
+        }
+        String columns = String.join(", ", defs);
+        String ine = ifNotExists ? "IF NOT EXISTS " : "";
+
+        if (!l.distributed()) {
+            StringBuilder sb = new StringBuilder("CREATE TABLE ").append(ine)
+                    .append(q(schema, table)).append(" (").append(columns)
+                    .append(") ENGINE = ").append(l.engine());
+            // MergeTree 必须带 ORDER BY；无排序键用 tuple()（空排序键）
+            if (isMergeTree(l.engine())) sb.append(" ORDER BY tuple()");
+            return List.of(sb.toString());
+        }
+
+        String localSchema = l.localSchema(schema);
+        String cluster = quoteIdent(l.cluster());
+        List<String> out = new ArrayList<>(2);
+
+        StringBuilder local = new StringBuilder("CREATE TABLE ").append(ine)
+                .append(q(localSchema, table)).append(" ON CLUSTER ").append(cluster)
+                .append(" (").append(columns).append(") ENGINE = ").append(l.engine());
+        if (isMergeTree(l.engine())) {
+            local.append(" ORDER BY ").append(l.orderBy() != null
+                    ? l.orderBy() : defaultOrderKey(fields));
+            String partition = l.partitionBy() != null
+                    ? l.partitionBy() : defaultPartitionKey(fields);
+            if (partition != null) local.append(" PARTITION BY ").append(partition);
+            local.append(" SETTINGS index_granularity = 8192");
+        }
+        out.add(local.toString());
+
+        String shard = l.shardingKey() != null ? l.shardingKey() : defaultShardingKey(fields);
+        out.add("CREATE TABLE " + ine + q(schema, table) + " ON CLUSTER " + cluster
+                + " (" + columns + ") ENGINE = Distributed('" + escapeLiteral(l.cluster())
+                + "', '" + escapeLiteral(localSchema) + "', '" + escapeLiteral(table)
+                + "', " + shard + ")");
+        return out;
+    }
+
+    /** 删表语句：分布式先删 view 库表、再删 local 库表（都 {@code IF EXISTS ON CLUSTER}）。 */
+    static List<String> dropTableStatements(String schema, String table, ClusterLayout layout) {
+        ClusterLayout l = layout == null ? ClusterLayout.LOCAL_ONLY : layout;
+        if (!l.distributed()) {
+            return List.of("DROP TABLE IF EXISTS " + q(schema, table));
+        }
+        String onCluster = " ON CLUSTER " + quoteIdent(l.cluster());
+        return List.of(
+                "DROP TABLE IF EXISTS " + q(schema, table) + onCluster,
+                "DROP TABLE IF EXISTS " + q(l.localSchema(schema), table) + onCluster);
+    }
+
+    /**
+     * 清表语句：分布式只 CLEAR local 表（Distributed 引擎视图不支持 TRUNCATE），
+     * 清掉 local 数据后 view 立即反映为空。
+     */
+    static List<String> truncateTableStatements(String schema, String table, ClusterLayout layout) {
+        ClusterLayout l = layout == null ? ClusterLayout.LOCAL_ONLY : layout;
+        if (!l.distributed()) {
+            return List.of("TRUNCATE TABLE " + q(schema, table));
+        }
+        return List.of("TRUNCATE TABLE IF EXISTS " + q(l.localSchema(schema), table)
+                + " ON CLUSTER " + quoteIdent(l.cluster()));
+    }
+
+    /** 引擎是否为 MergeTree 家族（需要 ORDER BY / 支持 PARTITION BY / SETTINGS）。 */
+    private static boolean isMergeTree(String engine) {
+        String e = engine == null ? "" : engine.trim();
+        int paren = e.indexOf('(');
+        if (paren >= 0) e = e.substring(0, paren).trim();
+        return e.toLowerCase(Locale.ROOT).endsWith("mergetree");
+    }
+
+    /** 第一个非容器列（List / FixedSizeList / Map 不能作排序 / 分片键）；没有则 null。 */
+    private static Field firstScalarField(List<Field> fields) {
+        for (Field f : fields) {
+            ArrowType t = f.getType();
+            if (!(t instanceof ArrowType.List || t instanceof ArrowType.FixedSizeList
+                    || t instanceof ArrowType.Map)) {
+                return f;
+            }
+        }
+        return null;
+    }
+
+    /** 默认 ORDER BY：第一个非容器列（可空列包 assumeNotNull，避免 allow_nullable_key 依赖）。 */
+    private static String defaultOrderKey(List<Field> fields) {
+        Field f = firstScalarField(fields);
+        if (f == null) return "tuple()";
+        String col = quoteIdent(f.getName());
+        return f.isNullable() ? "assumeNotNull(" + col + ")" : col;
+    }
+
+    /** 默认 PARTITION BY：存在 Date/Timestamp 类型的 data_insert_time 列时用 toYYYYMMDD(该列)。 */
+    private static String defaultPartitionKey(List<Field> fields) {
+        for (Field f : fields) {
+            if (!"data_insert_time".equalsIgnoreCase(f.getName())) continue;
+            ArrowType t = f.getType();
+            if (!(t instanceof ArrowType.Date || t instanceof ArrowType.Timestamp)) return null;
+            String col = quoteIdent(f.getName());
+            return "toYYYYMMDD(" + (f.isNullable() ? "assumeNotNull(" + col + ")" : col) + ")";
+        }
+        return null;
+    }
+
+    /** 默认分片键：xxHash32(toString(第一非容器列))，可空列先兜底空串。 */
+    private static String defaultShardingKey(List<Field> fields) {
+        Field f = firstScalarField(fields);
+        if (f == null) return "rand()";
+        String col = quoteIdent(f.getName());
+        return f.isNullable()
+                ? "xxHash32(ifNull(toString(" + col + "), ''))"
+                : "xxHash32(toString(" + col + "))";
+    }
+
+    /** 单引号字符串字面量转义（集群名 / 库名 / 表名）。 */
+    private static String escapeLiteral(String s) {
+        return s == null ? "" : s.replace("'", "''");
     }
 
     /**
@@ -1055,10 +1285,25 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
     }
 
     /**
-     * 可空字段包 {@code Nullable(...)}（仅用于嵌套元素 / Map 值，顶层列保持旧口径）。
+     * 建表列类型：可空字段包 {@code Nullable(...)}（顶层列与嵌套元素同口径）。
+     *
+     * <p>CTAS 的目标表必须能承载 SELECT 结果里的 NULL。旧实现只给嵌套元素包 Nullable、
+     * 顶层标量一律写成 NOT NULL，导致源列 {@code Nullable(String)} 里的 NULL 写回时被
+     * 驱动拒绝（{@code Cannot set null to non-nullable column}）。</p>
      *
      * <p>★ClickHouse 不允许 {@code Nullable(Array(...))} / {@code Nullable(Map(...))}
-     * （"Nested type cannot be inside Nullable type"），故容器子字段一律不包；
+     * （"Nested type cannot be inside Nullable type"），故容器字段不包 Nullable；
+     * 可空的数组元素请用 {@code Array(Nullable(T))} 表达。</p>
+     */
+    static String ddlColumnType(Field field) {
+        return nullableIf(field);
+    }
+
+    /**
+     * 可空字段包 {@code Nullable(...)}（顶层列 / 嵌套元素 / Map 值通用，容器除外）。
+     *
+     * <p>★ClickHouse 不允许 {@code Nullable(Array(...))} / {@code Nullable(Map(...))}
+     * （"Nested type cannot be inside Nullable type"），故容器字段一律不包；
      * 可空的数组元素请用 {@code Array(Nullable(T))} 表达。</p>
      */
     private static String nullableIf(Field child) {
@@ -1110,6 +1355,9 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
      */
     @Override
     public boolean supportsOverwrite(String catalog, String schema, String table) {
+        // 分布式建表模式下覆盖不可用：staging 克隆的是 Distributed 视图，
+        // 写入 staging 会落到同一张 local 表（“原表从未被触碰”的前提不成立）。
+        if (layout.distributed()) return false;
         String uuid = UUID.randomUUID().toString().replace("-", "");
         String probe = q(schema, table + "__dojao_probe_" + uuid);
         try (Connection conn = getConnection(); Statement stmt = conn.createStatement()) {

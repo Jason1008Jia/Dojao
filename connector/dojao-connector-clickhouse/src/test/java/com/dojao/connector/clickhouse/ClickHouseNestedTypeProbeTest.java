@@ -14,8 +14,9 @@ import java.util.function.BooleanSupplier;
  * <b>ClickHouse 嵌套类型（Array / Map）映射</b>的离线探针 —— 只验纯类型推导，不连库。
  *
  * <p>CTAS 建表必须声明真实的 {@code Array(T)} / {@code Map(K, V)}：旧实现统一写
- * {@code String}，后续 INSERT 传 {@code Object[]} 会被驱动拒绝。元素 / Map 值按可空性
- * 包 {@code Nullable(...)}，Map 的 key 永不包（ClickHouse 不允许可空键）。</p>
+ * {@code String}，后续 INSERT 传 {@code Object[]} 会被驱动拒绝。可空字段（含顶层列、
+ * 元素、Map 值）包 {@code Nullable(...)}，容器外层与 Map 的 key 永不包
+ * （ClickHouse 不允许 {@code Nullable(Array/Map)} 与可空键）。</p>
  *
  * @author jiaxin
  * @version 1.0
@@ -31,6 +32,7 @@ public final class ClickHouseNestedTypeProbeTest {
 
     public static void main(String[] args) {
         scenario("ClickHouse 标量映射不变", ClickHouseNestedTypeProbeTest::scalars);
+        scenario("ClickHouse CTAS DDL 可空性", ClickHouseNestedTypeProbeTest::ddlNullability);
         scenario("ClickHouse Array 映射", ClickHouseNestedTypeProbeTest::arrays);
         scenario("ClickHouse Map 映射", ClickHouseNestedTypeProbeTest::maps);
         scenario("ClickHouse STRUCT 显式拒绝", ClickHouseNestedTypeProbeTest::rejectsStruct);
@@ -53,6 +55,32 @@ public final class ClickHouseNestedTypeProbeTest {
         check("Date → Date", () -> "Date".equals(ch(field("c", true, new ArrowType.Date(DateUnit.DAY)))));
         check("Timestamp → DateTime64(3)", () -> "DateTime64(3)".equals(ch(field("c", true,
                 new ArrowType.Timestamp(TimeUnit.MILLISECOND, null)))));
+    }
+
+    /**
+     * CTAS 建表列类型必须尊重 Arrow 可空性：顶层标量为可空字段时要包 {@code Nullable(...)}，
+     * 否则源数据里的 NULL 写回会被驱动拒绝；容器字段不包（CH 禁止 Nullable(Array/Map)）。
+     */
+    private static void ddlNullability() {
+        check("可空 Utf8 → Nullable(String)", () -> "Nullable(String)".equals(
+                ddl(field("parentId", true, ArrowType.Utf8.INSTANCE))));
+        check("非空 Utf8 → String", () -> "String".equals(
+                ddl(field("parentId", false, ArrowType.Utf8.INSTANCE))));
+        check("可空 Int64 → Nullable(Int64)", () -> "Nullable(Int64)".equals(
+                ddl(field("n", true, new ArrowType.Int(64, true)))));
+        check("可空 Decimal → Nullable(Decimal(18, 2))", () -> "Nullable(Decimal(18, 2))".equals(
+                ddl(field("d", true, new ArrowType.Decimal(18, 2, 128)))));
+        check("可空 Date → Nullable(Date)", () -> "Nullable(Date)".equals(
+                ddl(field("dt", true, new ArrowType.Date(DateUnit.DAY)))));
+        check("可空 Timestamp → Nullable(DateTime64(3))", () -> "Nullable(DateTime64(3))".equals(
+                ddl(field("ts", true, new ArrowType.Timestamp(TimeUnit.MILLISECOND, null)))));
+        check("可空数组外层不包 Nullable（CH 禁止）→ Array(Nullable(Int64))",
+                () -> "Array(Nullable(Int64))".equals(
+                        ddl(list(item("item", true, new ArrowType.Int(64, true))))));
+        check("可空 Map 外层不包 Nullable（CH 禁止）→ Map(String, Nullable(Int64))",
+                () -> "Map(String, Nullable(Int64))".equals(
+                        ddl(map(item("key", false, ArrowType.Utf8.INSTANCE),
+                                item("value", true, new ArrowType.Int(64, true))))));
     }
 
     private static void arrays() {
@@ -108,6 +136,11 @@ public final class ClickHouseNestedTypeProbeTest {
 
     private static String ch(Field field) {
         return ClickHouseConnector.arrowTypeToClickHouse(field);
+    }
+
+    /** CTAS 建表实际使用的列类型（含可空性）。 */
+    private static String ddl(Field field) {
+        return ClickHouseConnector.ddlColumnType(field);
     }
 
     private static Field field(String name, boolean nullable, ArrowType type) {

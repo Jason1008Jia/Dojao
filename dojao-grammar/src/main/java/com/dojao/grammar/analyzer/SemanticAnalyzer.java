@@ -74,6 +74,8 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
 
     private static final Set<String> AGGREGATE_FUNCTIONS = Set.of(
         "COUNT", "SUM", "AVG", "MAX", "MIN",
+        // 条件聚合：count_if(cond) / sum_if(v, cond) / max_if(v, cond) / min_if(v, cond)
+        "COUNT_IF", "SUM_IF", "MAX_IF", "MIN_IF",
         "COUNT_DISTINCT", "APPROX_COUNT_DISTINCT",
         "STDDEV", "STDDEV_POP", "STDDEV_SAMP",
         "VAR_POP", "VAR_SAMP", "VARIANCE",

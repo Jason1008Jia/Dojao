@@ -5,7 +5,11 @@ import com.dojao.connector.common.util.ORCArrowWriter;
 import com.dojao.connector.common.util.ParquetArrowWriter;
 import com.dojao.connector.common.util.TextArrowWriter;
 import com.dojao.spi.bean.Column;
+import com.dojao.spi.util.ArrowValueText;
+import org.apache.arrow.vector.DateDayVector;
+import org.apache.arrow.vector.DateMilliVector;
 import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.TimeStampVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.util.Text;
@@ -22,8 +26,10 @@ import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -455,6 +461,12 @@ final class HiveWriteSession implements AutoCloseable {
         }
         FieldVector v = root.getFieldVectors().get(pos);
         if (v.isNull(row)) return null;
+        // DATE/TIME 的 getObject 是 epoch 数字（Arrow 15），分区/分桶列必须按向量类型转日期文本
+        if (v instanceof DateDayVector dd) return LocalDate.ofEpochDay(dd.get(row)).toString();
+        if (v instanceof DateMilliVector dm) {
+            return Instant.ofEpochMilli(dm.get(row)).atZone(ZoneOffset.UTC).toLocalDate().toString();
+        }
+        if (v instanceof TimeStampVector ts) return TS_FORMAT.format(ArrowValueText.timestampOf(ts, row));
         Object o = v.getObject(row);
         if (o == null) return null;
         if (o instanceof byte[] bytes) return new String(bytes, StandardCharsets.UTF_8);

@@ -1826,7 +1826,7 @@ public final class DojaoUiApp {
         /** 结束前的推理事件快照（含尚未封口的思考）。 */
         List<String> trace() {
             List<String> out = new ArrayList<>(events);
-            if (thinking.length() > 0) {
+            if (!thinking.isEmpty()) {
                 out.add(thinkEvent(thinking.toString()));
             }
             return out;
@@ -1842,7 +1842,7 @@ public final class DojaoUiApp {
         }
 
         private void sealThinking() {
-            if (thinking.length() > 0) {
+            if (!thinking.isEmpty()) {
                 events.add(thinkEvent(thinking.toString()));
                 thinking.setLength(0);
             }
@@ -1906,7 +1906,7 @@ public final class DojaoUiApp {
                 ctx.status(400).json(Map.of("error", "未收到上传文件"));
                 return;
             }
-            file = files.get(0);
+            file = files.getFirst();
         } catch (Exception e) {
             ctx.status(400).json(Map.of("error", "读取上传内容失败: " + e.getMessage()));
             return;

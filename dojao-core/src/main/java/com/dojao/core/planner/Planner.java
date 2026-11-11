@@ -109,6 +109,19 @@ public final class Planner {
     /** 哨兵 catalog → 读取连接器（Store 形态；Worker 侧用 {@link MaterializedCteConnector#wire()}）。 */
     private final Map<String, MaterializedCteConnector> cteConnectors = new java.util.HashMap<>();
 
+    /**
+     * 主计划树<b>之外</b>的执行分支（物化 CTE / 物化派生体查询体）里分布式算子的 jobId。
+     *
+     * <p>这些查询体是惰性规划的（执行期由 {@code Store.materialize()} 触发），不在
+     * {@code PhysicalPlan.root()} 的 children 里；但它们的片段同样派发给 Worker，并以上面的 jobId
+     * 上报遥测。Master 的「僵尸片段回收」按计划树的 operator queryId 判定归属 —— 不登记就会把
+     * 正常运行中的查询体片段误判成残留并就地取消（现象：Worker 报
+     * {@code Master 已不认该查询 → 回收残留片段}，后续中间片段 {@code InterruptedException}）。</p>
+     *
+     * <p>{@link PhysicalPlan} 持有本集合的实时视图（不拷贝），QueryManager 登记归属时一并收集。</p>
+     */
+    private final Set<String> auxiliaryOperatorQueryIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     private long cteCatalogSequence;
 
     /**
@@ -232,7 +245,9 @@ public final class Planner {
         String explain = PhysicalPlanPrinter.print(root);
         // 物化 CTE 的落盘目录 / wire 载荷随查询生命周期回收：分布式路径不创建
         // MaterializedCteScanOperator，扫描算子 → Store 的关闭链路不成立，必须在计划收尾释放。
-        return new PhysicalPlan(root, explain, this::releaseMaterializedCtes);
+        // auxiliaryOperatorQueryIds 传实时视图：查询体是执行期惰性规划，登记随时可能追加。
+        return new PhysicalPlan(root, explain, this::releaseMaterializedCtes,
+                auxiliaryOperatorQueryIds);
     }
 
     /**
@@ -249,6 +264,7 @@ public final class Planner {
         materializedCtes.clear();
         cteCatalogs.clear();
         cteConnectors.clear();
+        auxiliaryOperatorQueryIds.clear();
         for (MaterializedCteScanOperator.Store store : stores) {
             store.release();
         }
@@ -1004,19 +1020,56 @@ public final class Planner {
     }
 
     /**
-     * 规划一次 CTE 查询体的物理计划（含查询体自身的 ORDER BY / LIMIT / OFFSET —— 与派生表
-     * 分支同一口径；{@code buildQuery} 只负责查询主体）。结果按<b>全列</b>物化，各引用点
-     * 按自身需求由列裁剪在上层插入 Project。
+     * 规划一次「被物化的查询体」的物理计划（含查询体自身的 ORDER BY / LIMIT / OFFSET —— 与派生表
+     * 分支同一口径；{@code buildQuery} / {@code buildSetOperation} 只负责查询主体）。结果按<b>全列</b>
+     * 物化，各引用点按自身需求由列裁剪在上层插入 Project。
+     *
+     * <p>A 方案把「派生体」当作独立查询体物化，因此除了多引用 CTE 的 {@link LogicalPlan.Select}，
+     * 还要承接集合运算（{@code UNION [ALL]}）派生体 —— 否则这两类派生表仍会整条回退 Master。
+     * 表函数 / UNNEST 有独立的行生成语义，不在物化范围内（调用方已提前识别）。</p>
      */
-    private MaterializedCteScanOperator.PlannedBody planMaterializedBody(LogicalPlan.Select body) {
-        PhysicalNode node = buildQuery(body, null);
-        node = applyOrderLimit(node, body.orderBy(), body.limit(), body.offset());
+    private MaterializedCteScanOperator.PlannedBody planMaterializedBody(LogicalPlan body) {
+        PhysicalNode node;
+        List<LogicalPlan.SortItem> orderBy;
+        Optional<Long> limit;
+        Optional<Long> offset;
+        if (body instanceof LogicalPlan.Select select) {
+            node = buildQuery(select, null);
+            orderBy = select.orderBy();
+            limit = select.limit();
+            offset = select.offset();
+        } else if (body instanceof LogicalPlan.SetOperation setOp) {
+            node = buildSetOperation(setOp);
+            orderBy = setOp.orderBy();
+            limit = setOp.limit();
+            offset = setOp.offset();
+        } else {
+            throw unsupported("可物化的派生体仅支持 SELECT / 集合运算，实际: "
+                    + body.getClass().getSimpleName());
+        }
+        node = applyOrderLimit(node, orderBy, limit, offset);
+        // 查询体的分布式算子不在主计划树内，但会以自己的 jobId 派发片段 —— 登记给 QueryManager，
+        // 否则 Master 的僵尸片段回收会把它们当成「已不认查询」的残留就地取消。
+        collectAuxiliaryQueryIds(node);
         List<String> explain = new ArrayList<>();
         for (String line : PhysicalPlanPrinter.print(node).split("\n")) {
             explain.add(line);
         }
         return new MaterializedCteScanOperator.PlannedBody(
                 node.operator(), node.outputColumns(), explain);
+    }
+
+    /** 收集主计划树之外的执行分支里的分布式算子 jobId（见 {@link #auxiliaryOperatorQueryIds}）。 */
+    private void collectAuxiliaryQueryIds(PhysicalNode node) {
+        if (node == null) return;
+        if (node.operator() instanceof AbstractDistributedOperator ado) {
+            auxiliaryOperatorQueryIds.add(ado.queryId());
+        } else if (node.operator() instanceof DistributedScanOperator dso) {
+            auxiliaryOperatorQueryIds.add(dso.jobId());
+        }
+        for (PhysicalNode child : node.children()) {
+            collectAuxiliaryQueryIds(child);
+        }
     }
 
     /**
@@ -2263,19 +2316,25 @@ public final class Planner {
         if (!hasUnnest && context.distributedExecution()) {
             List<WorkerRegistration> healthy = WorkerRegistry.get().healthy(context.workerHealthTimeoutMs());
             if (!healthy.isEmpty()) {
-                PhysicalNode distributed = null;
-                if (joins.size() == 1) {
-                    // 派生表 join（派生表 = 单裸表 GROUP BY，可作等值 join 的任一 SQL 侧）先试；
-                    // 返回 null → 落到普通两表 join 分布式。
-                    distributed = tryBuildDerivedDistributedJoin(rels, joins, healthy);
-                    if (distributed == null) {
-                        distributed = tryBuildDistributedJoin(rels, joins, healthy);
-                    }
-                    // 两条专用路径都接不住时（典型：<b>两侧都是派生表</b>）落链式路径 —— 链式路径的
-                    // 首表与各层右表本就能是派生源，单 join 即「2 元素链」，零额外机制。
-                }
+                PhysicalNode distributed = tryBuildDistributedJoinPlans(joinRels, joins, healthy);
+                // A 方案第一遍：只物化「派生流水线接不住」的派生体（简单派生源仍走零物化的流式通道）。
                 if (distributed == null) {
-                    distributed = tryBuildDistributedJoinChain(rels, joins, healthy);
+                    List<LogicalPlan.ResolvedRelation> materialized =
+                            materializeDerivedForJoin(joinRels, false);
+                    if (materialized != null) {
+                        joinRels = materialized;
+                        distributed = tryBuildDistributedJoinPlans(joinRels, joins, healthy);
+                    }
+                }
+                // A 方案第二遍：仍有派生体参与（典型：两侧派生体各自可流式、整链组合却不成立）→
+                // 把剩余派生体全部物化成基表再重试。派生⋈物理 / 物理⋈派生 / 派生⋈派生 统一收敛。
+                if (distributed == null) {
+                    List<LogicalPlan.ResolvedRelation> materialized =
+                            materializeDerivedForJoin(joinRels, true);
+                    if (materialized != null) {
+                        joinRels = materialized;
+                        distributed = tryBuildDistributedJoinPlans(joinRels, joins, healthy);
+                    }
                 }
                 if (distributed != null) {
                     return distributed;
@@ -2320,6 +2379,102 @@ public final class Planner {
             }
         }
         return current;
+    }
+
+    /**
+     * 依次尝试三条分布式 join 规划路径：
+     * <ol>
+     *   <li>单 join：派生表 join（派生表 = 单裸表 GROUP BY）→ 两表 join；</li>
+     *   <li>左深链（覆盖 N 表 / 两侧都是派生表等形状）。</li>
+     * </ol>
+     * 返回 {@code null} = 当前形状无法分布式执行（调用方可选择物化派生体后重试或回退单机）。
+     */
+    private PhysicalNode tryBuildDistributedJoinPlans(List<LogicalPlan.ResolvedRelation> rels,
+                                                      List<LogicalPlan.JoinInfo> joins,
+                                                      List<WorkerRegistration> workers) {
+        PhysicalNode distributed = null;
+        if (joins.size() == 1) {
+            distributed = tryBuildDerivedDistributedJoin(rels, joins, workers);
+            if (distributed == null) {
+                distributed = tryBuildDistributedJoin(rels, joins, workers);
+            }
+        }
+        if (distributed == null) {
+            distributed = tryBuildDistributedJoinChain(rels, joins, workers);
+        }
+        return distributed;
+    }
+
+    /**
+     * <b>A 方案：把派生体物化成哨兵基表</b> —— 对 join 关系列表里每个「派生体」关系，登记一份
+     * {@link MaterializedCteScanOperator.Store}（查询体只执行一次，结果写 Arrow IPC），并改写为
+     * {@code __dojao_cte__…} 的普通基表关系。改写后外层 join 链只需面对<b>基表</b>这一种输入，
+     * 「派生⋈物理 / 物理⋈派生 / 派生⋈派生 / 多层嵌套派生」全部收敛成同一形状，不再各自开洞。
+     *
+     * <p><b>为什么这是「彻底」的</b>：片段模型（{@code FragmentSpec} + 扁平交换）只能表达「基表扫描 /
+     * 交换输入」；派生体内部若还有 join / 窗口 / 多层嵌套，任何「就地改写派生流水线」的方案都只覆盖
+     * 事先枚举过的形态。物化把它变成「先跑完一个完整子查询、再当基表扫」，与查询体复杂度无关 ——
+     * 物化体的规划复用 {@link #buildQuery} / {@link #buildSetOperation} 的全部能力，递归下去仍按本方法
+     * 兜底，深度不受限。</p>
+     *
+     * <p><b>两遍策略</b>：调用方先按现有派生流水线规划（零物化代价）；失败后调用本方法：</p>
+     * <ul>
+     *   <li>{@code all=false}：只物化 {@link #planDerived} 接不住的派生体（保留简单派生源的流式下推）；</li>
+     *   <li>{@code all=true}：把剩余<b>所有</b>派生体物化 —— 覆盖「两侧各自看似可流式、组合起来却
+     *       不成立」的整链失败，是三类形状（派生⋈物理 / 物理⋈派生 / 派生⋈派生）的最后一道保证。</li>
+     * </ul>
+     *
+     * <p><b>语义</b>：被改写的派生体只执行一次；物化结果经 Worker 侧分布式扫描读取，Master 不承载
+     * 结果数据。外层谓词（{@code rel.filter()}）、别名、列集原样保留。开关：
+     * {@code -Ddojao.plan.materializeDerived=false} 可整体关闭。</p>
+     *
+     * @param all {@code true} = 无视派生流水线能力，物化全部派生体
+     * @return 改写后的关系列表；没有任何关系被改写时返回 {@code null}（调用方沿用原列表）
+     */
+    private List<LogicalPlan.ResolvedRelation> materializeDerivedForJoin(
+            List<LogicalPlan.ResolvedRelation> rels, boolean all) {
+        if (!Boolean.parseBoolean(System.getProperty("dojao.plan.materializeDerived", "true"))) {
+            return null;
+        }
+        boolean changed = false;
+        List<LogicalPlan.ResolvedRelation> out = new ArrayList<>(rels.size());
+        for (LogicalPlan.ResolvedRelation rel : rels) {
+            LogicalPlan body = rel.subquery().orElse(null);
+            // 表函数 / UNNEST 有独立的行生成 / LATERAL 语义，不能当查询体物化。
+            if (body instanceof LogicalPlan.Select || body instanceof LogicalPlan.SetOperation) {
+                boolean alreadyMaterialized = materializedCtes.containsKey(body);
+                if (!alreadyMaterialized && (all || !derivedStreamable(rel))) {
+                    registerDerivedStore(rel, body);
+                    alreadyMaterialized = true;
+                }
+                if (alreadyMaterialized) {
+                    out.add(asCteBase(rel));
+                    changed = true;
+                    continue;
+                }
+            }
+            out.add(rel);
+        }
+        return changed ? out : null;
+    }
+
+    /** 派生体能否走现有「派生源」流式流水线（{@link #planDerived} 可解析）；解析失败按不支持处理。 */
+    private boolean derivedStreamable(LogicalPlan.ResolvedRelation rel) {
+        try {
+            return planDerived(rel) != null;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** 登记一份派生体物化 Store（幂等：同一查询体对象只登记一次）。 */
+    private void registerDerivedStore(LogicalPlan.ResolvedRelation rel, LogicalPlan body) {
+        String name = rel.table().isBlank() ? "derived" : rel.table();
+        materializedCtes.put(body, new MaterializedCteScanOperator.Store(
+                name, () -> planMaterializedBody(body)));
+        System.err.printf("[Planner] A 方案：派生体 %s 物化为哨兵基表（%s，%d 列）%n",
+                name, body instanceof LogicalPlan.SetOperation ? "SETOP" : "SELECT",
+                rel.columns().size());
     }
 
     /** 表达式文本是否引用了某个限定名（{@code alias.col}）—— 用于拒绝 UNNEST 进 join 条件。 */
@@ -2402,7 +2557,12 @@ public final class Planner {
         return out;
     }
 
-    /** 派生表单个输出列的类型：基表裸列 → 原类型；count → BIGINT；sum/avg → DOUBLE；min/max → 入参列类型。 */
+    /**
+     * 派生表单个输出列的类型：基表裸列 → 原类型；count → BIGINT；sum/avg → DOUBLE；min/max → 入参列类型。
+     *
+     * <p>条件聚合按改写后的普通聚合定类型：{@code count_if} → BIGINT、{@code sum_if} → DOUBLE、
+     * {@code min_if/max_if} → value 参数（第一个逗号参数）的类型。</p>
+     */
     private static Field derivedFieldForItem(String text, String col, Map<String, Field> baseFields) {
         Field base = baseFields.get(SqlTextUtil.stripQualifier(text).toLowerCase(Locale.ROOT));
         if (base != null) {
@@ -2412,14 +2572,20 @@ public final class Planner {
         if (agg.isEmpty()) return null;
         String fn = agg.get().function().toLowerCase(Locale.ROOT);
         return switch (fn) {
-            case "count", "count_distinct" ->
+            case "count", "count_distinct", "count_if" ->
                     new Field(col, FieldType.nullable(new ArrowType.Int(64, true)), null);
-            case "sum", "avg" ->
+            case "sum", "avg", "sum_if" ->
                     new Field(col, FieldType.nullable(
                             new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)), null);
-            case "min", "max" -> {
-                Field arg = baseFields.get(
-                        SqlTextUtil.stripQualifier(agg.get().arg()).toLowerCase(Locale.ROOT));
+            case "min", "max", "min_if", "max_if" -> {
+                String argText = agg.get().arg();
+                if (fn.endsWith("_if")) {
+                    // 条件聚合：value 是第一个顶层参数（第二参数为条件）
+                    List<String> args = ScalarExpr.splitTopLevelComma(argText);
+                    argText = args.isEmpty() ? null : args.get(0).trim();
+                }
+                Field arg = argText == null ? null : baseFields.get(
+                        SqlTextUtil.stripQualifier(argText).toLowerCase(Locale.ROOT));
                 yield arg == null ? null : new Field(col, arg.getFieldType(), null);
             }
             default -> null;
@@ -2454,18 +2620,59 @@ public final class Planner {
                 leftPart, left.outputColumns(), left);
         PhysicalNode rightNode = new PhysicalNode("HashPartition[" + rightKeys + "]",
                 rightPart, right.outputColumns(), right);
-        HashJoinOperator join = new HashJoinOperator(
-                leftPart, rightPart, leftKeys, rightKeys, jt,
-                context.memoryLimit(), partitions, declaredRightFields(rightRel), null, false,
-                keys.onLeftFilter(), keys.onRightFilter());
         List<String> outCols = joinOutputColumns(jt, left.outputColumns(), right.outputColumns(),
                 leftKeys, rightKeys);
-        String name = "HashJoin[" + jt + ", " + leftKeys + "=" + rightKeys + "]";
+        // 单机回退 join 同样受 build 侧内存约束（HashJoinOperator 超预算 fail-fast）。
+        // build 侧体量不可估 / 超预算 → 排序归并（两侧排序可溢写），避免「build side too large」。
+        List<Field> declaredRight = declaredRightFields(rightRel);
+        Operator join;
+        String name;
+        if (localJoinUseSortMerge(keys, rightRel)) {
+            join = new SortMergeJoinOperator(
+                    leftPart, rightPart, leftKeys, rightKeys, jt,
+                    context.memoryLimit(), partitions, declaredRight);
+            name = "SortMergeJoin[" + jt + ", " + leftKeys + "=" + rightKeys + "]";
+        } else {
+            join = new HashJoinOperator(
+                    leftPart, rightPart, leftKeys, rightKeys, jt,
+                    context.memoryLimit(), partitions, declaredRight, null, false,
+                    keys.onLeftFilter(), keys.onRightFilter());
+            name = "HashJoin[" + jt + ", " + leftKeys + "=" + rightKeys + "]";
+        }
         // 估算行数（EXPLAIN 用）：单机路径没有连接器列统计 → 外键假设（输出 ≈ 大的一侧，下界）
         long estimatedRows = JoinCardinality.estimateJoinRows(
                 left.estimatedRows(), right.estimatedRows(),
                 JoinCardinality.UNKNOWN, JoinCardinality.UNKNOWN);
         return new PhysicalNode(name, join, outCols, leftNode, rightNode).withEstimate(estimatedRows);
+    }
+
+    /**
+     * 单机回退 join 是否改用可溢写的排序归并。
+     *
+     * <p>判据与分布式路径同源（{@link JoinDecider}）：只有 build 侧（右表）装不下才降级。
+     * 体量探不到（派生表 / 无统计）一律排序归并 —— 哈希超预算直接失败，排序归并只是慢一点。</p>
+     *
+     * <p>ON 单侧残差谓词只在 {@link HashJoinOperator} 的匹配阶段实现（排序归并无残差语义）→ 强制哈希。
+     * {@code query.join.algorithm} 逃生门同样生效。</p>
+     */
+    private boolean localJoinUseSortMerge(JoinKeys keys, LogicalPlan.ResolvedRelation rightRel) {
+        if (keys.hasOnFilters()) {
+            return false;
+        }
+        String forced = ResourceConfig.joinAlgorithm();
+        if (forced != null && !forced.isBlank() && !"auto".equalsIgnoreCase(forced)) {
+            return "sort_merge".equalsIgnoreCase(forced.trim());
+        }
+        long rightBytes;
+        try {
+            DojaoConnector probe = rightRel == null ? null : connectorFor(rightRel.catalog());
+            rightBytes = probe == null ? JoinDecider.UNKNOWN
+                    : JoinDecider.estimateBytes(JoinDecider.StatsProbe.of(probe),
+                            rightRel.catalog(), rightRel.schema(), rightRel.table(), relScanFilter(rightRel));
+        } catch (RuntimeException e) {
+            rightBytes = JoinDecider.UNKNOWN;
+        }
+        return JoinDecider.tier(rightBytes, context.memoryLimit()) == JoinDecider.Tier.LARGE;
     }
 
     /**
@@ -5340,9 +5547,25 @@ public final class Planner {
     }
 
     /**
+     * 条件聚合（{@code COUNT_IF / SUM_IF / MAX_IF / MIN_IF}）：改写为 CASE 派生列上的普通聚合。
+     * 语义与 ClickHouse / Trino 一致 —— 条件为 TRUE 才计入（FALSE / NULL 一律跳过）。
+     */
+    private static final Set<String> IF_AGGREGATES = Set.of("COUNT_IF", "SUM_IF", "MAX_IF", "MIN_IF");
+
+    /**
      * 由单个聚合调用（{@link SqlTextUtil.AggInfo}）构造 {@link AggregationSpec}：剥离
      * {@code COUNT(DISTINCT x)} 的 {@code distinct} 前缀、解析聚合参数列（裸列直通 / CASE·算术表达式
      * 转派生列）、按函数名分派。整项聚合与「嵌在表达式里的内层聚合」共用这一份实现。
+     *
+     * <p>条件聚合在此改写（参数顺序：{@code count_if(cond)}、{@code sum_if(value, cond)} /
+     * {@code max_if(value, cond)} / {@code min_if(value, cond)}）：</p>
+     * <ul>
+     *   <li>{@code count_if(cond)} → {@code COUNT(CASE WHEN cond THEN 1 ELSE NULL END)}；</li>
+     *   <li>{@code sum_if(v, cond)} → {@code SUM(CASE WHEN cond THEN v ELSE NULL END)}；
+     *       max/min 同理。</li>
+     * </ul>
+     * <p>谓词与取值都只是<b>原表达式文本</b>，由 {@link #parseConditionalArg} 校验并登记为
+     * CaseProjection（分布式下随 AggregateStep 下发，Worker 侧先逐行物化再聚合）。</p>
      */
     private AggregationSpec buildAggregationSpec(String outName, SqlTextUtil.AggInfo a,
                                                  PhysicalNode upstream,
@@ -5360,16 +5583,42 @@ public final class Planner {
                 argText = t.substring(8).trim();
             }
         }
+        String fn = a.function();
+        if (IF_AGGREGATES.contains(fn)) {
+            if (distinctAgg) {
+                throw unsupported(fn + "(DISTINCT ...) 不支持：条件聚合本身已按条件过滤");
+            }
+            if (a.star()) {
+                throw unsupported(fn + " 需要显式参数：" + ifAggregateSignature(fn));
+            }
+            List<String> args = ScalarExpr.splitTopLevelComma(argText);
+            if ("COUNT_IF".equals(fn)) {
+                if (args.size() != 1) {
+                    throw unsupported("COUNT_IF 参数个数 " + args.size()
+                            + " 不对，应为 1 个：" + ifAggregateSignature(fn));
+                }
+                argText = "CASE WHEN " + args.get(0).trim() + " THEN 1 ELSE NULL END";
+                fn = "COUNT";
+            } else {
+                if (args.size() != 2) {
+                    throw unsupported(fn + " 参数个数 " + args.size()
+                            + " 不对，应为 2 个：" + ifAggregateSignature(fn));
+                }
+                argText = "CASE WHEN " + args.get(1).trim() + " THEN "
+                        + args.get(0).trim() + " ELSE NULL END";
+                fn = fn.substring(0, fn.length() - 3);   // SUM_IF → SUM / MAX_IF → MAX / MIN_IF → MIN
+            }
+        }
         // 聚合参数：裸列名直接引用；CASE 表达式改写为派生列（CaseProject 预计算后聚合）
-        String inputCol = a.star() ? null : resolveAggInput(argText, a.function(), upstream,
+        String inputCol = a.star() ? null : resolveAggInput(argText, fn, upstream,
                 caseProjections, derivedCols);
-        if (distinctAgg && !"COUNT".equals(a.function())
-                && !"MIN".equals(a.function()) && !"MAX".equals(a.function())) {
+        if (distinctAgg && !"COUNT".equals(fn)
+                && !"MIN".equals(fn) && !"MAX".equals(fn)) {
             // MIN/MAX(DISTINCT) 与不带 DISTINCT 完全等价（同一组值的极值不变）⇒ 下面按普通 MIN/MAX 建规格，
             // 去重语义自然满足。SUM/AVG(DISTINCT) 需另立函数，明确报不支持，不做静默降级（降级会给出错的数）。
-            throw unsupported(a.function() + "(DISTINCT ...)（当前仅支持 COUNT / MIN / MAX(DISTINCT ...)）");
+            throw unsupported(fn + "(DISTINCT ...)（当前仅支持 COUNT / MIN / MAX(DISTINCT ...)）");
         }
-        return switch (a.function()) {
+        return switch (fn) {
             // 分区元数据扫描的行集是「一行为一个非空分区」：count(*) 必须按每分区精确行数求和
             // （sum_int64 保 BIGINT，普通 sum 会漂成 DOUBLE）。行数列只会由该扫描路径产生。
             case "COUNT" -> a.star()
@@ -5385,19 +5634,24 @@ public final class Planner {
             case "MAX" -> AggregationSpec.max(inputCol, outName);
             default -> {
                 // 先查 collect-evaluate 型（CollectAggregateRegistry，框架攒值），再查增量型
-                CollectAggregateFunction collectFn = CollectAggregateRegistry.getGlobal(a.function());
+                CollectAggregateFunction collectFn = CollectAggregateRegistry.getGlobal(fn);
                 if (collectFn != null) {
                     List<String> collectCols = validateCollectArgs(a, collectFn, upstream);
                     yield AggregationSpec.collect(outName, collectFn, collectCols);
                 }
                 // 自定义聚合（CREATE FUNCTION 加载后注册进 AggregateFunctionRegistry）按名取用
-                AggregateFunction<?> custom = AggregateFunctionRegistry.getGlobal(a.function());
+                AggregateFunction<?> custom = AggregateFunctionRegistry.getGlobal(fn);
                 if (custom == null) {
-                    throw unsupported("聚合函数: " + a.function());
+                    throw unsupported("聚合函数: " + fn);
                 }
                 yield AggregationSpec.aggregate(inputCol, outName, custom);
             }
         };
+    }
+
+    /** 条件聚合的调用签名（错误提示用）。 */
+    private static String ifAggregateSignature(String fn) {
+        return "COUNT_IF".equals(fn) ? "count_if(condition)" : fn.toLowerCase(Locale.ROOT) + "(value, condition)";
     }
 
     // ==================== 聚合嵌在表达式里（内层聚合） ====================
@@ -6313,6 +6567,23 @@ public final class Planner {
             return null;
         }
         List<FragmentSpec.JoinAlias> aliases = probe.outputAliases();
+        // 穿透投影 / 别名层后，分组键必须仍由 join 基座产出 —— 否则说明中间是「改名投影」
+        // （`SELECT user_id AS uid ... GROUP BY uid`），下沉到 Worker 后 join 输出仍是 user_id，
+        // 每分区聚合会报「field uid not found」。此时拒绝下沉，交由本地聚合在投影之上求值。
+        // 例外：GROUP BY 表达式派生列（__gk_N）由发送端物化，本就不在 join 输出里。
+        Set<String> derivedKeys = new HashSet<>();
+        for (GroupKeyExpression gk : groupKeyExpressions) derivedKeys.add(gk.derivedColumn());
+        Set<String> joinCols = new HashSet<>();
+        for (String c : probe.columns()) joinCols.add(c.toLowerCase(java.util.Locale.ROOT));
+        for (FragmentSpec.JoinAlias a : aliases) {
+            joinCols.add(a.aliasName().toLowerCase(java.util.Locale.ROOT));
+        }
+        for (String key : keys) {
+            if (derivedKeys.contains(key)) continue;
+            if (!joinCols.contains(key.toLowerCase(java.util.Locale.ROOT))) {
+                return null;
+            }
+        }
         // 派生源（子查询 / CTE 的迷你流水线）由本算子原样转交 StageScheduler（sources 参数）——
         // 链上 CROSS 环节的 build 侧单值广播同样随 sources 生效，不再回退 Master 单机聚合。
         int partitions = djo.numPartitions();
@@ -7158,9 +7429,16 @@ public final class Planner {
      * 各层过滤与列裁剪，流水线不丢）。</p>
      */
     /** 窗口链探测结果：分布式 join 基（直连 / 派生）+ 外连接同名列消歧规则（由内向外的套用顺序）。 */
+    /**
+     * @param columns join 基座<b>自身</b>的输出列（不含其上层被穿透的投影 / 别名层）。
+     *                下游把分组键 / 窗口键压到 join 上时，用它校验「键确实由 join 产出」——
+     *                穿透改名投影（{@code SELECT user_id AS uid}）后键名会与 join 输出不符，
+     *                此时必须拒绝下沉（否则 Worker 侧聚合找不到列），回退本地路径。
+     */
     private record WindowChainJoinBase(DistributedJoinOperator join,
                                        DistributedDerivedJoinOperator derivedJoin,
-                                       List<FragmentSpec.JoinAlias> outputAliases) {
+                                       List<FragmentSpec.JoinAlias> outputAliases,
+                                       List<String> columns) {
     }
 
     /**
@@ -7179,10 +7457,12 @@ public final class Planner {
             WindowChainJoinBase inner = probeWindowChainJoinBase(node.children().get(0));
             if (inner == null) return null;
             List<FragmentSpec.JoinAlias> all = new ArrayList<>(inner.outputAliases());
+            List<String> cols = new ArrayList<>(inner.columns());
             for (ColumnAliasOperator.Alias a : ca.aliases()) {
                 all.add(new FragmentSpec.JoinAlias(a.sourceName(), a.occurrence(), a.aliasName()));
+                cols.add(a.aliasName());
             }
-            return new WindowChainJoinBase(inner.join(), inner.derivedJoin(), all);
+            return new WindowChainJoinBase(inner.join(), inner.derivedJoin(), all, cols);
         }
         if (op instanceof ProjectOperator || op instanceof CaseProjectOperator
                 || op instanceof ExpressionProjectOperator) {
@@ -7195,10 +7475,12 @@ public final class Planner {
         // 携带后续阶段（聚合 / 窗口）的算子是不可再重建的边界：窗口链只能挂在纯 join 之上，
         // 否则 withWindowChain 会把内层聚合 / 已有窗口整段顶掉（聚合后开窗 → 窗口挂在明细行上）。
         if (op instanceof DistributedJoinOperator djo) {
-            return isBareJoin(djo) ? new WindowChainJoinBase(djo, null, new ArrayList<>()) : null;
+            return isBareJoin(djo)
+                    ? new WindowChainJoinBase(djo, null, new ArrayList<>(), node.outputColumns()) : null;
         }
         if (op instanceof DistributedDerivedJoinOperator ddj) {
-            return ddj.windowChain().isEmpty() ? new WindowChainJoinBase(null, ddj, new ArrayList<>()) : null;
+            return ddj.windowChain().isEmpty()
+                    ? new WindowChainJoinBase(null, ddj, new ArrayList<>(), node.outputColumns()) : null;
         }
         return null;
     }

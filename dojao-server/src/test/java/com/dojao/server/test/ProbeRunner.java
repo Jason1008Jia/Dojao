@@ -38,7 +38,13 @@ public final class ProbeRunner {
             new Probe("com.dojao.server.test.ShuffleStreamGenerationProbeTest", null),
             new Probe("com.dojao.server.test.DistributedDifferentialProbeTest", null),
             // 取消 → 资源释放（停止后 Worker 仍烧 CPU / 内存不降的回归护栏）
-            new Probe("com.dojao.server.test.CancellationReleaseProbeTest", null));
+            new Probe("com.dojao.server.test.CancellationReleaseProbeTest", null),
+            // Worker 叶子池弹性（固定尺寸 FIFO 会把打破环的生产者片段饿死 → 死锁）
+            new Probe("com.dojao.server.test.WorkerLeafPoolElasticProbeTest", null),
+            // 扫描存活心跳 / 完工后终态事件迟到不得误判 LOST
+            new Probe("com.dojao.server.test.ScanLivenessProbeTest", null),
+            // 中间层片段（写 shuffle）必须走弹性叶子池，不得排在等它的主池消费者后面
+            new Probe("com.dojao.server.test.MiddleStagePoolProbeTest", null));
 
     private static final Pattern P1 = Pattern.compile("(\\d+)\\s*PASS\\s*/\\s*(\\d+)\\s*FAIL");
     private static final Pattern P2 = Pattern.compile("PASS=(\\d+)\\s+FAIL=(\\d+)");

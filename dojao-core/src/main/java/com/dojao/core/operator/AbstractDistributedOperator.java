@@ -627,6 +627,9 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
     protected final void dispatch(FragmentSpec spec) {
         taskStates.put(spec.fragmentId(), new FragmentTaskState(spec));
         taskOwner.put(spec.fragmentId(), spec.selfWorkerId());
+        // 归属登记：派发出去的 jobId 必须归属到当前执行的查询，否则 Master 的僵尸片段回收会把
+        // 主计划树之外（物化 CTE / 物化派生体查询体）的片段误判成残留。见 DispatchScope。
+        com.dojao.core.runtime.master.DispatchScope.register(queryId);
         gateway.dispatchFragment(spec.selfWorkerId(), queryId, spec.fragmentId(), spec,
                 resultQueue, controlQueue);
     }

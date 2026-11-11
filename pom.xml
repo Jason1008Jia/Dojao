@@ -83,6 +83,10 @@
         <sqlite.jdbc.version>3.45.3.0</sqlite.jdbc.version>
         <postgresql.version>42.7.1</postgresql.version>
         <clickhouse.jdbc.version>0.6.0</clickhouse.jdbc.version>
+        <!-- ClickHouse JDBC 的 Apache HttpClient 5 连接池（driver 精简 jar 不含，缺省降级 HttpURLConnection） -->
+        <httpclient5.version>5.2</httpclient5.version>
+        <!-- ClickHouse JDBC 默认 compress=lz4，编解码实现 net.jpountz.lz4 需显式引入（精简 jar 不含） -->
+        <lz4.version>1.6.0</lz4.version>
         <!-- Microsoft JDBC Driver for SQL Server：jre11 变体兼容 JDK 11+，传递依赖全为 optional（离线可解析） -->
         <mssql.jdbc.version>12.6.1.jre11</mssql.jdbc.version>
         <!-- Oracle JDBC Driver（ojdbc11，JDK 11+）：pom 无任何依赖，离线可解析 -->
@@ -366,6 +370,17 @@
                 <groupId>com.clickhouse</groupId>
                 <artifactId>clickhouse-jdbc</artifactId>
                 <version>${clickhouse.jdbc.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.httpcomponents.client5</groupId>
+                <artifactId>httpclient5</artifactId>
+                <version>${httpclient5.version}</version>
+            </dependency>
+            <!-- ClickHouse JDBC 默认 LZ4 压缩的编解码实现（net.jpountz.lz4 包） -->
+            <dependency>
+                <groupId>org.lz4</groupId>
+                <artifactId>lz4-java</artifactId>
+                <version>${lz4.version}</version>
             </dependency>
             <!-- Microsoft JDBC Driver for SQL Server（SQL Server 连接器；transitive 依赖全 optional，不进 lib/） -->
             <dependency>

@@ -6,6 +6,7 @@ import com.dojao.common.memory.NodeMemory;
 import com.dojao.spi.bean.*;
 import com.dojao.spi.service.DojaoConnector;
 import com.dojao.spi.service.OverwriteEnable;
+import com.dojao.spi.util.ArrowJdbcValues;
 import com.dojao.spi.util.JdbcArrowConverter;
 import com.dojao.spi.util.JdbcSizeEstimator;
 import com.dojao.spi.util.SqlIdentifiers;
@@ -1023,7 +1024,7 @@ public class SqlServerConnector implements DojaoConnector, OverwriteEnable {
             for (int row = 0; row < rowCount; row++) {
                 for (int col = 0; col < colCount; col++) {
                     FieldVector vector = root.getVector(col);
-                    Object value = vector.getObject(row);
+                    Object value = ArrowJdbcValues.toJdbc(vector, row);
                     // Arrow Text → String
                     if (value instanceof Text textValue) {
                         value = textValue.toString();

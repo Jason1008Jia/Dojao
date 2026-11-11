@@ -13,6 +13,7 @@ import com.dojao.core.resource.ParallelismCalculator;
 import com.dojao.core.resource.ScanTableExtractor;
 import com.dojao.core.resource.TableRef;
 import com.dojao.core.rpc.*;
+import com.dojao.core.runtime.master.DispatchScope;
 import com.dojao.core.runtime.master.WorkerRegistry;
 import com.dojao.grammar.analyzer.exception.SemanticException;
 import com.dojao.grammar.analyzer.expression.Expression;
@@ -22,13 +23,12 @@ import com.dojao.server.function.FunctionManager;
 import com.dojao.spi.bean.FunctionDefinition;
 import com.dojao.spi.bean.TableStats;
 import com.dojao.spi.service.DojaoConnector;
-import com.dojao.spi.util.NestedTypeSupport;
+import com.dojao.spi.util.ArrowValueText;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -591,6 +591,9 @@ public class QueryServiceImpl {
         Operator op = physical.operator();
         long totalRows = 0;
         try {
+            // 派发归属作用域：算子链（含执行期惰性规划的物化 CTE / 物化派生体查询体）派发出去的
+            // 每个 jobId 都登记到本查询，Master 的僵尸片段回收据此不再误杀它们。
+            DispatchScope.begin(qm::registerOperatorQueryId);
             qm.markRunning();
             op.open();
             Page page;
@@ -617,9 +620,9 @@ public class QueryServiceImpl {
                         for (FieldVector vec : vectors) {
                             // 嵌套值（LIST/MAP/STRUCT）的 getObject().toString() 是 Java 的
                             // [1, 2] / {a=1}，这里统一渲染成与 Hive 文本一致的 JSON 风格。
-                            String value = NestedTypeSupport.isNested(vec)
-                                    ? NestedTypeSupport.formatValue(vec, r)
-                                    : (vec.isNull(r) ? "NULL" : plainText(vec.getObject(r)));
+                            String value = vec.isNull(r)
+                                    ? "NULL"
+                                    : ArrowValueText.text(vec, r);
                             row.addValues(value);
                         }
                         builder.addRows(row.build());
@@ -654,6 +657,7 @@ public class QueryServiceImpl {
                 throw e;
             }
         } finally {
+            DispatchScope.end();
             op.close();
             QueryManagerRegistry.get().complete(qm);
         }
@@ -676,22 +680,6 @@ public class QueryServiceImpl {
         return outCols.size() == 1 && "*".equals(outCols.get(0));
     }
 
-    /**
-     * 结果值转文本：浮点数按十进制展开，避免 {@code 4.6258752709998167E8} 这类科学计数法。
-     * NaN / Infinity 保持 Java 原样（BigDecimal 无法表示）。
-     */
-    private static String plainText(Object value) {
-        if (value instanceof Double d) {
-            return Double.isFinite(d) ? new BigDecimal(d.toString()).toPlainString() : d.toString();
-        }
-        if (value instanceof Float f) {
-            return Float.isFinite(f) ? new BigDecimal(f.toString()).toPlainString() : f.toString();
-        }
-        if (value instanceof BigDecimal bd) {
-            return bd.toPlainString();
-        }
-        return String.valueOf(value);
-    }
 
     // ==================== 写语句响应 ====================
 
@@ -707,6 +695,8 @@ public class QueryServiceImpl {
         // FragmentFinished 判 EOF，行数 = totalOutputRows()（各分区回传 rowCount 之和）。
         boolean distributedWrite = op instanceof AbstractDistributedOperator;
         try {
+            // 派发归属作用域（同 respondRows）：写计划的分布式片段 / 物化查询体片段都要归属本查询。
+            DispatchScope.begin(qm::registerOperatorQueryId);
             qm.markRunning();
             op.open();
             Page page;
@@ -732,6 +722,7 @@ public class QueryServiceImpl {
                 throw e;
             }
         } finally {
+            DispatchScope.end();
             op.close();
             QueryManagerRegistry.get().complete(qm);
         }

@@ -111,6 +111,12 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
     // ---- 两阶段流水线状态 ----
     private volatile boolean phase1Done;
     private volatile boolean phase2Started;
+    /**
+     * Phase 1 / Phase 2 初始化锁。<b>本地计划里多个 HashPartition 分发线程会并发 next()</b>，
+     * 两个线程同时看到 {@code phase2Started == false} 会各自起一轮 Phase 2（覆盖池、重置
+     * {@code phase2Remaining}）→ 计数永远归不了零、消费者永久等待。初始化必须只做一次。
+     */
+    private final Object phaseInitLock = new Object();
     private ExecutorService phase2Pool;
     private final List<Future<?>> phase2Futures = new ArrayList<>();
     /**
@@ -243,13 +249,17 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
 
     @Override
     protected Page doNext() throws Exception {
-        if (!phase1Done) {
-            runPhase1();
-            phase1Done = true;
-        }
-        if (!phase2Started) {
-            startPhase2();
-            phase2Started = true;
+        if (!phase1Done || !phase2Started) {
+            synchronized (phaseInitLock) {
+                if (!phase1Done) {
+                    runPhase1();
+                    phase1Done = true;
+                }
+                if (!phase2Started) {
+                    startPhase2();
+                    phase2Started = true;
+                }
+            }
         }
 
         // 边归并边消费：Phase 2 分区线程把页 put 进有界队列（满则阻塞在本线程），这里同时排空。

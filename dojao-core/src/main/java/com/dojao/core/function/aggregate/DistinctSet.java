@@ -20,8 +20,9 @@ import java.util.Set;
  * <ul>
  *   <li>{@link #addLong}/{@link #addDouble}：开放寻址 {@code long[]} + {@code boolean[]}，装载因子
  *       ≤ 0.5 ⇒ 约 17B/值（旧实现按 48B/值估算都不够）；</li>
- *   <li>{@link #addUtf8}：UTF-8 字节写入分块 arena（64KB 块，不整块复制），旁挂偏移/长度/哈希
- *       数组 ⇒ 约 20B + 字符串字节/值，且<b>不产生任何逐值对象</b>；</li>
+ *   <li>{@link #addUtf8}：UTF-8 字节写入分块 arena（首块 256B，之后按 2 倍几何增长、
+ *       上限 64KB，不整块复制），旁挂偏移/长度/哈希数组 ⇒ 约 20B + 字符串字节/值，
+ *       且<b>不产生任何逐值对象</b>；</li>
  *   <li>类型混杂（极少见）时自动退化为 {@link HashSet} 语义（{@link #kind()} = {@code OBJECT}）。</li>
  * </ul>
  *
@@ -48,8 +49,27 @@ public final class DistinctSet extends AbstractSet<Object> {
     private static final byte STRING = 3;
     private static final byte OBJECT = 4;
 
-    /** 字符串 arena 的分块大小（单个超长值独占一块）。 */
-    private static final int CHUNK_SIZE = 64 * 1024;
+    /** 字符串 arena 单块上限（单个超长值独占一块）。 */
+    private static final int MAX_CHUNK_SIZE = 64 * 1024;
+    /**
+     * 字符串 arena 首块大小。
+     *
+     * <p>★不能直接用 {@link #MAX_CHUNK_SIZE} 作为首块：每个 {@code COUNT(DISTINCT)} 状态
+     * = 一个分组，按分组键（如手机号）高基数时每组往往只有 1~5 个短字符串。若每组首块就申请
+     * 64KB，单页（1 万行 ⇒ 上万个新分组）就会瞬时占掉数百 MB~数 GB —— 溢写闸门只在「页边界」
+     * 检查，根本来不及触发，Worker 直接堆 OOM（线上：join 输出按 telenumber 分组
+     * count(distinct customer_id)，JAG 片段读第一页即 OOM）。首块 256B，之后几何增长到
+     * 64KB，既保留大集合的摊还 O(1) 追加，又让小分组内存与实际值字节数成正比。</p>
+     */
+    private static final int MIN_CHUNK_SIZE = 256;
+    /**
+     * 去重表首次分配的槽数（LONG/DOUBLE 与 STRING 共用）。
+     *
+     * <p>同理不能按 64 起跳：每个分组一个状态，高基数分组时绝大多数组只有 1~5 个值，
+     * 64 槽的 {@code long[]+boolean[]}（约 576B）或字符串槽表（约 768B）会被放大成
+     * 「分组数 × 数百字节」的固定开销。16 槽足够覆盖典型小分组，增长仍是 2 倍几何摊还。</p>
+     */
+    private static final int INITIAL_TABLE_CAPACITY = 16;
 
     private byte kind = EMPTY;
     private int size;
@@ -112,7 +132,7 @@ public final class DistinctSet extends AbstractSet<Object> {
     public boolean addLong(long v) {
         if (kind == EMPTY) kind = LONG;
         if (kind != LONG) return add(Long.valueOf(v));
-        if (lkeys == null) initLongTable(64);
+        if (lkeys == null) initLongTable(INITIAL_TABLE_CAPACITY);
         return insertLong(v);
     }
 
@@ -120,7 +140,7 @@ public final class DistinctSet extends AbstractSet<Object> {
     public boolean addDouble(double v) {
         if (kind == EMPTY) kind = DOUBLE;
         if (kind != DOUBLE) return add(Double.valueOf(v));
-        if (lkeys == null) initLongTable(64);
+        if (lkeys == null) initLongTable(INITIAL_TABLE_CAPACITY);
         return insertLong(Double.doubleToLongBits(v));
     }
 
@@ -130,7 +150,7 @@ public final class DistinctSet extends AbstractSet<Object> {
         if (kind != STRING) {
             return add(new String(src, off, len, StandardCharsets.UTF_8));
         }
-        if (slots == null) initStringTable(64);
+        if (slots == null) initStringTable(INITIAL_TABLE_CAPACITY);
         int hash = mix(hashBytes(src, off, len));
         int idx = hash & smask;
         while (slots[idx] != 0) {
@@ -236,8 +256,17 @@ public final class DistinctSet extends AbstractSet<Object> {
             int ci = chunkIndex + 1;
             if (chunks == null) chunks = new byte[4][];
             if (ci == chunks.length) chunks = Arrays.copyOf(chunks, chunks.length << 1);
-            chunks[ci] = new byte[Math.max(CHUNK_SIZE, len)];
-            arenaBytes += 16L + chunks[ci].length;   // 16B ≈ 数组对象头；增量缓存，estimatedBytes 必须 O(1)
+            // 首块 MIN_CHUNK_SIZE；后续按上一块 2 倍几何增长（封顶 MAX_CHUNK_SIZE）；
+            // 单个超长值独占一块（至少 len）。大集合仍是摊还 O(1) 追加，小集合不再按 64KB 起跳。
+            int size;
+            if (chunkIndex < 0) {
+                size = Math.max(MIN_CHUNK_SIZE, len);
+            } else {
+                long grown = Math.min((long) MAX_CHUNK_SIZE, (long) chunks[chunkIndex].length << 1);
+                size = (int) Math.max(grown, len);
+            }
+            chunks[ci] = new byte[size];
+            arenaBytes += 16L + size;   // 16B ≈ 数组对象头；增量缓存，estimatedBytes 必须 O(1)
             chunkIndex = ci;
             chunkFill = 0;
         }
@@ -362,7 +391,7 @@ public final class DistinctSet extends AbstractSet<Object> {
         int before = size();
         switch (kind) {
             case LONG, DOUBLE -> {
-                if (lkeys == null) initLongTable(64);
+                if (lkeys == null) initLongTable(INITIAL_TABLE_CAPACITY);
                 // 直接搬裸值：DOUBLE 的 lkeys 存的是 doubleToLongBits，不能走 addDouble（会再次转换）
                 for (int i = 0; i < other.lkeys.length; i++) {
                     if (other.lused[i]) insertLong(other.lkeys[i]);

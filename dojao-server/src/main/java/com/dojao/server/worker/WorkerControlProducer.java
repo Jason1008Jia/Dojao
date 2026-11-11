@@ -229,13 +229,12 @@ public final class WorkerControlProducer implements FlightProducer {
         // 其失败由同查询消费者片段的判死连带取消间接体现。
         java.util.function.Consumer<String> aborter = spec.isProducer() ? null
                 : cause -> queue.offer(new FragmentEvent.FragmentFailed(taskId, cause), 3, TimeUnit.SECONDS);
-        // Producer（叶子）走专线：消费者/MiddleJoinConsumer 会整段阻塞等 shuffle 收齐，与它们
-        // 共用一池时生产者会被永久饿死（详见 WorkerManager#leafExecutor）
-        if (spec.isProducer()) {
-            wm.submitLeafTask(task, body);
-        } else {
-            wm.submitTask(task, body, aborter);
-        }
+        // 按依赖方向选池（详见 WorkerManager#submitFragmentTask）：
+        // ① Producer 与「中间层消费者」都<b>向下游写 shuffle</b>，别人要等它们推进 → 弹性叶子池；
+        // ② 只有终端纯消费者（不产生任何 shuffle 输出）留在固定主池 —— 它们互不等待，不会成环。
+        // 旧实现仅按 isProducer() 分池，把 MiddleJoinConsumer 放进主池：6 个 AggregateConsumer
+        // 先占满主池、等它产 JAGG 数据，它却排在第 7 位 → 线程等待环（2026-11-11 三表 join 死锁）。
+        wm.submitFragmentTask(spec, task, body, aborter);
         ack(listener, true, null);
     }
 

@@ -6,6 +6,7 @@ import com.dojao.common.memory.NodeMemory;
 import com.dojao.spi.bean.*;
 import com.dojao.spi.service.DojaoConnector;
 import com.dojao.spi.service.OverwriteEnable;
+import com.dojao.spi.util.ArrowJdbcValues;
 import com.dojao.spi.util.JdbcArrowConverter;
 import com.dojao.spi.util.JdbcSizeEstimator;
 import com.dojao.spi.util.SqlIdentifiers;
@@ -1103,7 +1104,7 @@ public class OracleConnector implements DojaoConnector, OverwriteEnable {
             for (int row = 0; row < rowCount; row++) {
                 for (int col = 0; col < colCount; col++) {
                     FieldVector vector = root.getVector(col);
-                    ps.setObject(col + 1, jdbcValue(vector.getObject(row)));
+                    ps.setObject(col + 1, jdbcValue(ArrowJdbcValues.toJdbc(vector, row)));
                 }
                 ps.addBatch();
                 if (((row + 1) % batchSize) == 0) {
@@ -1130,6 +1131,7 @@ public class OracleConnector implements DojaoConnector, OverwriteEnable {
         if (value instanceof Text text) return text.toString();
         if (value instanceof Boolean b) return b ? 1 : 0;
         if (value instanceof LocalTime t) return t.toString();
+        if (value instanceof java.sql.Time t) return t.toString();   // Oracle 无 TIME 类型，按文本写入
         return value;
     }
 

@@ -51,6 +51,67 @@ var SQL_KEYWORDS = {
  */
 var SQL_TOKEN_RE = /--[^\n]*|\/\*[\s\S]*?\*\/|'(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.|"")*"|`[^`]*`|[A-Za-z_][A-Za-z0-9_$]*|\d+(?:\.\d+)?|\s+|[\s\S]/g;
 
+// ==================== 括号配对高亮 ====================
+//
+// 编辑器是 textarea + 垫层（见文件头），所以「括号高亮」不是给 textarea 上色，而是在重画垫层时
+// 把光标旁那一对括号单独包成 <span class="sql-bracket-match">。字符本身不变、只加背景与阴影，
+// 不会改变字宽（加粗/斜体都会让垫层与 textarea 的折行错位，见下方配色注释）。
+//
+// 配对必须跳过字符串/注释/反引号里的括号：复用同一个 SQL_TOKEN_RE 切 token，长度 > 1 的 token
+// （字符串、注释、标识符、数字、空白）整段跳过，只有「独立的单字符」才可能是括号。
+
+/** 右括号 → 左括号。 */
+var BRACKET_OPEN_OF = { ')': '(', ']': '[', '}': '{' };
+
+function isBracketChar(ch) {
+    return ch === '(' || ch === ')' || ch === '[' || ch === ']' || ch === '{' || ch === '}';
+}
+
+/**
+ * 单趟扫描全文，返回「括号偏移 ↔ 配对括号偏移」的双向映射。
+ *
+ * <p>用栈配对；遇到与栈顶不同类的右括号只做「不配对」处理而<b>不</b>向上找——
+ * 混用不同类型的括号本身就是写错了，让高亮直接消失比高亮到一个错误位置更诚实。</p>
+ */
+function bracketMatches(text) {
+    var match = Object.create(null);
+    var stack = [];
+    SQL_TOKEN_RE.lastIndex = 0;
+    var m;
+    while ((m = SQL_TOKEN_RE.exec(text)) !== null) {
+        var tok = m[0];
+        if (tok.length !== 1 || !isBracketChar(tok)) continue;   // 字符串/注释等整段跳过
+        if (tok === '(' || tok === '[' || tok === '{') {
+            stack.push({ ch: tok, idx: m.index });
+        } else if (stack.length && stack[stack.length - 1].ch === BRACKET_OPEN_OF[tok]) {
+            var open = stack.pop().idx;
+            match[open] = m.index;
+            match[m.index] = open;
+        }
+    }
+    return match;
+}
+
+/**
+ * 光标处的「待配对括号」：取光标右边那个字符，取不到再取左边那个。
+ *
+ * <p>textarea 的光标永远落在字符之间：点在括号左半边时 caret 在它<b>之前</b>（取右边），
+ * 点在右半边时 caret 在它<b>之后</b>（取左边），两种点法都要能命中。</p>
+ *
+ * @return 命中且能配对时返回 <code>[左偏移, 右偏移]</code>，否则 null
+ */
+function bracketPairAt(text, caret) {
+    if (!text || caret < 0) return null;
+    var idx = -1;
+    if (isBracketChar(text.charAt(caret))) idx = caret;
+    else if (caret > 0 && isBracketChar(text.charAt(caret - 1))) idx = caret - 1;
+    if (idx < 0) return null;
+    var pairs = bracketMatches(text);
+    var other = pairs[idx];
+    if (other === undefined) return null;
+    return [Math.min(idx, other), Math.max(idx, other)];
+}
+
 /** 单个 token 的 CSS 类名；返回空串表示「不染色」。 */
 function sqlTokenClass(tok) {
     var c0 = tok.charAt(0);
@@ -64,6 +125,9 @@ function sqlTokenClass(tok) {
     return '';
 }
 
+/** 上一次重画时的「文本 + 配对括号位置」，相同则跳过 DOM 重建（光标移动/按键会频繁触发）。 */
+var lastHighlightKey = null;
+
 /**
  * 把编辑器内容重画一遍。
  *
@@ -71,7 +135,8 @@ function sqlTokenClass(tok) {
  * 编辑器里是用户输入的任意文本，拼 HTML 就是一个自伤的 XSS 口子。</p>
  *
  * <p>每次输入都整体重画：token 化几 KB 文本是微秒级，比做增量更新简单得多，也不会出现
- * 「删了两个字符颜色还在」这类状态不一致。</p>
+ * 「删了两个字符颜色还在」这类状态不一致。光标移动（点击 / 方向键）只改「配对括号」，走下面的
+ * key 去重直接返回，不重建 DOM。</p>
  */
 function renderSqlHighlight() {
     var host = document.getElementById('sql-highlight');
@@ -80,6 +145,20 @@ function renderSqlHighlight() {
     if (!host || !code || !input) return;
 
     var text = input.value || '';
+    // 有选区时不配对：此时 selectionStart 只是选区起点，跟着它高亮会显得莫名其妙。
+    var pair = input.selectionStart === input.selectionEnd
+            ? bracketPairAt(text, input.selectionStart)
+            : null;
+    var key = text + '\u0000' + (pair ? pair[0] + ',' + pair[1] : '');
+    if (key === lastHighlightKey) {
+        syncSqlHighlight(input, host);                  // 文本与配对都没变，只需跟住滚动/内边距
+        return;
+    }
+    lastHighlightKey = key;
+
+    var hl = Object.create(null);
+    if (pair) { hl[pair[0]] = 1; hl[pair[1]] = 1; }
+
     var frag = document.createDocumentFragment();
     var plain = '';                                    // 连续「不染色」片段攒成一个文本节点
     SQL_TOKEN_RE.lastIndex = 0;
@@ -87,13 +166,13 @@ function renderSqlHighlight() {
     while ((m = SQL_TOKEN_RE.exec(text)) !== null) {
         var tok = m[0];
         var cls = sqlTokenClass(tok);
-        if (!cls) {
+        if (!cls && !hl[m.index]) {
             plain += tok;
             continue;
         }
         if (plain) { frag.appendChild(document.createTextNode(plain)); plain = ''; }
         var span = document.createElement('span');
-        span.className = cls;
+        span.className = cls || 'sql-bracket-match';    // 括号 token 无语法色，只挂配对高亮
         span.textContent = tok;
         frag.appendChild(span);
     }
@@ -138,6 +217,11 @@ function bindSqlHighlight() {
     if (!input || !host || !body) return;
 
     input.addEventListener('input', renderSqlHighlight);
+    // 光标移动不触发 input：点击、方向键、拖选都要重算「光标旁是哪一对括号」。
+    // 重画有 key 去重（文本 + 配对位置都没变就直接返回），打字时的 keyup 不会造成二次重建。
+    input.addEventListener('click', renderSqlHighlight);
+    input.addEventListener('keyup', renderSqlHighlight);
+    input.addEventListener('select', renderSqlHighlight);
     // 滚动只要跟住位移，不必重画 DOM（滚动是高频事件，重建整棵节点纯属浪费）
     input.addEventListener('scroll', function () { syncSqlHighlight(input, host); });
 

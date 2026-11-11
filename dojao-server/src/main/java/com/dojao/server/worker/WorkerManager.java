@@ -1,6 +1,7 @@
 package com.dojao.server.worker;
 
 import com.dojao.core.config.ResourceConfig;
+import com.dojao.core.operator.FragmentSpec;
 import com.dojao.core.runtime.worker.ResourceSummary;
 import com.dojao.core.runtime.worker.WorkerNode;
 import com.dojao.core.runtime.worker.WorkerState;
@@ -21,6 +22,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -103,7 +105,19 @@ public final class WorkerManager {
      * <b>假死</b>而不是报错。分池后生产者的推进不再依赖空闲槽位，这条死锁链被切断。</p>
      *
      * <p><b>代价</b>：单 Worker 并发片段上限从 {@code parallelism} 变为 {@code 2 × parallelism}
-     * （消费者一池 + 叶子一池）。两池各自<b>有界</b>，池满照旧排队，只是不同角色不再互相拖死。</p>
+     * （消费者一池 + 叶子一池）。</p>
+     *
+     * <p><b>为什么是有界池之上的「弹性池」（2026-11-11 修复偶发假死）</b>：固定尺寸 + FIFO 队列仍会
+     * 死锁。实测链路（多表 join 回退 Master 单机时）：Master 打开计划即把所有基表扫描切片派到
+     * 叶子池 → 本地 HashJoin 先 build 右侧，左侧扫描暂时无人消费、写满分区队列而阻塞 → 6 个叶子
+     * 线程全被这些扫描占住 → 右侧分布式子 join 的生产者片段排在 FIFO 第 7 位以后永远跑不到 →
+     * 主池的 join 消费者等它（{@code 已收页=0}）→ 右侧 build 不结束 → 左侧扫描永远不被消费。
+     * 这是一个<b>环形等待</b>：被等待的片段本身就在排队，线程总数够（主池当时仅 1/6）也救不了。</p>
+     *
+     * <p>片段是「整段占用线程 + 阻塞等上下游」的执行单位，任何<em>依赖未知</em>的有界 FIFO 都可能
+     * 把唯一能打破环的片段排在后面。故叶子池改为<b>按需扩容、空闲 60s 回收</b>（
+     * {@code ThreadPoolExecutor(0, MAX, 60s, SynchronousQueue)}）：只要还有活片段，它就能拿到线程。
+     * 并发片段数仍由 Master 的并行度 / 阶段调度决定，线程数上界 = 该 Worker 上的活片段数。</p>
      */
     private final ThreadPoolExecutor leafExecutor;
     /** 心跳调度线程。 */
@@ -187,7 +201,12 @@ public final class WorkerManager {
         // 任务池容量：显式传正值优先；否则（0 / 负数）取配置文件 system.worker.parallelism
         this.poolSize = maxConcurrentTasks > 0 ? maxConcurrentTasks : ResourceConfig.workerParallelism();
         this.taskExecutor = newPool(poolSize, "dojao-worker-task-" + shortId);
-        this.leafExecutor = newPool(poolSize, "dojao-worker-leaf-" + shortId);
+        // 叶子池必须弹性（见字段说明）：固定尺寸 + FIFO 会把「被等待的生产者片段」饿死在队列里。
+        // core=0 + SynchronousQueue = 每个任务立即扩容出一个线程；空闲 60s 自动回收。
+        this.leafExecutor = new ThreadPoolExecutor(
+                0, Integer.MAX_VALUE, 60L, TimeUnit.SECONDS,
+                new SynchronousQueue<>(),
+                new NamedThreadFactory("dojao-worker-leaf-" + shortId));
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "dojao-worker-heartbeat-" + shortId);
             t.setDaemon(true);
@@ -277,6 +296,26 @@ public final class WorkerManager {
     /** 叶子任务 + 判死回传钩子（独立 Scan 有结果汇，见 {@link #submitTask(WorkerTask, WorkerTaskExecution, Runnable)}）。 */
     public void submitLeafTask(WorkerTask task, WorkerTaskExecution execution, Consumer<String> aborter) {
         submit(task, execution, leafExecutor, "leaf", aborter);
+    }
+
+    /**
+     * 按片段的<b>依赖方向</b>选池执行：向下游写 shuffle 的（Producer / 中间层消费者）→ 弹性叶子池；
+     * 纯消费者（终端，不产生任何 shuffle 输出）→ 固定主池。
+     *
+     * <p>为什么中间层消费者也走叶子池：它既消费上游、又生产下游交换 —— 下游消费者可能先占满主池、
+     * 排着等它产数据，若它自己也在主池队列里就是线程等待环（2026-11-11 三表 join 死锁：
+     * 6 个 AggregateConsumer 占满主池，MiddleJoinConsumer 排第 7 位，JAGG 交换永远 0 页）。
+     * 主池只剩彼此不互相等待的终端消费者，叶子池弹性保证「打破环的片段」永远拿得到线程。</p>
+     *
+     * @see FragmentSpec#writesShuffle()
+     */
+    public void submitFragmentTask(FragmentSpec spec, WorkerTask task,
+                                   WorkerTaskExecution execution, Consumer<String> aborter) {
+        if (spec != null && spec.writesShuffle()) {
+            submitLeafTask(task, execution, aborter);
+        } else {
+            submitTask(task, execution, aborter);
+        }
     }
 
     private void submit(WorkerTask task, WorkerTaskExecution execution, ThreadPoolExecutor pool,
@@ -457,10 +496,10 @@ public final class WorkerManager {
             int waitMain = taskExecutor.getQueue().size();
             int activeLeaf = leafExecutor.getActiveCount();
             int waitLeaf = leafExecutor.getQueue().size();
-            // 两个池任一「占满 + 有排队」都算（主池被阻塞消费者占满 = 经典死锁；叶子池被阻塞生产者
-            // 占满 = 数据推不出去的对称形态）
-            boolean saturated = (activeMain >= poolSize && waitMain > 0)
-                    || (activeLeaf >= poolSize && waitLeaf > 0);
+            // 只按主池判定：叶子池是弹性的（SynchronousQueue、上限无界），任务永不排队，不存在
+            // 「占满 + 排队」。主池现在只承载纯消费者（没有 shuffle 输出、互不等待），一旦
+            // 「占满 + 有排队 + 零推进」仍是真死锁（例如上游 Worker 失联让所有消费者同时挂起）。
+            boolean saturated = activeMain >= poolSize && waitMain > 0;
             boolean moved = pages != lastPagesSeen || seq != lastSeqSeen;
             if (!saturated || queued.isEmpty() || moved) {
                 // 条件不成立 / 有推进：重置停滞窗口（含上次判死后的升级计时）
@@ -472,9 +511,9 @@ public final class WorkerManager {
             }
             if (stalledSinceNanos == 0L) {
                 stalledSinceNanos = now;
-                log.warn("Worker {} 池疑似死锁：主池 {}/{} 占满（排队 {}）、叶子池 {}/{} 占满（排队 {}）"
+                log.warn("Worker {} 池疑似死锁：主池 {}/{} 占满（排队 {}）、叶子池 {} 线程（弹性，无队列）"
                                 + "且停止推进（{} 个片段未启动）—— 开始计时（阈值 {}ms，可用 -DDojaoPoolDeadlockMs 调整）",
-                        info.workerId(), activeMain, poolSize, waitMain, activeLeaf, poolSize, waitLeaf,
+                        info.workerId(), activeMain, poolSize, waitMain, activeLeaf,
                         queued.size(), POOL_DEADLOCK_MS);
                 return;
             }
@@ -625,8 +664,11 @@ public final class WorkerManager {
     }
 
     /**
-     * 任务池工厂：<b>core == max</b> 固定尺寸 + 无界 FIFO 队列 —— 前 {@code size} 个任务各占一线程，
-     * 其余排队等空闲槽位（不拒绝、不超时）。两个池（消费者主池 / 叶子专线）尺寸与语义完全一致。
+     * 主任务池工厂：<b>core == max</b> 固定尺寸 + 无界 FIFO 队列 —— 前 {@code size} 个任务各占一线程，
+     * 其余排队等空闲槽位（不拒绝、不超时）。
+     *
+     * <p>叶子池<b>不</b>走这里：它必须按需扩容（固定尺寸会造成「被等待的生产者排在队列里」的
+     * 环形死锁，见 {@link #leafExecutor} 说明）。</p>
      */
     private static ThreadPoolExecutor newPool(int size, String threadNamePrefix) {
         return new ThreadPoolExecutor(

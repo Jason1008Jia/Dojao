@@ -38,9 +38,14 @@ public final class CatalogCreateSupport {
     /** {@code catalog.<类型>.} 前缀（Hive 系写的是家族的 {@code catalog.hive.}，与 type 无关）。 */
     private static final Pattern CATALOG_PREFIX = Pattern.compile("^catalog\\.[^.]+\\.", Pattern.CASE_INSENSITIVE);
 
-    /** 说明里的「默认 X」——只认 ASCII 字面量，避免把「默认取引擎默认批大小」当默认值。 */
-    private static final Pattern DEFAULT_LITERAL =
-            Pattern.compile("默认(?:值)?(?:为)?\\s*[：:]?\\s*([A-Za-z0-9._-]+)");
+    /**
+     * 说明里的「默认 X」——只认 ASCII 字面量，避免把「默认取引擎默认批大小」当默认值；
+     * 且「默认」必须位于小句开头（行首或标点 / 空白之后），否则
+     * 「（FE 端口默认 9030）」这类括号内的补充说明会被误判成字段默认值
+     * （曾把 Doris 的 JDBC 连接串渲染成端口号数字框）。
+     */
+    private static final Pattern DEFAULT_LITERAL = Pattern.compile(
+            "(?:^|[，,。；;：:、\\s])默认(?:值)?(?:为)?\\s*[：:]?\\s*([A-Za-z0-9._-]+)");
 
     /** 说明里的「如 xxx」示例。 */
     private static final Pattern EXAMPLE = Pattern.compile("如\\s*([^。；;，,（(]+)");
@@ -79,7 +84,14 @@ public final class CatalogCreateSupport {
             Map.entry("split.file.min.bytes", "文件内切分阈值"),
             Map.entry("metastore.kerberos.principal", "Kerberos 主体"),
             Map.entry("header", "首行为列名"),
-            Map.entry("samplerows", "类型推断采样行数"));
+            Map.entry("samplerows", "类型推断采样行数"),
+            Map.entry("distributed", "分布式建表"),
+            Map.entry("cluster", "集群名"),
+            Map.entry("engine", "表引擎"),
+            Map.entry("localschemasuffix", "本地库后缀"),
+            Map.entry("orderby", "排序键"),
+            Map.entry("partitionby", "分区键"),
+            Map.entry("shardingkey", "分片键"));
 
     /** 卡片副标题（连接器自带 displayName 之外的一句话说明）。 */
     private static final Map<String, String> DESCRIPTIONS = Map.of(
@@ -200,6 +212,11 @@ public final class CatalogCreateSupport {
     }
 
     private static boolean isNumeric(String lowerName, String defaultValue) {
+        // 连接串 / 地址 / 路径 / Kerberos 主体永远是文本：说明里出现的端口号只是示例
+        if (lowerName.contains("url") || lowerName.contains("uri")
+                || lowerName.contains("path") || lowerName.contains("principal")) {
+            return false;
+        }
         if (defaultValue != null && defaultValue.matches("\\d+")) return true;
         return lowerName.contains("rows") || lowerName.contains("size")
                 || lowerName.contains("limit") || lowerName.contains("bytes")

@@ -53,6 +53,16 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
     private static final long DEFAULT_TASK_TIMEOUT_MS = Integer.getInteger("DojaoTaskTimeoutMs", 30_000);
     /** 看门狗扫描周期（ms）。-DDojaoWatchdogPeriodMs 覆盖。 */
     private static final long WATCHDOG_PERIOD_MS = Integer.getInteger("DojaoWatchdogPeriodMs", 1_000);
+    /**
+     * 「Worker 已完工、终态事件尚未消费」的宽限期（ms）。-DDojaoScanDoneGraceMs 覆盖。
+     *
+     * <p>Worker 扫描线程跑完会注销存活采样器（不再有 liveness 心跳），而 {@code ScanFinished}
+     * 终态事件要挤进容量 64 的事件队列才被 Master 消费 —— Master 正在拉取别的子树时队列可能是满的，
+     * 这中间可以停留远超 30s。此时任务<b>已经完成</b>，继续按「无心跳」判 LOST 属于误杀
+     * （线上 2026-11-11：扫描 16:24:01 已「完成任务」，16:24:31 被看门狗判 LOST，整条查询 fail-fast，
+     * 重跑就不复现）。收到 Worker 的 done 帧后只按这个长窗口兜「终态事件永久丢失」这一真失联场景。</p>
+     */
+    private static final long WORKER_DONE_GRACE_MS = Long.getLong("DojaoScanDoneGraceMs", 600_000L);
 
     private final ReadRequest baseRequest;
     private final int parallelism;
@@ -259,6 +269,9 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
             ScanTask task = new ScanTask(taskId, w.info().workerId(), jobId);
             taskTracker.put(taskId, task);
             try {
+                // 归属登记（与 AbstractDistributedOperator#dispatch 同口径）：物化 CTE / 物化派生体
+                // 查询体内的分布式扫描也走这里，jobId 必须归属到当前查询，否则会被僵尸回收误杀。
+                com.dojao.core.runtime.master.DispatchScope.register(jobId);
                 gateway.dispatchScan(w.info().workerId(), jobId, taskId, catalog,
                         applyFetchLimit(partitions.get(i)), tail, eventQueue);
                 task.state = TaskState.RUNNING;
@@ -404,15 +417,24 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
         long now = System.nanoTime();
         for (ScanTask t : taskTracker.values()) {
             TaskState s = t.state;
-            if ((s == TaskState.SUBMITTED || s == TaskState.RUNNING)
-                    && now - t.lastProgressNanos > DEFAULT_TASK_TIMEOUT_MS * 1_000_000L) {
-                t.state = TaskState.LOST;
-                t.cause = "no page or liveness heartbeat for " + DEFAULT_TASK_TIMEOUT_MS + "ms (task timeout)";
-                t.finishNanos = now;
-                System.err.printf("[DistributedScan] task %s on worker %s judged LOST: %s%n",
-                        t.taskId, t.workerId, t.cause);
-                recordFailure(t.taskId, t.cause);
-            }
+            if (s != TaskState.SUBMITTED && s != TaskState.RUNNING) continue;
+            // Worker 已报完工（done 帧）但终态事件还没被 Master 消费：任务并没有死，只是事件堵在
+            // 满队列里。用长宽限期覆盖「终态事件永久丢失」这一真失联场景，绝不按 30s 数据面沉默误杀。
+            boolean workerDone = t.workerFinishedNanos != 0L;
+            long silentSince = workerDone
+                    ? Math.max(t.lastProgressNanos, t.workerFinishedNanos)
+                    : t.lastProgressNanos;
+            long windowMs = workerDone ? WORKER_DONE_GRACE_MS : DEFAULT_TASK_TIMEOUT_MS;
+            if (now - silentSince <= windowMs * 1_000_000L) continue;
+            t.state = TaskState.LOST;
+            t.cause = workerDone
+                    ? "worker reported done but terminal event not consumed for " + windowMs
+                            + "ms; scan result unavailable"
+                    : "no page or liveness heartbeat for " + windowMs + "ms (task timeout)";
+            t.finishNanos = now;
+            System.err.printf("[DistributedScan] task %s on worker %s judged LOST: %s%n",
+                    t.taskId, t.workerId, t.cause);
+            recordFailure(t.taskId, t.cause);
         }
     }
 
@@ -454,6 +476,27 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
         return true;
     }
 
+    /**
+     * Worker 收尾帧（{@code done=true}）：Worker 侧扫描线程已经结束，之后<b>不会</b>再有存活心跳。
+     *
+     * <p>但 {@code ScanFinished} 终态事件可能还堵在满事件队列里 —— 此时任务并没有失联，看门狗必须
+     * 改用 {@link #WORKER_DONE_GRACE_MS} 长宽限期，否则已完成的扫描会被按 30s 数据面沉默误判 LOST
+     * 并 fail-fast（见该常量注释）。命中已知 taskId 返回 true。</p>
+     */
+    public boolean markWorkerFinished(String taskId) {
+        if (taskId == null) {
+            return false;
+        }
+        ScanTask t = taskTracker.get(taskId);
+        if (t == null) {
+            return false;
+        }
+        if (t.state == TaskState.SUBMITTED || t.state == TaskState.RUNNING) {
+            t.workerFinishedNanos = System.nanoTime();
+        }
+        return true;
+    }
+
     // ==================== 控制面：任务记录 ====================
 
     /** 分区任务状态机。 */
@@ -470,6 +513,11 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
         volatile TaskState state = TaskState.SUBMITTED;
         /** 最后一次「接触」时刻：由 {@link #acceptPage}（数据页到达）与 {@link #markAlive}（存活心跳）共同刷新。 */
         volatile long lastProgressNanos;
+        /**
+         * Worker 收尾帧（done=true）到达时刻，0 = 未收到。非 0 时看门狗改按
+         * {@link #WORKER_DONE_GRACE_MS} 判失联 —— Worker 已完工，终态事件可能还堵在事件队列里。
+         */
+        volatile long workerFinishedNanos;
         volatile long finishNanos;
         volatile String cause;
 

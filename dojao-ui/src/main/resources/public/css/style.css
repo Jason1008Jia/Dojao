@@ -1310,6 +1310,18 @@ textarea.sql-editor::-moz-selection { background: rgba(37, 99, 235, 0.26); color
 .sql-tok-string { color: var(--text-dim); }
 .sql-tok-keyword { color: var(--accent-text); }
 
+/* 括号配对高亮：光标停在某个括号旁时，与它配对的那个括号一起加深。
+   ★只用背景/阴影，不加粗、不加字间距 —— 垫层与 textarea 的排版必须完全一致，否则点击落点会错位。 */
+.sql-bracket-match {
+  background: rgba(37, 99, 235, 0.22);
+  box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.55), 0 0 6px rgba(37, 99, 235, 0.45);
+  border-radius: 2px;
+}
+:root[data-theme="dark"] .sql-bracket-match {
+  background: rgba(96, 165, 250, 0.26);
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.70), 0 0 6px rgba(96, 165, 250, 0.50);
+}
+
 /* ========== 监控 / AI：展示型页面 ==========
    监控页走「扁平仪表盘」路线（浅灰底 + 白卡 + 无阴影，见下方监控页样式块），
    AI 页保留原来的彩色底片 + 毛玻璃。两者只共用「撑满 + 不滚动」的容器骨架。 */

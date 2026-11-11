@@ -93,6 +93,22 @@ public final class CatalogCreateSupportProbeTest {
                 "catalog.excel.header", "可选，默认 true");
         check("header 布尔", "boolean".equals(header.kind()));
         check("header 标签", "首行为列名".equals(header.label()));
+
+        // 回归：括号里的「端口默认 9030」是补充说明，不是 jdbcUrl 的默认值
+        CatalogCreateSupport.CatalogField dorisJdbc = CatalogCreateSupport.parseField(
+                "catalog.doris.jdbcUrl",
+                "必填。MySQL 协议连接串（FE 端口默认 9030），如 jdbc:mysql://host:9030/db");
+        check("doris jdbcUrl 文本", "text".equals(dorisJdbc.kind()));
+        check("doris jdbcUrl 无伪默认值", "".equals(dorisJdbc.defaultValue()));
+        check("doris jdbcUrl 占位符", "jdbc:mysql://host:9030/db".equals(dorisJdbc.placeholder()));
+
+        // 回归：「HDFS 默认文件系统」里的「默认」也不是默认值
+        CatalogCreateSupport.CatalogField fs = CatalogCreateSupport.parseField(
+                "catalog.hive.fs.defaultFS",
+                "HDFS 默认文件系统，如 hdfs://host:9000（Hive 表 location 若是完整 URI，本项可省）");
+        check("fs.defaultFS 文本", "text".equals(fs.kind()));
+        check("fs.defaultFS 无伪默认值", "".equals(fs.defaultValue()));
+        check("fs.defaultFS 占位符", "hdfs://host:9000".equals(fs.placeholder()));
     }
 
     // ---------------------------------------------------------------- S2 连接器描述

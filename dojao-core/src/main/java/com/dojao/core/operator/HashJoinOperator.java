@@ -602,7 +602,8 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
                         : (crossJoin ? 0 : j.table.probe(page, j.probeKeyIndices, r));
                 int matchedPairs = 0;
                 if (groupIdx >= 0) {
-                    for (int rr : j.table.getMatchingRows(groupIdx)) {
+                    for (int rr = j.table.firstMatchingRow(groupIdx); rr >= 0;
+                         rr = j.table.nextMatchingRow(rr)) {
                         if (j.rightRowOk != null && !j.rightRowOk[rr]) continue;   // 右残差为假 ⇒ 该 build 行不匹配
                         addPair(j, pageIdx, r, rr);
                         j.matches++;

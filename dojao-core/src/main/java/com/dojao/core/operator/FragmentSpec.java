@@ -59,6 +59,28 @@ public sealed interface FragmentSpec
     /** true → Producer（扫切片 → 推送）；false → Consumer（接桶 → 本地算子 → 回传）。 */
     boolean isProducer();
 
+    /**
+     * 本片段是否<b>向下游 shuffle 写页</b>（别人要等它推进）—— 决定 Worker 侧跑在哪个线程池。
+     *
+     * <p>与 {@link #isProducer()} 不同：中间层消费者（MiddleJoin / MiddleAggregate /
+     * MiddleWindow，以及带下一分区的 ChainedJoinConsumer）虽然「消费上游」，但也<b>生产下游交换</b>。
+     * 它们必须和 Producer 一样跑在弹性叶子池：若放进固定尺寸的主池队列，可能排在「等自己产数据」
+     * 的终端消费者后面 —— 2026-11-11 线上 3 表 join 死锁正是 6 个 AggregateConsumer 先占满主池、
+     * MiddleJoinConsumer（JAGG 的唯一生产者）排在第 7 位，形成线程等待环。</p>
+     *
+     * <p><b>不变量</b>：主池只放「纯消费者」（没有任何 shuffle 输出），它们之间不存在互相等待；
+     * 任何写 shuffle 的片段都走弹性叶子池，保证「打破环的那个片段」永远能拿到线程。</p>
+     */
+    default boolean writesShuffle() {
+        if (isProducer()) {
+            return true;
+        }
+        return this instanceof MiddleJoinConsumer
+                || this instanceof MiddleAggregateConsumer
+                || this instanceof MiddleWindowConsumer
+                || (this instanceof ChainedJoinConsumer c && c.nextPartition() != null);
+    }
+
     /** 人类可读摘要（派发日志用）。 */
     String describe();
 
