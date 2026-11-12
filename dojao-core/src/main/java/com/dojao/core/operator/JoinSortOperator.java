@@ -860,6 +860,11 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
             } else if (va instanceof List<?> la && vb instanceof List<?> lb) {
                 int cmp = ArrowComparators.compareLists(la, lb);
                 if (cmp != 0) return cmp;
+            } else {
+                // ★ 绝不能「跳过该列」：非 Comparable 的值若被忽略，复合键在前导列相等时会被判为
+                //   完全相等 ⇒ 排序分组错乱 / 假匹配。见 RowAccumulator.normalizeKeyValue。
+                int cmp = String.valueOf(va).compareTo(String.valueOf(vb));
+                if (cmp != 0) return cmp;
             }
         }
         return a.values().length - b.values().length;

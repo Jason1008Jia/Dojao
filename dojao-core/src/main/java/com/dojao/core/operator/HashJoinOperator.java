@@ -119,7 +119,7 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
      * <p>计划期已知两侧输入列 ⇒ 由 Master 随 {@code JoinStep} 下发，<b>所有分区输出 schema 恒一致</b>，
      * 与 build 侧是否有数据无关。右表整表为空（probe 侧谓词过滤光）时也能正确产出 NULL 右列。
      */
-    private final List<Field> declaredRightFields;
+    private List<Field> declaredRightFields;
 
     /**
      * 左表（probe 侧）<b>声明列</b>，来自计划期（{@code JoinStep.declaredLeftFields}）；null/空 = 未声明。
@@ -128,7 +128,7 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
      * 而左表某分区可能<b>一页都收不到</b> —— 没有左列类型就造不出输出 schema。旧行为在这些分区
      * 静默跳过孤儿行（结果少数据）。有声明列后所有分区输出 schema 恒一致。</p>
      */
-    private final List<Field> declaredLeftFields;
+    private List<Field> declaredLeftFields;
 
     /**
      * ON 子句中的<b>单侧残差谓词</b>（只引用一侧的列），null = 无。
@@ -308,6 +308,23 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
             partitionBytesIn[i] = new AtomicLong();
             partitionBytesOut[i] = new AtomicLong();
         }
+    }
+
+    /** 计划期声明的左/右全列（列裁剪后由 Planner 收窄，见 {@link #narrowDeclaredFields}）。 */
+    public List<Field> getDeclaredLeftFields() { return declaredLeftFields; }
+    public List<Field> getDeclaredRightFields() { return declaredRightFields; }
+
+    /**
+     * 列裁剪后把声明列收窄到<b>实际输入页</b>的列集（顺序一致）。
+     *
+     * <p>计划期按关系的全列生成声明列，但 {@code Planner.optimizeColumns} 会在算子之间插入
+     * Project 裁掉无用列 —— 若声明列仍按全列宽，某分区用声明列兜底建出的输出 schema 会比其他
+     * 分区（用实收页 schema）多列，下游按列下标取向量即越界。这里在剪枝完成后按上游节点
+     * 最终输出列收窄，保证声明 schema 与实收页 schema 一致。</p>
+     */
+    public void narrowDeclaredFields(List<Field> left, List<Field> right) {
+        if (left != null) this.declaredLeftFields = left.isEmpty() ? null : List.copyOf(left);
+        if (right != null) this.declaredRightFields = right.isEmpty() ? null : List.copyOf(right);
     }
 
     public List<String> getLeftKeyColumns() { return leftKeyColumns; }
@@ -932,13 +949,17 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
         ArrowBuf dstData = dst.getDataBuffer();
         if (dstData.capacity() < (long) outRows * tw) { dst.reAlloc(); dstData = dst.getDataBuffer(); }
         ArrowBuf dstVal = dst.getValidityBuffer();
-        boolean hasNulls = src.getNullCount() > 0;
+        // ★ 不能按 src.getNullCount() 走「全 valid」快路径：右表源恒为 JoinHashTable.buildVectors，
+        //   其数据由 copyValueSafe 直写缓冲、从不 setValueCount ⇒ Arrow 的 nullCount（按 valueCount
+        //   统计 validity 位）恒为 0，而 validity 位里确实可能有 NULL。只看 nullCount 会把 NULL 行
+        //   原样拷数据 + 置 valid ⇒ NULL 静默变 0 / 0.00 / 1970-01-01（与 WindowSortOperator 同源缺陷）。
+        //   逐行读 validity 位，代价每行一次位测试，可忽略。
         ArrowBuf srcData = src.getDataBuffer();
         for (int k = 0; k < outRows; k++) {
             int rr = rRowArr[k];
             if (rr < 0) continue;   // 补 NULL 阶段处理
             dstData.setBytes((long) k * tw, srcData, (long) rr * tw, tw);
-            if (dstVal != null && hasNulls && src.isNull(rr)) BitVectorHelper.unsetBit(dstVal, k);
+            if (dstVal != null && src.isNull(rr)) BitVectorHelper.unsetBit(dstVal, k);
         }
     }
 
@@ -1039,14 +1060,14 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
             int cValBytes = (int) (((long) outRows * listSize + 7) / 8);
             for (int b = 0; b < cValBytes; b++) dstCVal.setByte(b, (byte) 0xFF);
         }
-        boolean hasNulls = src.getNullCount() > 0;
+        // ★ 逐行读 validity（理由同 copyRightFixed：buildVectors 的 nullCount 恒为 0）
         FieldVector srcC = ((FixedSizeListVector) src).getDataVector();
         ArrowBuf srcData = srcC.getDataBuffer();
         for (int k = 0; k < outRows; k++) {
             int rr = rRowArr[k];
             if (rr < 0) continue;   // 补 NULL 阶段处理
             dstData.setBytes((long) k * childBytes, srcData, (long) rr * childBytes, childBytes);
-            if (hasNulls && src.isNull(rr)) dst.setNull(k);
+            if (src.isNull(rr)) dst.setNull(k);
         }
     }
 

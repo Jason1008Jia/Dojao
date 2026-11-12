@@ -95,14 +95,31 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
      * 见 {@code ArrowSchemaIpc}。（修复前：这类分区落到 index 分支、静默吐 0 行 —— 实测
      * {@code a LEFT JOIN b}、b 侧 0 页 ⇒ 结果集整个是空的。）</p>
      */
-    private final List<Field> declaredRightFields;
+    private List<Field> declaredRightFields;
 
     /**
      * 左（probe）侧<b>声明列</b>（{@code JoinStep.declaredLeftFields}），与右表声明列对称：
      * RIGHT / FULL join 的左表某分区一页未收时，「右行 + 左列全 NULL」的孤儿行需要左列类型。
      * 缺失时旧行为是<b>响亮报错</b>（{@link #requireSchema}），绝不静默少行。
      */
-    private final List<Field> declaredLeftFields;
+    private List<Field> declaredLeftFields;
+
+    /** 声明列（列裁剪后由 Planner 收窄，见 {@link #narrowDeclaredFields}）。 */
+    public List<Field> getDeclaredLeftFields() { return declaredLeftFields; }
+    public List<Field> getDeclaredRightFields() { return declaredRightFields; }
+
+    /** 左/右 join 键列（列裁剪必须保留；缺列会让 {@link #findFieldIndex} 落空 → 静默按第 0 列 join）。 */
+    public List<String> getLeftKeyColumns() { return leftKeyColumns; }
+    public List<String> getRightKeyColumns() { return rightKeyColumns; }
+
+    /**
+     * 列裁剪后把声明列收窄到实际输入页的列集 —— 见
+     * {@link HashJoinOperator#narrowDeclaredFields(List, List)} 的同一约束。
+     */
+    public void narrowDeclaredFields(List<Field> left, List<Field> right) {
+        if (left != null) this.declaredLeftFields = left.isEmpty() ? null : List.copyOf(left);
+        if (right != null) this.declaredRightFields = right.isEmpty() ? null : List.copyOf(right);
+    }
 
     private Schema leftSchema;
     private Schema rightSchema;
@@ -527,21 +544,25 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
             // （判定在 mergeJoinPartition：LEFT/FULL 缺右、RIGHT/FULL 缺左）——此处不再重复判断。
             if (leftPa == null) {
                 requireSchema(leftSchema, "左（probe）", pid);
-                dumpAllAsOrphan(rightPa, findFieldIndex(rightSchema, rightKeyColumns.getFirst()),
+                dumpAllAsOrphan(rightPa, resolveKeyIndices(rightSchema, rightKeyColumns),
                         false, pid, buf);
                 ok = true;
                 return;
             }
             if (rightPa == null) {
                 requireSchema(rightSchema, "右（build）", pid);
-                dumpAllAsOrphan(leftPa, findFieldIndex(leftSchema, leftKeyColumns.getFirst()),
+                dumpAllAsOrphan(leftPa, resolveKeyIndices(leftSchema, leftKeyColumns),
                         true, pid, buf);
                 ok = true;
                 return;
             }
 
-            int leftKeyIdx = findFieldIndex(leftSchema, leftKeyColumns.getFirst());
-            int rightKeyIdx = findFieldIndex(rightSchema, rightKeyColumns.getFirst());
+            // ★必须按<b>全部</b>键列比较：多列键（如 [business_month, customer_id]）只取 getFirst()
+            //   会退化成「按第一个键列 join」⇒ 同月任意两行都当匹配，输出 = 同月行的笛卡尔积。
+            //   线上事故：578146 行 × 14513 行按 business_month 交叉，产出十几分钟仍在流的巨量结果，
+            //   计划停在 DistributedJoin 不出结果。
+            int[] leftKeyIdx = resolveKeyIndices(leftSchema, leftKeyColumns);
+            int[] rightKeyIdx = resolveKeyIndices(rightSchema, rightKeyColumns);
             left = createIterator(leftPa, leftKeyIdx);
             right = createIterator(rightPa, rightKeyIdx);
 
@@ -565,6 +586,16 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
                         rightHasMore = consumeKeyGroup(right, (it, chunk) -> outputOrphanRight(it, chunk, buf));
                     } else {
                         rightHasMore = discardKeyGroup(right); // 丢弃（INNER/LEFT 不需要输出）
+                    }
+                } else if (hasNullKey(lk)) {
+                    // ★SQL join 语义：NULL 键与任何值（包括 NULL）都不相等，绝不能当匹配键
+                    //   cross join。两侧 NULL 组在本轮先各自按孤儿处理：这里消费左 NULL 组，
+                    //   右 NULL 组留给下一轮（左已推进到更大的键 ⇒ cmp &gt; 0）。
+                    //   旧实现把 NULL_KEY == NULL_KEY 视作匹配，产生「两个 NULL 键拼一起」的幻影行。
+                    if (joinType == JoinType.LEFT || joinType == JoinType.FULL) {
+                        leftHasMore = consumeKeyGroup(left, (it, chunk) -> outputOrphanRows(it, chunk, buf));
+                    } else {
+                        leftHasMore = discardKeyGroup(left);
                     }
                 } else {
                     // key 匹配 → 逐块 cross join（组可能跨多个 record batch）
@@ -659,7 +690,8 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
     private static class FileIterator {
         private final PartitionState<RowAccumulator> pa;  // null = 内存/索引模式
         private final BufferAllocator allocator;
-        private final int keyColIdx;
+        /** join 键列下标；长度 &gt; 1 = 复合键（必须全部比较，见 {@link #currentKey()}）。 */
+        private final int[] keyCols;
         private final boolean inMemory;
         private final int[] sortedIndices;      // null = 文件/内存模式，非 null = 索引模式
         private final List<FieldVector> sourceVectors; // 零拷贝索引模式：直接引用 accumulator 向量
@@ -675,10 +707,10 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
         record Mark(int fileIdx, int sliceFirstBlock, int row) { }
 
         /** 文件模式：逐批加载 Arrow 文件 */
-        FileIterator(PartitionState<RowAccumulator> pa, BufferAllocator allocator, int keyColIdx) {
+        FileIterator(PartitionState<RowAccumulator> pa, BufferAllocator allocator, int[] keyCols) {
             this.pa = pa;
             this.allocator = allocator;
-            this.keyColIdx = keyColIdx;
+            this.keyCols = keyCols;
             this.fileIdx = -1;
             this.nextBlock = 0;
             this.fileDone = false;
@@ -688,10 +720,10 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
         }
 
         /** 内存模式：直接用已排序的 VectorSchemaRoot，不加载文件 */
-        FileIterator(VectorSchemaRoot root, int keyColIdx) {
+        FileIterator(VectorSchemaRoot root, int[] keyCols) {
             this.pa = null;
             this.allocator = null;
-            this.keyColIdx = keyColIdx;
+            this.keyCols = keyCols;
             this.fileIdx = 0;
             this.currentRoot = root;
             this.row = 0;
@@ -702,10 +734,10 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
         }
 
         /** 索引模式：零拷贝，直接持有 accumulator 向量引用 + 排序索引，不包装 VectorSchemaRoot */
-        FileIterator(int[] sortedIndices, List<FieldVector> vectors, int keyColIdx) {
+        FileIterator(int[] sortedIndices, List<FieldVector> vectors, int[] keyCols) {
             this.pa = null;
             this.allocator = null;
-            this.keyColIdx = keyColIdx;
+            this.keyCols = keyCols;
             this.sortedIndices = sortedIndices;
             this.sourceVectors = vectors;
             this.fileIdx = 0;
@@ -760,9 +792,24 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
             }
         }
 
+        /**
+         * 当前行的 join 键。多列键构造 {@link WindowSortOperator.CompositeKey}（与排序端
+         * {@link JoinSortOperator#buildKeyFromSpill} 同口径），<b>绝不能只取第一列</b>。
+         */
         Object currentKey() {
-            int phys = (sortedIndices != null) ? sortedIndices[row] : row;
-            return RowAccumulator.readKeyValue(getVector(keyColIdx), phys);
+            return keyAtPhysical((sortedIndices != null) ? sortedIndices[row] : row);
+        }
+
+        /** 物理行 → join 键值（单列返回标量，多列返回 CompositeKey）。 */
+        private Object keyAtPhysical(int phys) {
+            if (keyCols.length == 1) {
+                return RowAccumulator.readKeyValue(getVector(keyCols[0]), phys);
+            }
+            Object[] vals = new Object[keyCols.length];
+            for (int i = 0; i < keyCols.length; i++) {
+                vals[i] = RowAccumulator.readKeyValue(getVector(keyCols[i]), phys);
+            }
+            return new WindowSortOperator.CompositeKey(vals);
         }
 
         /**
@@ -831,8 +878,7 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
         }
 
         private boolean readAndEqual(Object k) {
-            int phys = (sortedIndices != null) ? sortedIndices[row] : row;
-            return keysEqual(k, RowAccumulator.readKeyValue(getVector(keyColIdx), phys));
+            return keysEqual(k, keyAtPhysical((sortedIndices != null) ? sortedIndices[row] : row));
         }
 
         /** 获取第 col 列向量（索引模式直接返回 accumulator 向量，文件/内存模式返回 root 中的向量） */
@@ -882,7 +928,7 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
     }
 
     /** 单侧无数据时, dump 有数据侧的所有行为孤儿 (LEFT/FULL 时右为空, RIGHT/FULL 时左为空) */
-    private void dumpAllAsOrphan(PartitionState<RowAccumulator> pa, int keyIdx,
+    private void dumpAllAsOrphan(PartitionState<RowAccumulator> pa, int[] keyIdx,
                                   boolean isLeft, int pid, JoinOutputBuffer buf) {
         FileIterator fi = createIterator(pa, keyIdx);
         while (fi.nextBatch()) {
@@ -900,7 +946,7 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
     }
 
     /** 三路分发：索引模式 > 内存模式 > 文件模式 */
-    private FileIterator createIterator(PartitionState<RowAccumulator> pa, int keyIdx) {
+    private FileIterator createIterator(PartitionState<RowAccumulator> pa, int[] keyIdx) {
         if (pa.sortedIndices != null && pa.indexSource != null) {
             return new FileIterator(pa.sortedIndices, pa.indexSource.vectors, keyIdx);
         }
@@ -908,6 +954,20 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
             return new FileIterator(pa.inMemoryRoot, keyIdx);
         }
         return new FileIterator(pa, allocator, keyIdx);
+    }
+
+    /**
+     * 解析 join 键列下标（多列 = 复合键，顺序与 {@code leftKeyColumns/rightKeyColumns} 一致）。
+     *
+     * <p>排序端 {@link JoinSortOperator#buildKeyFromSpill} 按同一顺序把各键列读成
+     * {@link WindowSortOperator.CompositeKey#values()}；归并端必须同口径，否则多列键退化成单列键。</p>
+     */
+    static int[] resolveKeyIndices(Schema schema, List<String> keyColumns) {
+        int[] idx = new int[keyColumns.size()];
+        for (int i = 0; i < keyColumns.size(); i++) {
+            idx[i] = findFieldIndex(schema, keyColumns.get(i));
+        }
+        return idx;
     }
 
     /** 输出右孤儿行（RIGHT/FULL join） */
@@ -940,6 +1000,7 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
         if (a == RowAccumulator.NULL_KEY && b == RowAccumulator.NULL_KEY) return 0;
         if (a == RowAccumulator.NULL_KEY) return -1;
         if (b == RowAccumulator.NULL_KEY) return 1;
+        if (a instanceof Number na && b instanceof Number nb) return compareNumbers(na, nb);
         if (a instanceof Comparable ca && b instanceof Comparable cb) return ca.compareTo(cb);
         if (a instanceof WindowSortOperator.CompositeKey cka
                 && b instanceof WindowSortOperator.CompositeKey ckb)
@@ -949,20 +1010,61 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
 
     // ---- 流式 join 的静态工具 ----
 
+    /**
+     * 键是否含 NULL：单列 {@link RowAccumulator#NULL_KEY}，或复合键（{@code CompositeKey}）的任一列为
+     * NULL_KEY。SQL 三值逻辑下含 NULL 的 join 键<b>不匹配任何行</b>（连另一个含 NULL 的键也不匹配）。
+     *
+     * <p>排序端为了分组会把 NULL 当同一组（{@code keysEqual} 对 NULL_KEY 返回 true，复合键按
+     * {@code Arrays.equals} 比），所以「是否匹配」必须在 join 交叉判定处单独挡掉。</p>
+     */
+    private static boolean hasNullKey(Object key) {
+        if (key == RowAccumulator.NULL_KEY) return true;
+        if (key instanceof WindowSortOperator.CompositeKey ck) {
+            for (Object v : ck.values()) {
+                if (v == RowAccumulator.NULL_KEY) return true;
+            }
+        }
+        return false;
+    }
+
     @SuppressWarnings({"rawtypes", "unchecked"})
     static boolean keysEqual(Object a, Object b) {
         if (a == RowAccumulator.NULL_KEY && b == RowAccumulator.NULL_KEY) return true;
         if (a == RowAccumulator.NULL_KEY || b == RowAccumulator.NULL_KEY) return false;
+        // ★数值跨类型（Integer/Long/Float/Double…）：按数值比较，不能交给 compareTo
+        //   （Integer.compareTo(Long) 直接 ClassCastException）。同型时等价于原 compareTo == 0。
+        if (a instanceof Number na && b instanceof Number nb) return compareNumbers(na, nb) == 0;
         if (a instanceof Comparable ca && b instanceof Comparable cb) return ca.compareTo(cb) == 0;
         return a.equals(b);
     }
 
+    /** 数值键跨类型比较：两侧都是整型按 long，其余按 double 值比较。 */
+    private static int compareNumbers(Number a, Number b) {
+        if (isIntegral(a) && isIntegral(b)) return Long.compare(a.longValue(), b.longValue());
+        return Double.compare(a.doubleValue(), b.doubleValue());
+    }
+
+    private static boolean isIntegral(Number n) {
+        return n instanceof Long || n instanceof Integer || n instanceof Short || n instanceof Byte;
+    }
+
+    /**
+     * 按名定位 join 键列下标。
+     *
+     * <p>★缺列时<b>必须响亮失败</b>：旧实现返回 0，一旦列裁剪把 join 键列裁掉（如
+     * {@code ON a.user_id = q1_val} 的 q1_val 不在上层需求里），join 会静默按第 0 列比较
+     * ⇒ 结果\"看似正常\"但整批错行（实测种子 20270597：LEFT JOIN 变成 user_id = q1_uid）。</p>
+     */
     static int findFieldIndex(Schema schema, String name) {
         List<Field> fields = schema.getFields();
         for (int i = 0; i < fields.size(); i++) {
             if (fields.get(i).getName().equals(name)) return i;
         }
-        return 0;
+        List<String> have = new ArrayList<>(fields.size());
+        for (Field f : fields) have.add(f.getName());
+        throw new IllegalStateException("SortMergeJoin 的 join 键列 \"" + name + "\" 不在输入页中"
+                + "（实到列：" + have + "）—— 缺列会让 join 静默按第 0 列比较、结果整批错行，"
+                + "请检查列裁剪是否漏保留 join 键列。");
     }
 
     /**
@@ -1142,8 +1244,14 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
                     boolean leftHas = ls != null && !ls.isEmpty();
                     boolean rightHas = rs != null && !rs.isEmpty();
 
-                    if (leftHas && rightHas) {
+                    if (leftHas && rightHas && !hasNullKey(key)) {
                         buf.appendCrossJoinSegments(leftCache, ls, rightCache, rs);
+                    } else if (leftHas && hasNullKey(key)) {
+                        // ★NULL 键不相交（SQL 语义）：两侧 NULL 组各自当孤儿，不交叉相乘。
+                        if (joinType == JoinType.LEFT || joinType == JoinType.FULL)
+                            outputIndexOrphan(leftCache, ls, buf, true);
+                        if (joinType == JoinType.RIGHT || joinType == JoinType.FULL)
+                            outputIndexOrphan(rightCache, rs, buf, false);
                     } else if (leftHas) {
                         // LEFT/FULL: 左有右无 → 左孤儿
                         if (joinType == JoinType.LEFT || joinType == JoinType.FULL)
@@ -1421,7 +1529,10 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
                 int cmp = ArrowComparators.compareLists(la, lb);
                 if (cmp != 0) return cmp;
             }
-            if (a instanceof Comparable<?> ca && b instanceof Comparable<?> cb) {
+            if (a instanceof Number na && b instanceof Number nb) {
+                int cmp = compareNumbers(na, nb);
+                if (cmp != 0) return cmp;
+            } else if (a instanceof Comparable<?> ca && b instanceof Comparable<?> cb) {
                 @SuppressWarnings({"rawtypes", "unchecked"})
                 int cmp = ((Comparable) ca).compareTo(cb);
                 if (cmp != 0) return cmp;
@@ -1443,12 +1554,20 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
             if (na && nb) continue;
             if (na) return -1;
             if (nb) return 1;
-            if (va instanceof Comparable<?> ca && vb instanceof Comparable<?> cb) {
+            if (va instanceof Number numA && vb instanceof Number numB) {
+                int cmp = compareNumbers(numA, numB);
+                if (cmp != 0) return cmp;
+            } else if (va instanceof Comparable<?> ca && vb instanceof Comparable<?> cb) {
                 @SuppressWarnings({"rawtypes", "unchecked"})
                 int cmp = ((Comparable) ca).compareTo(cb);
                 if (cmp != 0) return cmp;
             } else if (va instanceof List<?> la && vb instanceof List<?> lb) {
                 int cmp = ArrowComparators.compareLists(la, lb);
+                if (cmp != 0) return cmp;
+            } else {
+                // ★ 绝不能「跳过该列」：非 Comparable 的值（如未归一化的 Arrow Text）若被忽略，
+                //   复合键在前导列相等时会被判为完全相等 ⇒ 假匹配 / 笛卡尔积。
+                int cmp = String.valueOf(va).compareTo(String.valueOf(vb));
                 if (cmp != 0) return cmp;
             }
         }

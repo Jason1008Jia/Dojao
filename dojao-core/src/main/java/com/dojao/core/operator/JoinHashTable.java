@@ -160,6 +160,12 @@ public class JoinHashTable extends RowHashTable {
         if (groupCount == 0) return -1;
 
         VectorSchemaRoot root = input.getRoot();
+        // ★SQL 三值逻辑：NULL 键与任何值（包括 NULL）都不相等 ⇒ 探测行含 NULL 键时直接判不匹配。
+        //   基类 keysEqualAt 把 null==null 视作相等（GROUP BY 需要并入同一组），join 必须在此处挡掉，
+        //   否则「两个 NULL 键」会拼成一行幻影结果（LEFT/FULL 还会少掉一条应补 NULL 的孤儿行）。
+        for (int keyIdx : keyIndices) {
+            if (root.getVector(keyIdx).isNull(rowIndex)) return -1;
+        }
         int hash = hashRow(root, keyIndices, rowIndex);
         int bucket = bucketOf(hash, capacity);
 

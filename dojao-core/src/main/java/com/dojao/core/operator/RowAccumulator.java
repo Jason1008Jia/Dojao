@@ -175,8 +175,7 @@ public class RowAccumulator implements Slot {
                     if (keyVec.isNull(r)) {
                         key = NULL_KEY;
                     } else {
-                        Object val = keyVec.getObject(r);
-                        key = (val instanceof byte[] ba) ? new String(ba, StandardCharsets.UTF_8) : val;
+                        key = normalizeKeyValue(keyVec.getObject(r));
                     }
                     List<Integer> list = keyToRowIndices.get(key);
                     if (list == null) {
@@ -321,9 +320,7 @@ public class RowAccumulator implements Slot {
         if (gIdx < 0) return NULL_KEY;
         FieldVector vec = src.getVector(gIdx);
         if (vec.isNull(srcRow)) return NULL_KEY;
-        Object val = vec.getObject(srcRow);
-        if (val instanceof byte[] ba) return new String(ba, StandardCharsets.UTF_8);
-        return val;
+        return normalizeKeyValue(vec.getObject(srcRow));
     }
 
     private Object buildCompositeKey(VectorSchemaRoot src, int row) {
@@ -335,15 +332,60 @@ public class RowAccumulator implements Slot {
         return new WindowSortOperator.CompositeKey(vals);
     }
 
+    /**
+     * 读取一行某列的键值，<b>按数值归一化</b>（跨列类型可比较、可哈希同口径）。
+     *
+     * <p>整型（Int / Date / Time / Timestamp / Bool）无论宽度一律返回 {@link Long}（符号扩展），
+     * 浮点返回 {@link Double}（整值再归一成 {@link Long}）。这样 {@code BIGINT = INT} 这类
+     * 跨类型 join 两侧的键在 {@code equals}/{@code hashCode}/{@code compareTo} 上口径一致：
+     * 旧实现按各自宽度返回 {@code Integer}/{@code Long}，
+     * {@code Integer(5).equals(Long(5))} 恒 false ⇒ 跨类型 join 静默不匹配
+     * （排序归并下还会因 {@code Integer.compareTo(Long)} 抛 ClassCastException）。</p>
+     */
     static Object readKeyValue(FieldVector vec, int row) {
         if (vec.isNull(row)) return NULL_KEY;
-        int tw = typeWidthOf(vec.getField().getType());
-        if (tw == 8) return vec.getDataBuffer().getLong((long) row * 8);
-        if (tw == 4) return vec.getDataBuffer().getInt((long) row * 4);
-        if (tw == 2) return vec.getDataBuffer().getShort((long) row * 2);
-        if (tw == 1) return vec.getDataBuffer().getByte(row);
-        Object val = vec.getObject(row);
-        return (val instanceof byte[] ba) ? new String(ba, StandardCharsets.UTF_8) : val;
+        ArrowType type = vec.getField().getType();
+        int tw = typeWidthOf(type);
+        if (tw > 0 && tw <= 8) {
+            ArrowBuf buf = vec.getDataBuffer();
+            if (type instanceof ArrowType.FloatingPoint fp) {
+                return switch (fp.getPrecision()) {
+                    case SINGLE -> canonicalDouble(Float.intBitsToFloat(buf.getInt((long) row * 4)));
+                    case DOUBLE -> canonicalDouble(Double.longBitsToDouble(buf.getLong((long) row * 8)));
+                    // Arrow Java 无 HalfFloat 向量，HALF 交给 getObject 兜底
+                    default -> normalizeKeyValue(vec.getObject(row));
+                };
+            }
+            long v = switch (tw) {
+                case 8 -> buf.getLong((long) row * 8);
+                case 4 -> buf.getInt((long) row * 4);
+                case 2 -> buf.getShort((long) row * 2);
+                default -> buf.getByte(row);
+            };
+            return v;
+        }
+        return normalizeKeyValue(vec.getObject(row));
+    }
+
+    /** 整值浮点归一成 {@link Long}（与整型键同型），保证跨类型等值键的 equals/hash/compare 一致。 */
+    private static Object canonicalDouble(double d) {
+        if (d == Math.rint(d) && Math.abs(d) < 0x1p63) return (long) d;
+        return d;
+    }
+
+    /**
+     * 把键值归一化成可直接比较/哈希的 Java 值。
+     *
+     * <p>★ Arrow 15 的 {@code Utf8} 列 {@link FieldVector#getObject} 返回
+     * {@code org.apache.arrow.vector.util.Text}，它<b>没有实现 {@link Comparable}</b>。各比较器里
+     * 「{@code instanceof Comparable} 才比较」的写法会因此把该列<b>整列跳过</b> ⇒ 复合键只按前导
+     * 数值列判定相等 ⇒ 排序归并 join 输出「同 user_id 的笛卡尔积」（线上 4 表 join 卡死的根因）。
+     * 归一化成 {@link String} 后既可比较、哈希口径也与 byte[] 一致。</p>
+     */
+    static Object normalizeKeyValue(Object val) {
+        if (val instanceof byte[] ba) return new String(ba, StandardCharsets.UTF_8);
+        if (val instanceof org.apache.arrow.vector.util.Text t) return t.toString();
+        return val;
     }
 
     // ==================== 列批量拷贝 ====================

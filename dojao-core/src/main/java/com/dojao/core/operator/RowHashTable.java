@@ -1,9 +1,11 @@
 package com.dojao.core.operator;
 
 import com.dojao.common.data.Page;
+import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.util.TransferPair;
 
@@ -175,18 +177,31 @@ public abstract class RowHashTable implements AutoCloseable {
         for (int i = 0; i < keyIdx.length; i++) {
             FieldVector vec = root.getVector(keyIdx[i]);
             if (vec.isNull(rowIndex)) { hash = 31 * hash; continue; }
-            int tw = RowAccumulator.typeWidthOf(vec.getField().getType());
-            if (tw == 8) {
-                long v = vec.getDataBuffer().getLong((long) rowIndex * 8);
+            ArrowType type = vec.getField().getType();
+            int tw = RowAccumulator.typeWidthOf(type);
+            if (tw > 0 && tw <= 8 && !(type instanceof ArrowType.FloatingPoint)) {
+                // ★整型（含 Date/Time/Timestamp/Bool）无论宽度一律符号扩展到 long 再混洗：
+                //   BIGINT 与 INT 上的同一个数值得到同一个 hash ⇒ 跨类型 join 落同一桶。
+                //   旧实现 4 字节列直接取 raw int，负数与 8 字节列口径不一致。
+                ArrowBuf buf = vec.getDataBuffer();
+                long v = switch (tw) {
+                    case 8 -> buf.getLong((long) rowIndex * 8);
+                    case 4 -> buf.getInt((long) rowIndex * 4);
+                    case 2 -> buf.getShort((long) rowIndex * 2);
+                    default -> buf.getByte(rowIndex);
+                };
                 hash = 31 * hash + (int) (v ^ (v >>> 32));
-            } else if (tw == 4) {
-                hash = 31 * hash + vec.getDataBuffer().getInt((long) rowIndex * 4);
-            } else if (tw == 2) {
-                hash = 31 * hash + (int) vec.getDataBuffer().getShort((long) rowIndex * 2);
-            } else if (tw == 1) {
-                hash = 31 * hash + (int) vec.getDataBuffer().getByte(rowIndex);
             } else {
-                hash = 31 * hash + vec.getObject(rowIndex).hashCode();
+                // 浮点 / Decimal / 变长：与 RowAccumulator.readKeyValue 的规范口径一致
+                Object val = RowAccumulator.readKeyValue(vec, rowIndex);
+                if (val instanceof Long l) {
+                    long v = l;
+                    hash = 31 * hash + (int) (v ^ (v >>> 32));
+                } else if (val instanceof Double d) {
+                    hash = 31 * hash + Double.hashCode(d);
+                } else {
+                    hash = 31 * hash + val.hashCode();
+                }
             }
         }
         return hash;
@@ -211,25 +226,40 @@ public abstract class RowHashTable implements AutoCloseable {
             if (in && kn) continue;
             if (in != kn) return false;
 
-            // 定长列直接读 dataBuffer 原始字节比较，避免 Integer/Long/Short/Byte 装箱
-            int tw = RowAccumulator.typeWidthOf(iv.getField().getType());
-            if (tw == 8) {
-                if (iv.getDataBuffer().getLong((long) inputRow * 8)
-                        != kv.getDataBuffer().getLong((long) groupIdx * 8)) return false;
-            } else if (tw == 4) {
-                if (iv.getDataBuffer().getInt((long) inputRow * 4)
-                        != kv.getDataBuffer().getInt((long) groupIdx * 4)) return false;
-            } else if (tw == 2) {
-                if (iv.getDataBuffer().getShort((long) inputRow * 2)
-                        != kv.getDataBuffer().getShort((long) groupIdx * 2)) return false;
-            } else if (tw == 1) {
-                if (iv.getDataBuffer().getByte(inputRow)
-                        != kv.getDataBuffer().getByte(groupIdx)) return false;
-            } else if (!iv.getObject(inputRow).equals(kv.getObject(groupIdx))) {
-                return false;
+            ArrowType it = iv.getField().getType();
+            ArrowType kt = kv.getField().getType();
+            int itw = RowAccumulator.typeWidthOf(it);
+            int ktw = RowAccumulator.typeWidthOf(kt);
+            if (!(it instanceof ArrowType.FloatingPoint)
+                    && !(kt instanceof ArrowType.FloatingPoint)
+                    && itw > 0 && itw == ktw) {
+                // 同宽整型：直接读 dataBuffer 原始字节比较，避免 Integer/Long/Short/Byte 装箱
+                ArrowBuf ib = iv.getDataBuffer();
+                ArrowBuf kb = kv.getDataBuffer();
+                boolean eq = switch (itw) {
+                    case 8 -> ib.getLong((long) inputRow * 8) == kb.getLong((long) groupIdx * 8);
+                    case 4 -> ib.getInt((long) inputRow * 4) == kb.getInt((long) groupIdx * 4);
+                    case 2 -> ib.getShort((long) inputRow * 2) == kb.getShort((long) groupIdx * 2);
+                    default -> ib.getByte(inputRow) == kb.getByte(groupIdx);
+                };
+                if (!eq) return false;
+            } else {
+                // ★两侧宽度/类型可能不同（如 BIGINT = INT）：宽度必须<b>各取各的向量</b>。
+                //   旧实现用 probe 侧 iv 的宽度去读 build 侧 kv ⇒ 8 字节步长读 4 字节缓冲
+                //   （build 组数越过缓冲可容纳的值数即 IndexOutOfBoundsException，线上 25 万组实测）。
+                Object a = RowAccumulator.readKeyValue(iv, inputRow);
+                Object b = RowAccumulator.readKeyValue(kv, groupIdx);
+                if (!keyValuesEqual(a, b)) return false;
             }
         }
         return true;
+    }
+
+    /** 规范键值相等：整型（Long）按数值、浮点（Double）按数值，其余按 {@code equals}。 */
+    private static boolean keyValuesEqual(Object a, Object b) {
+        if (a instanceof Long la && b instanceof Long lb) return la.longValue() == lb.longValue();
+        if (a instanceof Double da && b instanceof Double db) return Double.compare(da, db) == 0;
+        return a.equals(b);
     }
 
     // ==================== 桶定位：斐波那契（乘法）散列 ====================
