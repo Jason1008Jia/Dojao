@@ -6,6 +6,7 @@ loadJobPerPagePref();  // 任务列表每页条数（localStorage 记忆，默�
 loadJobStateFilterPref();  // 任务列表状态筛选（localStorage 记忆，默认「全部」）
 switchTab('home');
 loadCatalogTree();
+bindSqlCatalogPicker();   // 标签栏右上角的 catalog 自绘下拉（原生 select 仅作数据源）
 initSqlConsoles();    // 多查询控制台：装载标签模型 + 回填编辑器（须在 bindSqlEditor 之前）
 bindSqlEditor();      // 草稿记忆（刷新不丢）+ Ctrl+Z / Ctrl+Shift+Z 撤销重做
 bindSqlHighlight();   // 高亮垫层（注释灰 / 关键字蓝），须排在 initSqlConsoles（回填正文）之后

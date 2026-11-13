@@ -43,8 +43,10 @@ public class ClickHouseConnectorFactory implements ConnectorFactory {
                 "可选。本地表 ORDER BY 表达式；默认取第一个非容器列（可空列包 assumeNotNull）");
         props.put("catalog.clickhouse.partitionBy",
                 "可选。本地表 PARTITION BY 表达式；默认存在 data_insert_time 列时用 toYYYYMMDD(data_insert_time)");
+        // 注意：说明里不要写「默认 <ASCII 表达式>」——UI 会把它当字段默认值预填
+        // （曾把 shardingKey 预填成 "xxHash32"，建 Distributed 表时报 Missing columns: 'xxHash32'）。
         props.put("catalog.clickhouse.shardingKey",
-                "可选。Distributed 分片表达式；默认 xxHash32(toString(第一个非容器列))");
+                "可选。Distributed 分片表达式；留空则按第一个非容器列自动生成 xxHash32(toString(col))");
         return props;
     }
 

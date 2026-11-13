@@ -196,6 +196,12 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
      * </ol>
      */
     public LogicalPlan analyze(String sql) {
+        // ★先剥掉 SQL 注释再词法分析：ANTLR 的注释走 HIDDEN 通道，但 ParserRuleContext.getText()
+        //   会把区间内<b>隐藏通道 token 一并拼进来</b>，于是 `data_state = '0' --正常数据` 这类
+        //   带注释的谓词原文会把「正常数据」当成标识符带进表达式文本 —— 派生表下推按列名解析
+        //   时就多出一个不存在的列（规划期拒掉下沉），谓词被拼进连接器 SQL 时 `--` 还会把
+        //   同一行后面的条件全部注释掉（静默少过滤）。字符串/引号内文本原样保留。
+        sql = stripSqlComments(sql);
         SyntaxErrorCollector syntaxCollector = new SyntaxErrorCollector();
         SqlBaseLexer lexer = new SqlBaseLexer(CharStreams.fromString(sql));
         lexer.removeErrorListeners();
@@ -228,6 +234,62 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
     }
 
     // ==================== Helper ====================
+
+    /**
+     * 剥掉 SQL 注释（{@code -- 行注释} 与 <code>/* 块注释 *&#47;</code>），替换为一个空格以保持
+     * token 分隔；<b>字符串字面量 / 引号标识符内的文本原样保留</b>（如 {@code 'a--b'} 不变）。
+     *
+     * <p>为什么必须在词法分析前做：ANTLR 把注释放在 HIDDEN 通道，但 {@code ctx.getText()} 会
+     * 连带隐藏 token 一起拼接 ⇒ 表达式原文里残留注释文本，进而被规划器当作标识符解析、
+     * 或被原样拼进下推给连接器的 WHERE（{@code --} 会注释掉同行后续条件，静默少过滤）。</p>
+     */
+    static String stripSqlComments(String sql) {
+        if (sql == null || sql.isEmpty()) return sql;
+        StringBuilder out = new StringBuilder(sql.length());
+        int n = sql.length();
+        int i = 0;
+        while (i < n) {
+            char c = sql.charAt(i);
+            // 引号区域（字符串 / 双引号 / 反引号标识符）：整段拷贝，'' 视为转义
+            if (c == '\'' || c == '"' || c == '`') {
+                char q = c;
+                out.append(c);
+                i++;
+                while (i < n) {
+                    char d = sql.charAt(i);
+                    out.append(d);
+                    i++;
+                    if (d == q) {
+                        if (i < n && sql.charAt(i) == q) {   // '' / "" 转义
+                            out.append(q);
+                            i++;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                continue;
+            }
+            // -- 行注释：吃到行尾（保留换行符本身）
+            if (c == '-' && i + 1 < n && sql.charAt(i + 1) == '-') {
+                i += 2;
+                while (i < n && sql.charAt(i) != '\n' && sql.charAt(i) != '\r') i++;
+                out.append(' ');
+                continue;
+            }
+            // /* 块注释 */
+            if (c == '/' && i + 1 < n && sql.charAt(i + 1) == '*') {
+                i += 2;
+                while (i + 1 < n && !(sql.charAt(i) == '*' && sql.charAt(i + 1) == '/')) i++;
+                i = Math.min(n, i + 2);
+                out.append(' ');
+                continue;
+            }
+            out.append(c);
+            i++;
+        }
+        return out.toString();
+    }
 
     private Scope scope() {
         return scopeStack.peek();

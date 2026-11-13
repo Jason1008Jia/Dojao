@@ -7,6 +7,7 @@ import com.dojao.core.runtime.worker.WorkerGateway;
 import com.dojao.spi.bean.ReadRequest;
 import com.dojao.spi.bean.ScanSlice;
 import com.dojao.spi.service.DojaoConnector;
+import org.apache.arrow.vector.types.pojo.Field;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -17,7 +18,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 分布式扫描算子 —— 把分区扫描任务派发给集群 Worker，各 Worker 拉自己分区数据回传 Master。
@@ -96,6 +99,24 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
     /** 谓词下推：要交给数据源执行的过滤条件。 */
     private final List<String> predicates = new ArrayList<>();
 
+    // ==================== 扫描分片就地写（scan-sink：CTAS / INSERT 的纯扫描+投影形态） ====================
+
+    /** 分片侧投影（可空）：Worker 扫描后先投影（纯列投影 / 标量表达式投影）。 */
+    private volatile FragmentSpec.ScanProjection projection;
+    /** 写目标（可空）：非空 → Worker 投影后就地写目标表、不回传数据页，只回传 FINISHED(rows)。 */
+    private volatile FragmentSpec.SinkStep sink;
+    /** 终端输出列（CTAS 建表用；仅 sink 形态由 Planner 设置）。 */
+    private volatile List<Field> outputFields = List.of();
+    /** 各分区写入行数之和（sink 形态回传；普通扫描恒 0）。 */
+    private final AtomicLong writtenRows = new AtomicLong();
+
+    // ---- 写生命周期（CTAS 建表 / 失败回滚）：数据源副作用只在执行期（doOpen / doClose）发生 ----
+    private Runnable prepare;
+    private volatile Runnable successFinalizer;
+    private volatile Runnable abortFinalizer;
+    private final AtomicBoolean finalized = new AtomicBoolean();
+    private volatile boolean skipDispatch;
+
     /**
      * Worker 回传事件队列（有界即背压，容量 {@value #EVENT_QUEUE_CAPACITY}）。
      *
@@ -148,6 +169,14 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
                 + " partitions=" + parallelism
                 + (selectedColumns.isEmpty() ? " columns=<all>" : " columns=" + selectedColumns)
                 + filter);
+        if (sink != null) {
+            out.add("scan-sink " + sink.catalog() + "." + sink.schema() + "." + sink.table()
+                    + " (分片就地写，不回传数据页)"
+                    + (projection == null || projection.isIdentity() ? ""
+                            : " projection=" + projection.outputColumns()));
+        } else if (projection != null && !projection.isIdentity()) {
+            out.add("scan-projection " + projection.outputColumns());
+        }
         return out;
     }
 
@@ -204,6 +233,62 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
         this.fetchLimit = Math.max(0, rows);
     }
 
+    // ==================== 扫描分片就地写（scan-sink） ====================
+
+    /** 设置分片侧投影（null = 不投影，扫描页原样处理）。 */
+    public void setProjection(FragmentSpec.ScanProjection p) {
+        this.projection = p;
+    }
+
+    /** 设置写目标（null = 数据页回传 Master；非空 = 分片就地写、只回传行数）。 */
+    public void setSink(FragmentSpec.SinkStep s) {
+        this.sink = s;
+    }
+
+    /** 是否处于分片就地写形态。 */
+    public boolean hasSink() {
+        return sink != null;
+    }
+
+    /**
+     * 是否带「片内截断」下推（top-N 尾 / 顶层 LIMIT 前缀）。截断下推会让各分区只产出候选集 —
+     * scan-sink（整表写入语义）遇到它必须回退 Master 写路径，否则写入行数被截断污染。
+     */
+    public boolean hasTruncation() {
+        return tail != null || fetchLimit > 0;
+    }
+
+    /** 终端输出列（CTAS 建表 / EXPLAIN 用；仅 sink 形态非空）。 */
+    public List<Field> outputFields() {
+        return outputFields;
+    }
+
+    public void setOutputFields(List<Field> fields) {
+        this.outputFields = fields == null ? List.of() : List.copyOf(fields);
+    }
+
+    /** 各分区写入行数之和（sink 形态；rows_inserted 数据源）。 */
+    public long writtenRows() {
+        return writtenRows.get();
+    }
+
+    /**
+     * 装配写生命周期三钩子（与 {@code AbstractDistributedOperator#setOverwriteLifecycle} 同构）：
+     * {@code prepare} 在 doOpen 派发前运行（CTAS 建表；可调 {@link #skipDispatch()}）；
+     * {@code success} 在全部分区完成、返回 EOF 前恰好一次；{@code abort} 在 doClose 时未 success
+     * 则运行（删掉本语句刚建的表，不留半成品）。三个均可 null。
+     */
+    public void setSinkLifecycle(Runnable prepare, Runnable success, Runnable abort) {
+        this.prepare = prepare;
+        this.successFinalizer = success;
+        this.abortFinalizer = abort;
+    }
+
+    /** 让 doOpen 跳过派发（prepare 里目标表已存在且 IF NOT EXISTS 时调用）→ doNext 立即 EOF。 */
+    public void skipDispatch() {
+        this.skipDispatch = true;
+    }
+
     // ==================== 只读访问（分布式算子的基表探测用） ====================
 
     /** 原始读请求（未列裁剪 / 未下推）。 */
@@ -230,6 +315,20 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
     protected void doOpen() throws Exception {
         String schema = baseRequest.schema();
         String table = baseRequest.table();
+
+        // ---- 0a. 写生命周期准备（CTAS 建表）：执行期单点，EXPLAIN 不触发任何副作用 ----
+        if (prepare != null) {
+            prepare.run();
+        }
+        if (skipDispatch) {
+            // 目标表已存在且 IF NOT EXISTS：本语句不读不写（rows_inserted = 0）
+            totalPartitions = 0;
+            finishedCount.set(0);
+            eofReturned = false;
+            System.err.println("[DistributedScan] skipDispatch（目标表已存在，IF NOT EXISTS 跳过）");
+            return;
+        }
+
         if (workers.isEmpty()) {
             throw new IllegalStateException("DistributedScan 无可派发的 Worker");
         }
@@ -273,7 +372,7 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
                 // 查询体内的分布式扫描也走这里，jobId 必须归属到当前查询，否则会被僵尸回收误杀。
                 com.dojao.core.runtime.master.DispatchScope.register(jobId);
                 gateway.dispatchScan(w.info().workerId(), jobId, taskId, catalog,
-                        applyFetchLimit(partitions.get(i)), tail, eventQueue);
+                        applyFetchLimit(partitions.get(i)), tail, projection, sink, eventQueue);
                 task.state = TaskState.RUNNING;
                 task.lastProgressNanos = System.nanoTime();
             } catch (Throwable ex) {
@@ -300,8 +399,7 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
             if (finishedCount.get() >= totalPartitions) {
                 ScanEvent ev = eventQueue.poll();
                 if (ev == null || ev instanceof ScanEvent.ScanFinished) {
-                    eofReturned = true;
-                    return Page.eof();
+                    return finishEof();
                 }
                 if (ev instanceof ScanEvent.ScanPage sp) {
                     return acceptPage(sp);
@@ -325,14 +423,14 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
                     t.state = TaskState.FINISHED;
                     t.finishNanos = System.nanoTime();
                 }
+                writtenRows.addAndGet(sf.rows());   // 分片就地写回传行数；普通扫描恒 0
                 if (finishedCount.incrementAndGet() >= totalPartitions) {
                     // 最后一个分区刚结束，检查队列是否有残余数据页
                     ScanEvent remaining = eventQueue.poll();
                     if (remaining instanceof ScanEvent.ScanPage sp) {
                         return acceptPage(sp);
                     }
-                    eofReturned = true;
-                    return Page.eof();
+                    return finishEof();
                 }
                 continue;
             }
@@ -348,6 +446,15 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
                 throw failure;   // fail-fast
             }
         }
+    }
+
+    /** 全部分区成功完成：恰好一次运行 success 收尾（sink 形态无收尾动作，保留钩子对称性），返回 EOF。 */
+    private Page finishEof() {
+        eofReturned = true;
+        if (finalized.compareAndSet(false, true) && successFinalizer != null) {
+            successFinalizer.run();
+        }
+        return Page.eof();
     }
 
     /** 收一页扫描数据：更新分区进度（喂看门狗）+ 累计该任务行数 + 记录输入，页所有权交 Master。 */
@@ -397,6 +504,14 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
             }
         }
         taskTracker.clear();
+        // 未成功收尾（失败 / 取消 / 中途关闭）→ 回滚本语句的建表副作用，不留半成品
+        if (finalized.compareAndSet(false, true) && abortFinalizer != null) {
+            try {
+                abortFinalizer.run();
+            } catch (Throwable t) {
+                System.err.println("[DistributedScan] scan-sink 回滚失败: " + t);
+            }
+        }
     }
 
     // ==================== 控制面：看门狗 & 失败传播 ====================

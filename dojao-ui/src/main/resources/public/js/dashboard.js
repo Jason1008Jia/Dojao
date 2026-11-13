@@ -414,7 +414,9 @@ function doSubmitQuery(raw) {
     var errEl = document.getElementById('query-error');
     lastSqlText = raw;   // 「复制」「用 AI 修复」用本次真正跑的那段，而不是整框内容
 
-    var sent = withAutoLimit(raw);
+    // 编辑器默认 catalog：两段式 schema.table 补全成 catalog.schema.table 后再交给引擎
+    // （右侧下拉框选择当前 catalog；已写全三段式的 SQL 原样通过）。
+    var sent = withAutoLimit(completeCatalogQualifiers(raw));
     sqlAutoLimited = sent.autoLimit;
     sqlBatchCount = sqlStatementCount(raw);   // >1 = 引擎侧按分号切分后串行执行
     var btn = document.getElementById('submit-btn');
@@ -2821,8 +2823,12 @@ function renderSqlTable(r) {
         var cells = ['<td class="row-num" title="\u884c\u53f7">' + (idx + 1) + '</td>'];
         for (var i = 0; i < view.width; i++) {
             var v = (row && row[i] !== undefined && row[i] !== null) ? row[i] : '';
-            // res-cell 标记「真数据格」：右键菜单据此区分数据区与「（结果集为空）」占位行
-            cells.push('<td class="res-cell" data-col="' + i + '" title="' + esc(v) + '">' + esc(v) + '</td>');
+            // res-cell 标记「真数据格」：右键菜单据此区分数据区与「（结果集为空）」占位行。
+            // 单元格内容包一层 .cell-clip：超长文本（如 JSON 字串）按固定宽度截断 + 省略号，
+            // 不再把整列撑到几千像素、把右侧字段挤到看不见；hover 时 title 仍显示完整内容。
+            // 注意：完整文本保持在 DOM 里（只是视觉截断），右键「复制当前数据」取 textContent 不受影响。
+            cells.push('<td class="res-cell" data-col="' + i + '" title="' + esc(v) + '">'
+                + '<span class="cell-clip">' + esc(v) + '</span></td>');
         }
         return '<tr>' + cells.join('') + '</tr>';
     }).join('');

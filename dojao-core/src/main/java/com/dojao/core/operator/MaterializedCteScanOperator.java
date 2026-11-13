@@ -16,6 +16,11 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
@@ -184,6 +189,8 @@ public final class MaterializedCteScanOperator extends AbstractMeasurableOperato
         private long wirePayloadBytes;
         /** EXPLAIN 里查询体明细只展开一次（其余引用点指回首个节点），避免「看起来又扫了 N 次」。 */
         private boolean bodyShown;
+        /** 同层派生体预取组（Planner 规划期设置；{@code null} = 无动作）。 */
+        private volatile PrefetchGroup prefetchGroup;
 
         public Store(String name, Supplier<PlannedBody> bodySupplier) {
             this.name = name;
@@ -205,6 +212,14 @@ public final class MaterializedCteScanOperator extends AbstractMeasurableOperato
 
         public List<String> columns() {
             return body().columns();
+        }
+
+        /**
+         * 只<b>规划</b>查询体（不执行、不产生 IO）—— 供同一层多个派生体并行物化前，把会写
+         * Planner 状态的规划工作先在调用线程上串行做完。幂等：已规划直接返回缓存。
+         */
+        public void prepare() {
+            body();
         }
 
         /** 物化输出真实 schema（int 位宽 / decimal 精度）；未物化或零行时为 {@code null}。 */
@@ -284,6 +299,34 @@ public final class MaterializedCteScanOperator extends AbstractMeasurableOperato
         }
 
         /**
+         * 登记「同一层的多个派生体」为同一预取组：组内任一成员首次取载荷时，把其余成员并行拉起，
+         * 自己照常走惰性路径 —— 一层 N 个派生体不再串行跑 N 个完整子查询。每组只拉起一次。
+         *
+         * <p><b>只在首用（open 期）执行</b>，不在规划期：{@code Planner.plan()} 返回前查询还没登记进
+         * {@code QueryManager}，此时派发的 Worker 片段会被僵尸片段回收判成「Master 不认」而取消。
+         * 查询体的规划必须由 Planner 在单线程里先做完（见 {@code Planner.prepareMaterializedBodies}）。</p>
+         */
+        public static void linkPrefetchGroup(List<Store> group) {
+            if (group == null || group.size() < 2) {
+                return;
+            }
+            PrefetchGroup pg = new PrefetchGroup(group);
+            for (Store store : group) {
+                store.prefetchGroup = pg;
+            }
+        }
+
+        /** 预取组状态：组内共享的「只拉起一次」开关 + 成员列表。 */
+        private static final class PrefetchGroup {
+            final List<Store> members;
+            final AtomicBoolean started = new AtomicBoolean();
+
+            PrefetchGroup(List<Store> members) {
+                this.members = List.copyOf(members);
+            }
+        }
+
+        /**
          * 全部物化文件的 wire 载荷（每个文件一份，首次调用编码并缓存）。
          *
          * <p>多个引用点共享同一份编码结果 —— 旧实现在每个引用点都重读并重编码全部文件，
@@ -291,10 +334,64 @@ public final class MaterializedCteScanOperator extends AbstractMeasurableOperato
          * 直接失败（不静默回退），避免一条查询吃穿 Master 堆。</p>
          */
         public List<byte[]> wirePayloads() throws Exception {
+            List<Future<?>> siblings = startSiblingPrefetch();
+            try {
+                return wirePayloadsLocked();
+            } finally {
+                joinPrefetch(siblings);
+            }
+        }
+
+        /**
+         * 把预取组里<b>除自己以外</b>的物化体并行拉起（各自独立 queryId / 片段池；不碰 Planner 状态）。
+         * 自己由调用线程随后物化 —— 与其余体并行。已在预取中的组员走各自的惰性路径。
+         */
+        private List<Future<?>> startSiblingPrefetch() {
+            PrefetchGroup group = prefetchGroup;
+            if (group == null || group.members.size() < 2 || !group.started.compareAndSet(false, true)) {
+                return List.of();
+            }
+            ExecutorService pool = Executors.newFixedThreadPool(Math.min(group.members.size(), 8), r -> {
+                Thread t = new Thread(r, "dojao-derive-materialize");
+                t.setDaemon(true);
+                return t;
+            });
+            List<Future<?>> tasks = new ArrayList<>(group.members.size());
+            for (Store sibling : group.members) {
+                if (sibling == this) {
+                    continue;
+                }
+                tasks.add(pool.submit(() -> {
+                    try {
+                        sibling.wirePayloads();
+                    } catch (Throwable ignored) {
+                        // 失败由各 Store 记录并缓存；首个用到它的 planSlices / 扫描会把完整错误抛出来。
+                    }
+                }));
+            }
+            return tasks;
+        }
+
+        /** 等预取组跑完再返回 —— 避免查询收尾回收目录时组员还在写盘。 */
+        private static void joinPrefetch(List<Future<?>> tasks) {
+            for (Future<?> task : tasks) {
+                try {
+                    task.get();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                } catch (ExecutionException ignored) {
+                    // 同上：预取失败不在这里上抛，保持惰性路径的错误可见性。
+                }
+            }
+        }
+
+        private List<byte[]> wirePayloadsLocked() throws Exception {
             synchronized (lock) {
                 if (wirePayloads != null) {
                     return wirePayloads;
                 }
+                long t0 = System.nanoTime();
                 List<Path> fs = materialize();
                 long max = ResourceConfig.cteWireMaxBytes();
                 long total = 0L;
@@ -315,6 +412,8 @@ public final class MaterializedCteScanOperator extends AbstractMeasurableOperato
                 wireEncodeCount++;
                 wirePayloadBytes = total;
                 wirePayloads = List.copyOf(out);
+                System.err.printf("[MaterializedCte] %s 载荷编码完成 payloads=%d bytes=%d 耗时=%dms%n",
+                        name, out.size(), total, (System.nanoTime() - t0) / 1_000_000L);
                 return wirePayloads;
             }
         }
@@ -327,6 +426,8 @@ public final class MaterializedCteScanOperator extends AbstractMeasurableOperato
                 }
                 if (files != null) return files;
 
+                long t0 = System.nanoTime();
+                long rows = 0L;
                 List<Path> written = new ArrayList<>();
                 Operator op = body().operator();
                 try {
@@ -343,6 +444,7 @@ public final class MaterializedCteScanOperator extends AbstractMeasurableOperato
                                 Path file = dir.resolve("cte_" + written.size() + ".arrow");
                                 AbstractSpillableOperator.writeArrowFile(file, p.getRoot());
                                 written.add(file);
+                                rows += p.getRowCount();
                                 if (fields == null) {
                                     fields = List.copyOf(p.getRoot().getSchema().getFields());
                                 }
@@ -364,6 +466,8 @@ public final class MaterializedCteScanOperator extends AbstractMeasurableOperato
                     try { op.close(); } catch (Exception ignored) { }
                 }
                 files = List.copyOf(written);
+                System.err.printf("[MaterializedCte] %s 物化完成 rows=%d files=%d 耗时=%dms%n",
+                        name, rows, written.size(), (System.nanoTime() - t0) / 1_000_000L);
                 return files;
             }
         }

@@ -90,10 +90,13 @@ public final class StageScheduler {
                            String rightCatalog, String rightSchema, String rightTable, DojaoConnector rightProbe,
                            String rightFilter, FragmentSpec.JoinAlgorithm algorithm,
                            List<String> rightColumns, List<String> leftPartitionKeys,
-                           String onLeftFilter, String onRightFilter) {
+                           String onLeftFilter, String onRightFilter,
+                           List<GroupKeyExpression> leftComputed, List<GroupKeyExpression> rightComputed) {
         public JoinLink {
             onLeftFilter = blankToNull(onLeftFilter);
             onRightFilter = blankToNull(onRightFilter);
+            leftComputed = leftComputed == null ? List.of() : List.copyOf(leftComputed);
+            rightComputed = rightComputed == null ? List.of() : List.copyOf(rightComputed);
             // ON 单侧残差谓词只在 HashJoinOperator 内实现（SortMergeJoin 无匹配残差语义）：
             // 选中 SORT_MERGE 时强制降级为 HASH，避免 Worker 侧执行时才发现不支持。
             if ((onLeftFilter != null || onRightFilter != null)
@@ -103,6 +106,17 @@ public final class StageScheduler {
         }
 
         private static String blankToNull(String s) { return s == null || s.isBlank() ? null : s; }
+
+        /** 无表达式键合成列（14 参；绝大多数 join）。 */
+        public JoinLink(List<String> leftKeys, List<String> rightKeys, JoinType joinType,
+                        String rightCatalog, String rightSchema, String rightTable, DojaoConnector rightProbe,
+                        String rightFilter, FragmentSpec.JoinAlgorithm algorithm,
+                        List<String> rightColumns, List<String> leftPartitionKeys,
+                        String onLeftFilter, String onRightFilter) {
+            this(leftKeys, rightKeys, joinType, rightCatalog, rightSchema, rightTable, rightProbe, rightFilter,
+                    algorithm, rightColumns, leftPartitionKeys, onLeftFilter, onRightFilter,
+                    List.of(), List.of());
+        }
 
         /** 未指定算法 → 哈希 join（既有行为）。 */
         public JoinLink(List<String> leftKeys, List<String> rightKeys, JoinType joinType,
@@ -148,7 +162,15 @@ public final class StageScheduler {
         /** ON 单侧残差谓词的副本（其余字段不变）。 */
         public JoinLink withOnFilters(String onLeft, String onRight) {
             return new JoinLink(leftKeys, rightKeys, joinType, rightCatalog, rightSchema, rightTable, rightProbe,
-                    rightFilter, algorithm, rightColumns, leftPartitionKeys, onLeft, onRight);
+                    rightFilter, algorithm, rightColumns, leftPartitionKeys, onLeft, onRight,
+                    leftComputed, rightComputed);
+        }
+
+        /** JOIN ON 表达式键合成列：左右两侧在本地 join 之前物化的派生列。 */
+        public JoinLink withKeyComputed(List<GroupKeyExpression> left, List<GroupKeyExpression> right) {
+            return new JoinLink(leftKeys, rightKeys, joinType, rightCatalog, rightSchema, rightTable, rightProbe,
+                    rightFilter, algorithm, rightColumns, leftPartitionKeys, onLeftFilter, onRightFilter,
+                    left, right);
         }
 
         /**
@@ -173,16 +195,28 @@ public final class StageScheduler {
      *
      * <p>为 {@code null} 的层（{@link #planJoinChain} 的 sources 列表元素）＝ 普通基表扫描。</p>
      */
+    /**
+     * @param havingFilter <b>聚合型</b>：聚合后的 HAVING / 派生关系谓词（{@code MiddleAggregateConsumer}）；
+     *                     <b>投影型</b>：投影后过滤（派生列物化之后、哈希分区之前，由 Producer 的
+     *                     {@code filterAfterProject} 承载）—— 同一字段承载两种派生体的「派生体算完再过滤」
+     */
     public record DerivedSource(DojaoConnector innerProbe, ReadRequest innerRequest,
                                 List<String> innerKeys, List<AggregationSpec> aggregations,
                                 List<CaseProjection> caseProjections, String havingFilter,
-                                List<DerivedProjection> projections, DerivedWindow window) {
+                                List<DerivedProjection> projections, DerivedWindow window,
+                                List<String> outputColumns) {
+
+        public DerivedSource {
+            outputColumns = outputColumns == null || outputColumns.isEmpty()
+                    ? null : List.copyOf(outputColumns);
+        }
 
         /** 聚合型派生源（无投影列）—— 既有调用点原样可用。 */
         public DerivedSource(DojaoConnector innerProbe, ReadRequest innerRequest,
                              List<String> innerKeys, List<AggregationSpec> aggregations,
                              List<CaseProjection> caseProjections, String havingFilter) {
-            this(innerProbe, innerRequest, innerKeys, aggregations, caseProjections, havingFilter, null, null);
+            this(innerProbe, innerRequest, innerKeys, aggregations, caseProjections, havingFilter,
+                    null, null, null);
         }
 
         /** 投影型派生源（无聚合，逐行表达式投影）。 */
@@ -190,7 +224,17 @@ public final class StageScheduler {
                              List<String> innerKeys, List<AggregationSpec> aggregations,
                              List<CaseProjection> caseProjections, String havingFilter,
                              List<DerivedProjection> projections) {
-            this(innerProbe, innerRequest, innerKeys, aggregations, caseProjections, havingFilter, projections, null);
+            this(innerProbe, innerRequest, innerKeys, aggregations, caseProjections, havingFilter,
+                    projections, null, null);
+        }
+
+        /** 窗口型派生源（无聚合、无投影列）。 */
+        public DerivedSource(DojaoConnector innerProbe, ReadRequest innerRequest,
+                             List<String> innerKeys, List<AggregationSpec> aggregations,
+                             List<CaseProjection> caseProjections, String havingFilter,
+                             List<DerivedProjection> projections, DerivedWindow window) {
+            this(innerProbe, innerRequest, innerKeys, aggregations, caseProjections, havingFilter,
+                    projections, window, null);
         }
 
         /** true = 投影型派生源（无聚合，逐行表达式投影）。 */
@@ -258,10 +302,14 @@ public final class StageScheduler {
         }
     }
 
-    /** {@link JoinLink} 右表声明列的便捷取法（列集取该层的 {@code rightColumns}）。 */
+    /**
+     * {@link JoinLink} 右表声明列的便捷取法（列集取该层的 {@code rightColumns}），并在末尾追加
+     * 本层 ON 表达式键的合成列声明（Worker 侧生产者把它们追加到右页末尾）。
+     */
     private static List<Field> rightFieldsOf(JoinLink link) {
-        return rightFieldsOf(link.rightProbe(), link.rightCatalog(), link.rightSchema(), link.rightTable(),
-                link.rightColumns());
+        return AbstractDistributedOperator.appendJoinKeyComputed(
+                rightFieldsOf(link.rightProbe(), link.rightCatalog(), link.rightSchema(), link.rightTable(),
+                        link.rightColumns()), link.rightComputed());
     }
 
     /**
@@ -282,7 +330,10 @@ public final class StageScheduler {
         List<Field> first = ds0 != null ? derivedFields(ds0)
                 : rightFieldsOf(firstProbe, firstCatalog, firstSchema, firstTable, firstColumns);
         if (first == null) return null;
-        List<Field> out = new ArrayList<>(first);
+        // T0 生产者先在左页末尾物化第 1 层的 ON 表达式键
+        List<Field> out = AbstractDistributedOperator.appendJoinKeyComputed(
+                first, links.get(0).leftComputed());
+        if (out == null) return null;
         for (int j = 1; j < layer; j++) {
             JoinLink lj = links.get(j - 1);
             DerivedSource ds = sourceAt(sources, j);
@@ -290,14 +341,20 @@ public final class StageScheduler {
             if (rightFields == null) return null;
             boolean hashLike = lj.algorithm() == FragmentSpec.JoinAlgorithm.HASH
                     || lj.algorithm() == FragmentSpec.JoinAlgorithm.BROADCAST;
+            List<Field> next = new ArrayList<>(out);
             for (Field f : rightFields) {
                 if (hashLike && lj.joinType() == JoinType.INNER
                         && lj.rightKeys().contains(f.getName())
                         && lj.leftKeys().contains(f.getName())) {
                     continue;   // HashJoinOperator 对 INNER 剔除同名右键
                 }
-                out.add(f);
+                next.add(f);
             }
+            // 本层输出是下一层的左页：下一层 join 的表达式键在重分区前物化（追加到页尾）
+            next = AbstractDistributedOperator.appendJoinKeyComputed(
+                    next, links.get(j).leftComputed());
+            if (next == null) return null;
+            out = next;
         }
         return out;
     }
@@ -394,7 +451,8 @@ public final class StageScheduler {
             return windowSideFields(ds.innerProbe(), ds.innerRequest(), ds.window());
         }
         if (ds.isProjection()) {
-            return projectionSideFields(ds.innerProbe(), ds.innerRequest(), ds.projections());
+            return projectionSideFields(ds.innerProbe(), ds.innerRequest(), ds.projections(),
+                    ds.outputColumns());
         }
         return derivedSideFields(ds.innerProbe(), ds.innerRequest(), ds.innerKeys(), ds.aggregations(),
                 ds.caseProjections());
@@ -439,19 +497,49 @@ public final class StageScheduler {
     }
 
     /**
-     * 投影型派生源的<b>声明列</b>：页 = 基表扫描列（扫描请求列序）+ 逐行投影派生列
-     * （{@code ExpressionProjectOperator} 把派生列<b>追加</b>在末尾）—— 声明列须与实收页逐列
-     * 同名同型同序，否则 build 侧空桶退回声明值时该分区列数与其他分区不同 → 下游越界。
+     * 投影型派生源的<b>声明列</b>。Producer 侧的顺序是：扫基表 → {@code ExpressionProjectOperator}
+     * 把派生列<b>追加</b>在扫描列之后 → 按 {@code outputColumns} 裁回派生关系的声明输出列
+     * （{@link FragmentSpec.Producer#outputColumns()}）。故实收页 = {@code outputColumns} 顺序
+     * 对应的列，声明列必须逐列同名同型同序 —— 否则 build 侧空桶退回声明值时该分区列数与其他
+     * 分区不同 → 下游越界；实际列与声明列不一致还会让下游按名解析取到错误的列。
+     *
+     * <p>{@code outputColumns} 为空（旧调用点 / 老计划）→ 退回「扫描列 + 派生列」的原口径。</p>
      */
-    private static List<Field> projectionSideFields(DojaoConnector innerProbe, ReadRequest innerRequest,
-                                                    List<DerivedProjection> projections) {
-        List<Field> out = new ArrayList<>();
+    public static List<Field> projectionSideFields(DojaoConnector innerProbe, ReadRequest innerRequest,
+                                                  List<DerivedProjection> projections,
+                                                  List<String> outputColumns) {
         // null / 空列集 = 读全列（scanFields 自身语义）—— 与扫描页实际列序一致
-        out.addAll(AbstractDistributedOperator.scanFields(innerProbe,
+        List<Field> scanCols = AbstractDistributedOperator.scanFields(innerProbe,
                 innerRequest.catalog(), innerRequest.schema(), innerRequest.table(),
-                innerRequest.columns().orElse(null)));
-        for (DerivedProjection p : projections) {
-            out.add(p.field());
+                innerRequest.columns().orElse(null));
+        if (outputColumns == null || outputColumns.isEmpty()) {
+            List<Field> out = new ArrayList<>(scanCols);
+            for (DerivedProjection p : projections) {
+                out.add(p.field());
+            }
+            return out.isEmpty() ? null : out;
+        }
+        List<Field> out = new ArrayList<>(outputColumns.size());
+        for (String name : outputColumns) {
+            Field f = null;
+            for (DerivedProjection p : projections) {
+                if (p.column().equalsIgnoreCase(name)) {
+                    f = p.field();
+                    break;
+                }
+            }
+            if (f == null) {
+                for (Field sf : scanCols) {
+                    if (sf.getName().equalsIgnoreCase(name)) {
+                        f = sf;
+                        break;
+                    }
+                }
+            }
+            if (f == null) {
+                return null;   // 类型推断不出 → 不声明（Worker 退回「收到页才知道」）
+            }
+            out.add(f);
         }
         return out.isEmpty() ? null : out;
     }
@@ -841,7 +929,8 @@ public final class StageScheduler {
             producers.add(new FragmentSpec.Producer(fragmentId(queryId, "BR", i), wid,
                     new FragmentSpec.ScanStep(link.rightCatalog(), rightSlices.get(i)),
                     FragmentSpec.PartitionStep.broadcast(rightExchange, link.rightKeys(), w, ownerWorkerIds,
-                            FragmentSpec.Distribution.REPLICATE, 0)));
+                            FragmentSpec.Distribution.REPLICATE, 0),
+                    link.rightComputed()));
         }
         for (int i = 0; i < leftSlices.size(); i++) {
             int bucket = i % workers.size();   // 本生产者所在 Worker 的槽位 = 目标桶（零跨机）
@@ -849,7 +938,8 @@ public final class StageScheduler {
             producers.add(new FragmentSpec.Producer(fragmentId(queryId, "BL", i), wid,
                     new FragmentSpec.ScanStep(leftCatalog, leftSlices.get(i)),
                     FragmentSpec.PartitionStep.broadcast(leftExchange, leftKeys, w, ownerWorkerIds,
-                            FragmentSpec.Distribution.FIXED, bucket)));
+                            FragmentSpec.Distribution.FIXED, bucket),
+                    link.leftComputed()));
         }
 
         // 2. Consumer：每台一个，own 自己那一个桶；两侧 numPartitions 都是 w
@@ -865,7 +955,9 @@ public final class StageScheduler {
             consumers.add(new FragmentSpec.Consumer(fragmentId(queryId, "BC", i), wid, leftIn, rightIn,
                     new FragmentSpec.JoinStep(leftKeys, link.rightKeys(), link.joinType(),
                             fragmentMemory, w, FragmentSpec.JoinAlgorithm.BROADCAST, rightFieldsOf(link),
-                            rightFieldsOf(leftProbe, leftCatalog, leftSchema, leftTable, leftColumns))
+                            AbstractDistributedOperator.appendJoinKeyComputed(
+                                    rightFieldsOf(leftProbe, leftCatalog, leftSchema, leftTable, leftColumns),
+                                    link.leftComputed()))
                             .withOnFilters(link.onLeftFilter(), link.onRightFilter())));
         }
 
@@ -896,7 +988,8 @@ public final class StageScheduler {
                         : new JoinLink(l.leftKeys(), l.rightKeys(), l.joinType(),
                                 l.rightCatalog(), l.rightSchema(), l.rightTable(), l.rightProbe(),
                                 l.rightFilter(), FragmentSpec.JoinAlgorithm.HASH, l.rightColumns(),
-                                l.leftPartitionKeys(), l.onLeftFilter(), l.onRightFilter()))
+                                l.leftPartitionKeys(), l.onLeftFilter(), l.onRightFilter(),
+                                l.leftComputed(), l.rightComputed()))
                 .toList();
     }
 
@@ -1031,8 +1124,11 @@ public final class StageScheduler {
                                                FragmentSpec.AggregateStep partialFollowUp) {
         boolean hasWindow = windowChain != null && !windowChain.isEmpty();
         DerivedSource firstSource = sourceAt(sources, 0);
-        // 广播 join（仅单 join + 无 followUp + 无窗口链）：分区方式与哈希完全不同，走专门切片
-        if (links.size() == 1 && links.get(0).algorithm() == FragmentSpec.JoinAlgorithm.BROADCAST
+        // 广播 join（仅单 join + 无 followUp + 无窗口链 + 两侧都是物理表）：分区方式与哈希完全不同，
+        // 走专门切片。★左侧是派生源时绝不能走这里 —— planBroadcastJoin 只扫物理左表，派生源
+        // 流水线（emitDerivedSource）根本不会被发射，左交换收到 0 行 → 外连接静默丢全部 probe 行。
+        if (firstSource == null && links.size() == 1
+                && links.get(0).algorithm() == FragmentSpec.JoinAlgorithm.BROADCAST
                 && followUp == null && !hasWindow) {
             return planBroadcastJoin(queryId, workers, firstCatalog, firstSchema, firstTable, firstLeftKeys,
                     firstProbe, firstFilter, links.get(0), memoryLimit, firstColumns);
@@ -1041,7 +1137,10 @@ public final class StageScheduler {
         // ★链上广播（P1-a）只在「末层 + 无 followUp + 无窗口链」成立；其余 BROADCAST 结论一律降级哈希
         //   （带同 key 后续计算时广播的「probe 侧就地分桶」会让同组散到不同 Worker → 结果错；
         //    中间层广播需要新的片段编排，本期不做）。
+        // ★末层 build 侧是派生源时同样不能广播：末层广播用 emitRightProducers 直接复制物理切片，
+        // 派生右表没有直扫切片（rightSlices 为空）→ 右交换一个发送方都没有。
         boolean lastBroadcast = links.size() >= 2 && followUp == null && !hasWindow
+                && sourceAt(sources, links.size()) == null
                 && links.get(links.size() - 1).algorithm() == FragmentSpec.JoinAlgorithm.BROADCAST;
         if (!lastBroadcast) {
             links = downgradeBroadcast(links);
@@ -1242,8 +1341,13 @@ public final class StageScheduler {
                         //   的 build 侧只被 0 号桶消费 ⇒ 其余分区的左行一行都 join 不上）。
                         : new FragmentSpec.PartitionStep(nextLeftExchange, next.leftPartitionKeys(),
                                 n, ownerWorkerIds);
-                fragments.add(new FragmentSpec.MiddleJoinConsumer(
-                        fragmentId(queryId, "MJ", k, w), workerId, leftIn, rightIn, joinStep, nextPartition));
+                FragmentSpec.MiddleJoinConsumer mj = new FragmentSpec.MiddleJoinConsumer(
+                        fragmentId(queryId, "MJ", k, w), workerId, leftIn, rightIn, joinStep, nextPartition);
+                // 下一层 join 的 ON 表达式键：须在按下一层键重哈希之前物化（追加到页尾）
+                if (!next.leftComputed().isEmpty()) {
+                    mj = mj.withNextComputed(next.leftComputed());
+                }
+                fragments.add(mj);
             }
         }
 
@@ -1270,11 +1374,14 @@ public final class StageScheduler {
             emitDerivedSource(fragments, queryId, 0, firstSource, layout, workers, numWorkers, n,
                     ownerWorkerIds, firstLeftExchange, firstLeftKeys, memoryLimit, sourceSlices.get(0), false);
         } else {
+            // 首表是 join#1 的 probe 侧：ON 表达式键须在哈希分区前物化（追加到左页末尾）
+            List<GroupKeyExpression> firstLeftComputed = links.get(0).leftComputed();
             for (int i = 0; i < firstSlices.size(); i++) {
                 String w = workers.get(i % numWorkers).info().workerId();
                 fragments.add(new FragmentSpec.Producer(fragmentId(queryId, "PL", i), w,
                         new FragmentSpec.ScanStep(firstCatalog, firstSlices.get(i)),
-                        new FragmentSpec.PartitionStep(firstLeftExchange, firstLeftKeys, n, ownerWorkerIds)));
+                        new FragmentSpec.PartitionStep(firstLeftExchange, firstLeftKeys, n, ownerWorkerIds),
+                        firstLeftComputed));
             }
         }
         //    T2 .. T(N-1)（join#k≥2 的 build 右表）
@@ -1313,7 +1420,8 @@ public final class StageScheduler {
                             ownerWorkerIds, FragmentSpec.Distribution.REPLICATE, 0)
                     : new FragmentSpec.PartitionStep(rightExchange, link.rightKeys(), numPartitions, ownerWorkerIds);
             fragments.add(new FragmentSpec.Producer(fragmentId(queryId, "PR", k, i), w,
-                    new FragmentSpec.ScanStep(link.rightCatalog(), slices.get(i)), ps));
+                    new FragmentSpec.ScanStep(link.rightCatalog(), slices.get(i)), ps,
+                    link.rightComputed()));
         }
     }
 
@@ -1491,11 +1599,18 @@ public final class StageScheduler {
             for (DerivedProjection p : ds.projections()) {
                 gk.add(new GroupKeyExpression(p.column(), p.exprText()));
             }
+            // 派生关系的对外 schema = 内层 SELECT 输出列：派生列在扫描页尾<b>追加</b>物化后必须
+            // 裁回这些列。否则基表扫描列（尤其与别名同名的列）会一起流向 join 页 —— 下游按名
+            // 解析取到基表那份（首次出现优先），外连接孤儿行 / 下一层表达式键都会算错。
+            List<String> outCols = ds.outputColumns() != null ? ds.outputColumns()
+                    : gk.stream().map(GroupKeyExpression::derivedColumn).toList();
             for (int i = 0; i < innerSlices.size(); i++) {
                 String w = workers.get(i % numWorkers).info().workerId();
                 fragments.add(new FragmentSpec.Producer(fragmentId(queryId, "DIG" + idx, i), w,
                         new FragmentSpec.ScanStep(ds.innerRequest().catalog(), innerSlices.get(i)),
-                        new FragmentSpec.PartitionStep(targetExchange, targetKeys, n, ownerWorkerIds), gk));
+                        new FragmentSpec.PartitionStep(targetExchange, targetKeys, n, ownerWorkerIds),
+                        gk, ds.havingFilter())
+                        .withOutputColumns(outCols));
             }
             return;
         }
@@ -2639,6 +2754,35 @@ public final class StageScheduler {
                                                  List<FragmentSpec.JoinAlias> outputAliases,
                                                  List<String> outerKeys,
                                                  List<AggregationSpec> outerAggregations) {
+        return planDerivedJoin(queryId, workers, numPartitions, derivedOnLeft,
+                innerRequest, innerKeys, aggregations, caseProjections, innerProbe,
+                derivedJoinKeys, havingFilter, peerCatalog, peerSchema, peerTable, peerKeys, peerColumns,
+                peerProbe, peerFilter, joinType, memoryLimit, projections, window, joinAlgorithm,
+                windowChain, outputAliases, outerKeys, outerAggregations, null);
+    }
+
+    /**
+     * 同上一重载 + <b>投影型派生源的声明输出列</b>（{@code projectionOutputColumns}）：非空时
+     * 派生基表 Producer 在物化派生列后裁回这些列（派生关系的对外 schema），声明列也随之收窄 ——
+     * 不裁剪会让基表扫描列泄漏进 join 页（重名列 → 下游按名解析取错列）。
+     */
+    public static JoinChainStage planDerivedJoin(String queryId, List<WorkerRegistration> workers, int numPartitions,
+                                                 boolean derivedOnLeft,
+                                                 ReadRequest innerRequest, List<String> innerKeys,
+                                                 List<AggregationSpec> aggregations,
+                                                 List<CaseProjection> caseProjections, DojaoConnector innerProbe,
+                                                 List<String> derivedJoinKeys, String havingFilter,
+                                                 String peerCatalog, String peerSchema, String peerTable,
+                                                 List<String> peerKeys, List<String> peerColumns,
+                                                 DojaoConnector peerProbe, String peerFilter,
+                                                 JoinType joinType, long memoryLimit,
+                                                 List<DerivedProjection> projections, DerivedWindow window,
+                                                 FragmentSpec.JoinAlgorithm joinAlgorithm,
+                                                 List<FragmentSpec.WindowStep> windowChain,
+                                                 List<FragmentSpec.JoinAlias> outputAliases,
+                                                 List<String> outerKeys,
+                                                 List<AggregationSpec> outerAggregations,
+                                                 List<String> projectionOutputColumns) {
         PartitionLayout layout = PartitionLayout.roundRobin(workers, numPartitions);
         int n = layout.numPartitions();
         int numWorkers = workers.size();
@@ -2683,7 +2827,7 @@ public final class StageScheduler {
         List<Field> derivedFields = windowSource
                 ? windowSideFields(innerProbe, innerRequest, window)
                 : projectionSource
-                    ? projectionSideFields(innerProbe, innerRequest, projections)
+                    ? projectionSideFields(innerProbe, innerRequest, projections, projectionOutputColumns)
                     : derivedSideFields(innerProbe, innerRequest, innerKeys, aggregations, projs,
                             outerKeys, outerAggregations);
         // 声明列必须与上面的裁剪后扫描一致（否则空 build 桶退回声明值时列数与实收页不同 → 下游越界）
@@ -2838,8 +2982,12 @@ public final class StageScheduler {
                                 winPerPartition)
                         : new FragmentSpec.PartitionStep(aggExchange, innerKeys, n, ownerWorkerIds,
                                 aggPerPartitionExchanges);
+            // 投影型：外层 WHERE 下推到派生关系、引用派生别名时，派生列物化后、分区前逐行过滤
+            // （havingFilter 在投影形态下承载的正是这道「投影后过滤」，聚合形态仍走 MiddleAggregateConsumer）
             innerProducers.add(new FragmentSpec.Producer(fragmentId(queryId, "DIG", i), w,
-                    new FragmentSpec.ScanStep(innerRequest.catalog(), innerSlices.get(i)), ps, projExprs));
+                    new FragmentSpec.ScanStep(innerRequest.catalog(), innerSlices.get(i)), ps, projExprs,
+                    projectionSource ? havingFilter : null)
+                    .withOutputColumns(projectionSource ? projectionOutputColumns : null));
         }
         fragments.addAll(derivedOnLeft ? peerProducers : innerProducers);
         fragments.addAll(derivedOnLeft ? innerProducers : peerProducers);

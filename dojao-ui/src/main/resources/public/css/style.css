@@ -840,6 +840,16 @@ body.resizing { cursor: row-resize; user-select: none; }
   font-family: var(--font-mono); font-size: 12px;
 }
 .result-table td { font-family: var(--font-mono); font-size: 12px; color: var(--text-dim); }
+/* 超长单元格（JSON / 长文本）固定显示宽度 + 省略号，别把列撑到几千像素、把右侧字段挤没。
+   只做视觉截断：完整文本仍在 DOM 里（右键复制不受影响），hover 由 td 的 title 显示全文。 */
+.result-table td.res-cell .cell-clip {
+  display: inline-block;
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
 .result-table tbody tr { cursor: default; }
 .result-table tbody tr:hover td { background: var(--bg2); }
 
@@ -1242,6 +1252,78 @@ button.cancel-btn {
   transition: background .15s var(--ease), color .15s var(--ease);
 }
 button.cancel-btn:hover { background: var(--bg3); color: var(--text); }
+
+/* 默认 catalog 选择（控制台标签栏右上角，＋ 新建控制台按钮左侧）：
+   选中后编辑器可写两段式 schema.table。
+   整组是一个「控件胶囊」：[图标] Catalog │ 当前值 ▾，高度与 ＋/打开 按钮一致。
+   下拉弹层是自绘的（原生 select 仅作为数据源视觉隐藏），不跟随系统原生菜单的样式。 */
+.sql-catalog-pick {
+  position: relative;
+  flex: 0 0 auto;
+  display: inline-flex; align-items: center; gap: 7px;
+  height: 29px; padding: 0 4px 0 9px; margin-right: 2px;
+  border: 1px solid var(--line); border-radius: var(--radius-xs);
+  background: var(--bg2); color: var(--text-dim);
+  font-size: 12.5px; white-space: nowrap;
+  transition: background .15s var(--ease), border-color .15s var(--ease);
+}
+.sql-catalog-pick:hover { background: var(--bg3); border-color: var(--line-strong); }
+.sql-catalog-pick.open,
+.sql-catalog-pick:focus-within {
+  background: var(--bg1); border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+.sql-catalog-pick.disabled, .sql-catalog-pick.disabled:hover {
+  background: var(--bg2); border-color: var(--line); box-shadow: none;
+  cursor: not-allowed;
+}
+.sql-catalog-ico { width: 13px; height: 13px; flex: 0 0 13px; color: var(--text-faint); }
+/* 标签与取值之间留白 + 细分隔线，避免两者挤在一起 */
+.sql-catalog-label {
+  padding-right: 7px; font-size: 12px; color: var(--text-faint);
+  border-right: 1px solid var(--line);
+}
+.sql-catalog-btn {
+  display: inline-flex; align-items: center; gap: 7px;
+  height: 100%; min-width: 58px; max-width: 180px;
+  padding: 0 5px 0 0;
+  border: none; background: transparent;
+  color: var(--text); font-family: inherit; font-size: 12.5px; font-weight: 600;
+  cursor: pointer;
+}
+.sql-catalog-btn:disabled { color: var(--text-faint); cursor: not-allowed; }
+.sql-catalog-current { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sql-catalog-chevron {
+  width: 12px; height: 12px; flex: 0 0 12px; color: var(--text-faint);
+  transition: transform .15s var(--ease);
+}
+.sql-catalog-pick.open .sql-catalog-chevron { transform: rotate(180deg); }
+
+/* 自绘下拉弹层：贴胶囊右下展开（空间不足时靠右对齐），选项与右键菜单同款交互 */
+.sql-catalog-menu {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 350;
+  min-width: 168px; max-width: 280px; max-height: 260px;
+  padding: 4px; overflow-y: auto;
+  background: var(--bg1); border: 1px solid var(--line);
+  border-radius: var(--radius-sm); box-shadow: var(--shadow-2);
+}
+.sql-catalog-opt {
+  display: flex; align-items: center;
+  padding: 7px 10px; border-radius: var(--radius-xs);
+  color: var(--text-dim); font-size: 12.5px; cursor: pointer;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  transition: background .15s var(--ease), color .15s var(--ease);
+}
+.sql-catalog-opt:hover { background: var(--bg3); color: var(--text); }
+.sql-catalog-opt.active {
+  background: var(--accent-soft); color: var(--accent-text); font-weight: 600;
+}
+.sql-catalog-opt-empty { padding: 8px 10px; color: var(--text-faint); font-size: 12px; }
+/* 原生 select 只作为取值 / 选项数据源：视觉隐藏且不参与 Tab 焦点（按钮负责交互） */
+.sql-catalog-select {
+  position: absolute; width: 1px; height: 1px;
+  opacity: 0; pointer-events: none;
+}
 
 /* ---- SQL 编辑器：textarea + 高亮垫层 ----
    ★核心不变量：垫层与 textarea 的**排版必须逐项一致**（字形 + 折行宽度），改一处务必两处同步。
@@ -2224,14 +2306,39 @@ textarea.sql-editor::-moz-selection { background: rgba(37, 99, 235, 0.26); color
 }
 .mg-seg-btn + .mg-seg-btn { border-left: 1px solid var(--line); }
 .mg-seg-btn.active { background: var(--accent); color: #fff; font-weight: 600; }
-.mg-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 6px; }
+.mg-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
 .mg-btn {
   padding: 8px 18px; border: 1px solid var(--line); border-radius: var(--radius-xs);
   background: var(--bg1); color: var(--text-dim);
   font-family: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+  transition: background .15s var(--ease), color .15s var(--ease), border-color .15s var(--ease);
 }
+.mg-btn:hover:not(:disabled) { background: var(--bg3); color: var(--text); border-color: var(--line-strong); }
 .mg-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.mg-btn.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); color: #fff; }
+/* 危险操作（删除 catalog 等）：红色主按钮 */
+.mg-btn.danger { background: var(--err); border-color: var(--err); color: #fff; }
+.mg-btn.danger:hover:not(:disabled) { background: #b91c1c; border-color: #b91c1c; color: #fff; }
 .mg-btn:disabled { opacity: .6; cursor: not-allowed; }
+
+/* 小号确认弹窗（删除 catalog 等危险操作）：图标 + 说明的紧凑版式 */
+.mg-modal.mg-modal-sm { width: min(460px, 92vw); }
+.mg-confirm { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 10px; }
+.mg-confirm-ico {
+  flex: 0 0 40px; width: 40px; height: 40px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  background: rgba(220, 38, 38, 0.10); color: var(--err);
+}
+.mg-confirm-ico svg { width: 21px; height: 21px; display: block; }
+.mg-confirm-main { min-width: 0; }
+.mg-confirm-title {
+  margin-bottom: 6px; font-size: 14.5px; font-weight: 600; color: var(--text);
+  line-height: 1.5; word-break: break-all;
+}
+.mg-confirm-title b { color: var(--err); font-weight: 700; }
+.mg-confirm-desc { font-size: 12.5px; color: var(--text-dim); line-height: 1.75; }
+.mg-confirm-desc b { color: var(--text); font-weight: 600; }
 
 /* 技能表单（js/manage.js renderSkillForm）：提示词文本域 + 工具勾选格 */
 .mg-field textarea {

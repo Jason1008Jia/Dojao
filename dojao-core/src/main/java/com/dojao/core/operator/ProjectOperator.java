@@ -47,6 +47,9 @@ public class ProjectOperator extends AbstractMeasurableOperator {
     /** 更新上游算子引用（列裁剪优化使用，须在 {@link #doOpen()} 前调用）。 */
     public void setUpstream(Operator upstream) { this.upstream = upstream; }
 
+    /** 上游算子（scan-sink 形态探测用）。 */
+    public Operator upstream() { return upstream; }
+
     /**
      * 收窄改名投影为指定的投影项（列裁剪优化使用）：父节点不需要的输出列必须同步从投影项中
      * 移除 —— 否则裁剪会把对应源列从子节点裁掉，运行期 {@link #rename} 取不到源列而抛

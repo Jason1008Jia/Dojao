@@ -56,7 +56,7 @@ public final class BuiltinFunctionCatalog {
             "date_add", "date_sub", "add_months", "months_between", "last_day", "next_day",
             "trunc", "date_format", "from_utc_timestamp", "to_utc_timestamp",
             // —— 条件（BuiltinScalars / ConditionalFunctions）——
-            "nvl", "coalesce", "isnull", "isnotnull", "nullif", "assert_true",
+            "nvl", "ifnull", "if_null", "coalesce", "isnull", "isnotnull", "nullif", "assert_true",
             // —— 加密（BuiltinScalars / CryptoFunctions）——
             "md5", "sha1", "sha2", "crc32", "uuid", "hash");
 

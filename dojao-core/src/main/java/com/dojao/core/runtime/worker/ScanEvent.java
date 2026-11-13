@@ -22,8 +22,17 @@ public sealed interface ScanEvent permits ScanEvent.ScanPage, ScanEvent.ScanFini
     record ScanPage(String taskId, Page page) implements ScanEvent {
     }
 
-    /** 分区任务正常扫完（对应 v1 的 EOF 标记，语义更明确）。 */
-    record ScanFinished(String taskId) implements ScanEvent {
+    /**
+     * 分区任务正常扫完（对应 v1 的 EOF 标记，语义更明确）。
+     *
+     * <p>{@code rows}：本分区<b>写入目标表</b>的行数（scan-sink 就地写路径经 FINISHED metadata
+     * 回传；普通扫描回传路径无行数语义，恒 0）。</p>
+     */
+    record ScanFinished(String taskId, long rows) implements ScanEvent {
+        /** 普通扫描（数据页回传）完成：无写行数。 */
+        public ScanFinished(String taskId) {
+            this(taskId, 0L);
+        }
     }
 
     /** 分区任务失败：cause 为异常摘要，Master 据此 fail-fast（后续可据此重试）。 */

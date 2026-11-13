@@ -241,16 +241,30 @@ public sealed interface FragmentSpec
                     JoinType joinType, long memoryLimit, int numPartitions,
                     JoinAlgorithm algorithm, List<Field> declaredRightFields,
                     List<Field> declaredLeftFields, List<JoinAlias> outputAliases,
-                    String onLeftFilter, String onRightFilter) {
+                    String onLeftFilter, String onRightFilter,
+                    List<GroupKeyExpression> leftComputed, List<GroupKeyExpression> rightComputed) {
 
         public JoinStep {
             outputAliases = outputAliases == null ? List.of() : List.copyOf(outputAliases);
             onLeftFilter = blankToNull(onLeftFilter);
             onRightFilter = blankToNull(onRightFilter);
+            leftComputed = leftComputed == null ? List.of() : List.copyOf(leftComputed);
+            rightComputed = rightComputed == null ? List.of() : List.copyOf(rightComputed);
         }
 
         private static String blankToNull(String s) {
             return s == null || s.isBlank() ? null : s;
+        }
+
+        /** 无表达式键合成列（绝大多数 join）。 */
+        public JoinStep(List<String> leftKeyColumns, List<String> rightKeyColumns,
+                        JoinType joinType, long memoryLimit, int numPartitions,
+                        JoinAlgorithm algorithm, List<Field> declaredRightFields,
+                        List<Field> declaredLeftFields, List<JoinAlias> outputAliases,
+                        String onLeftFilter, String onRightFilter) {
+            this(leftKeyColumns, rightKeyColumns, joinType, memoryLimit, numPartitions, algorithm,
+                    declaredRightFields, declaredLeftFields, outputAliases,
+                    onLeftFilter, onRightFilter, List.of(), List.of());
         }
 
         /** 无 ON 单侧残差谓词（绝大多数 join）。 */
@@ -266,7 +280,18 @@ public sealed interface FragmentSpec
         public JoinStep withOnFilters(String onLeft, String onRight) {
             return new JoinStep(leftKeyColumns, rightKeyColumns, joinType, memoryLimit, numPartitions,
                     algorithm, declaredRightFields, declaredLeftFields, outputAliases,
-                    onLeft, onRight);
+                    onLeft, onRight, leftComputed, rightComputed);
+        }
+
+        /**
+         * 附加 JOIN ON 表达式键合成列：Worker 在本地 join 之前用
+         * {@code ExpressionProjectOperator} 追加这些派生列 —— 随后按左/右键列名（可能是表达式文本
+         * 的哨兵名）定位即可。null/空表示无表达式键（与旧行为逐字节一致）。
+         */
+        public JoinStep withKeyComputed(List<GroupKeyExpression> left, List<GroupKeyExpression> right) {
+            return new JoinStep(leftKeyColumns, rightKeyColumns, joinType, memoryLimit, numPartitions,
+                    algorithm, declaredRightFields, declaredLeftFields, outputAliases,
+                    onLeftFilter, onRightFilter, left, right);
         }
 
         /** 旧签名（无输出别名）：与 {@code outputAliases = []} 逐字节同行为。 */
@@ -304,7 +329,7 @@ public sealed interface FragmentSpec
         public JoinStep withOutputAliases(List<JoinAlias> aliases) {
             return new JoinStep(leftKeyColumns, rightKeyColumns, joinType, memoryLimit, numPartitions,
                     algorithm, declaredRightFields, declaredLeftFields, aliases,
-                    onLeftFilter, onRightFilter);
+                    onLeftFilter, onRightFilter, leftComputed, rightComputed);
         }
     }
 
@@ -442,6 +467,26 @@ public sealed interface FragmentSpec
     }
 
     /**
+     * 扫描分片侧投影（scan-sink 就地写）：Worker 扫完切片后先按此投影，再写 {@link SinkStep}
+     * 目标表 / 回传。{@code outputColumns} 是最终输出顺序；{@code computedColumns} 是其中由
+     * {@code expressions} 求值的列，其余为透传列。{@code expressions} 为空 = 纯列投影
+     * （{@code ProjectOperator} 语义），非空 = 标量表达式投影（{@code ScalarProjectOperator} 语义）。
+     */
+    record ScanProjection(List<String> outputColumns, List<String> computedColumns,
+                          List<GroupKeyExpression> expressions) {
+        public ScanProjection {
+            outputColumns = outputColumns == null ? List.of() : List.copyOf(outputColumns);
+            computedColumns = computedColumns == null ? List.of() : List.copyOf(computedColumns);
+            expressions = expressions == null ? List.of() : List.copyOf(expressions);
+        }
+
+        /** 扫描后投影是否为空操作（输出列 == 扫描列，无计算列）—— 无需包算子。 */
+        public boolean isIdentity() {
+            return expressions.isEmpty() && computedColumns.isEmpty();
+        }
+    }
+
+    /**
      * 片内 top-N 截断尾（顶层 ORDER BY + LIMIT/OFFSET 下推）—— 挂在<b>终端</b> Consumer 上：
      * Worker 把本分区最终结果按 {@code orderByKeys} 本地排序后只回传前 {@code offset+limit} 行，
      * Master 再在候选集上做全局排序取 {@code [offset, offset+limit)}（top-N 定理：全局前 N 必在
@@ -561,23 +606,49 @@ public sealed interface FragmentSpec
     record Producer(String fragmentId, String selfWorkerId,
                     ScanStep scan, PartitionStep partition,
                     List<GroupKeyExpression> groupKeyExpressions,
-                    ExpandStep expand) implements FragmentSpec {
+                    String filterAfterProject,
+                    ExpandStep expand,
+                    List<String> outputColumns) implements FragmentSpec {
+        public Producer {
+            outputColumns = outputColumns == null || outputColumns.isEmpty()
+                    ? null : List.copyOf(outputColumns);
+        }
+
         /** 无 GROUP BY 表达式（join / 窗口 / 纯扫描的常规 Producer）。 */
         public Producer(String fragmentId, String selfWorkerId,
                         ScanStep scan, PartitionStep partition) {
-            this(fragmentId, selfWorkerId, scan, partition, List.of(), null);
+            this(fragmentId, selfWorkerId, scan, partition, List.of(), null, null, null);
         }
 
         /** 无多维聚合展开（旧调用点）。 */
         public Producer(String fragmentId, String selfWorkerId,
                         ScanStep scan, PartitionStep partition,
                         List<GroupKeyExpression> groupKeyExpressions) {
-            this(fragmentId, selfWorkerId, scan, partition, groupKeyExpressions, null);
+            this(fragmentId, selfWorkerId, scan, partition, groupKeyExpressions, null, null, null);
+        }
+
+        /** 无多维聚合展开 + 投影后过滤（投影型派生源的外层谓词，引用派生别名）。 */
+        public Producer(String fragmentId, String selfWorkerId,
+                        ScanStep scan, PartitionStep partition,
+                        List<GroupKeyExpression> groupKeyExpressions, String filterAfterProject) {
+            this(fragmentId, selfWorkerId, scan, partition, groupKeyExpressions, filterAfterProject, null, null);
+        }
+
+        /**
+         * 声明输出列（<b>投影型派生源</b>）：扫描列 + {@code groupKeyExpressions} 物化的派生列，
+         * 在过滤之后<b>只保留</b>这些列（按给定顺序）。派生关系的对外 schema 是内层 SELECT 的
+         * 输出列 —— 不裁剪会让基表扫描列（同名列）泄漏到 join 页，下游按名解析会拿到错误的列。
+         * 未引用的表达式源列被裁掉（列裁剪已经保证只读需要的列）。
+         */
+        public Producer withOutputColumns(List<String> columns) {
+            return new Producer(fragmentId, selfWorkerId, scan, partition, groupKeyExpressions,
+                    filterAfterProject, expand, columns);
         }
 
         /** 附加多维聚合展开：扫描（与 GROUP BY 派生列）之后、哈希分区之前复制行。 */
         public Producer withExpand(ExpandStep e) {
-            return new Producer(fragmentId, selfWorkerId, scan, partition, groupKeyExpressions, e);
+            return new Producer(fragmentId, selfWorkerId, scan, partition, groupKeyExpressions,
+                    filterAfterProject, e, outputColumns);
         }
 
         @Override
@@ -591,8 +662,11 @@ public sealed interface FragmentSpec
                     : " → groupKey(" + groupKeyExpressions.stream()
                             .map(GroupKeyExpression::derivedColumn)
                             .collect(java.util.stream.Collectors.joining(", ")) + ")";
+            String post = filterAfterProject == null || filterAfterProject.isBlank() ? ""
+                    : " → filter[" + filterAfterProject + "]";
+            String out = outputColumns == null ? "" : " → select(" + outputColumns + ")";
             return "scan " + scan.request().schema() + "." + scan.request().table()
-                    + " → hash-partition(" + partition.keyColumns() + ")" + gk
+                    + " → hash-partition(" + partition.keyColumns() + ")" + gk + post + out
                     + FragmentSpec.expandSuffix(expand);
         }
     }

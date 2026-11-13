@@ -140,9 +140,13 @@ public class QueryServiceImpl {
         //   若在 validate 之后灌，自定义聚合会被当成普通列引用而报 "must appear in GROUP BY"。
         FunctionManager.ensureLoaded();
         LogicalPlan plan = sqlValidator.validate(sql);
+        // 规划期分段耗时（提交后要等整段走完 WebUI 才展开算子）—— 出慢查询时按这四段定位：
+        // 校验（分析器元数据探查）/ 并行度探查（getTableStats）/ 源行数探查 / Planner.plan（join 选型）。
+        long validateNanos = System.nanoTime();
         if (plan instanceof LogicalPlan.Explain explain) {
             // EXPLAIN：先规划（并行度按元数据决策）；普通 EXPLAIN 到此为止，对数据源零副作用
-            int parallelism = resolveQueryParallelism(explain.statement());
+            Map<String, TableStats> explainStats = new java.util.HashMap<>();
+            int parallelism = resolveQueryParallelism(explain.statement(), explainStats);
             PhysicalPlan physical = planner.withParallelism(parallelism).plan(plan);
             log.info("EXPLAIN 并行度: queryId={}, parallelism={}, analyze={}",
                     queryId, parallelism, explain.analyze());
@@ -159,7 +163,7 @@ public class QueryServiceImpl {
                         "EXPLAIN ANALYZE 只支持只读查询（不支持 INSERT / CTAS）");
             }
             try {
-                Map<String, Long> sourceRows = probeSourceRows(explain.statement());
+                Map<String, Long> sourceRows = probeSourceRows(explain.statement(), explainStats);
                 QueryManager qm = new QueryManager(queryId, sql, physical, 0, sourceRows);
                 QueryManagerRegistry.get().register(qm);
                 // 直接消费算子链并把结果丢弃（EXPLAIN ANALYZE 只回传计划文本，不回传数据行）
@@ -222,8 +226,13 @@ public class QueryServiceImpl {
         // 顶层 LIMIT 截断下推：简单单表直通链上，可以让数据源「读满即停」（SELECT ... LIMIT n），
         // 而不是等下游关游标。判定见 computeScanFetchRows。
         long scanFetchRows = rowsOneToOne ? computeScanFetchRows(plan) : 0L;
+        // 每查询一次性元数据探查缓存：并行度决策与 Scan 进度分母共用同一份 getTableStats，
+        // 不再对每张扫描表各探两次（ClickHouse 一次 getTableStats 要 3~4 次 JDBC 往返，
+        // 重复探查是「提交后算子迟迟不展开」的主要耗时之一）。
+        Map<String, TableStats> statsCache = new java.util.HashMap<>();
         // 动态并行度：探查扫描表元数据 → 计算初始并行度 → 准入控制（可用 < 应需×80% 时阻塞等待）
-        int desired = resolveQueryParallelism(plan);
+        int desired = resolveQueryParallelism(plan, statsCache);
+        long parallelismNanos = System.nanoTime();
         int granted = desired;
         boolean admitted = false;
         if (connectorProvider != null && !localScan) {
@@ -233,7 +242,8 @@ public class QueryServiceImpl {
                     queryId, desired, granted, budget.available());
         }
         // 扫描源总量探查（Progress 分母）：与并行度探查同源，供 QueryManager 挂到 Producer 任务
-        Map<String, Long> sourceRows = probeSourceRows(plan);
+        Map<String, Long> sourceRows = probeSourceRows(plan, statsCache);
+        long sourceRowsNanos = System.nanoTime();
         Planner effective = null;
         try {
             effective = planner.withParallelism(localScan ? 1 : granted);
@@ -246,6 +256,12 @@ public class QueryServiceImpl {
                 log.info("LIMIT 截断下推命中: queryId={}, 扫描行数上限={}", queryId, scanFetchRows);
             }
             PhysicalPlan physical = effective.plan(plan);
+            log.info("查询规划耗时: queryId={}, 校验={}ms, 并行度探查={}ms, 源行数探查={}ms, 规划={}ms",
+                    queryId,
+                    (validateNanos - startNanos) / 1_000_000,
+                    (parallelismNanos - validateNanos) / 1_000_000,
+                    (sourceRowsNanos - parallelismNanos) / 1_000_000,
+                    (System.nanoTime() - sourceRowsNanos) / 1_000_000);
             // 每查询一个 QueryManager 守护：注册后由执行路径实时采集算子指标
             QueryManager qm = new QueryManager(queryId, sql, physical, 0, sourceRows);
             QueryManagerRegistry.get().register(qm);
@@ -414,7 +430,7 @@ public class QueryServiceImpl {
      * 初始并行度决策：提取扫描表 → 经连接器探查元数据（框架只调 {@link DojaoConnector#getTableStats} 接口，
      * 不关心各连接器实现）→ {@link ParallelismCalculator} 计算。探查失败/无提供者 → 回退默认。
      */
-    private int resolveQueryParallelism(LogicalPlan plan) {
+    private int resolveQueryParallelism(LogicalPlan plan, Map<String, TableStats> statsCache) {
         // 每 query 硬上限 = budget.perQueryMax()：配置了 system.query.max.parallelism 用用户值，
         // 否则默认公式 = 集群容量 / worker 数（卡死，准入侧 tryAdmit 同上限双保险）
         int cap = budget.perQueryMax();
@@ -426,21 +442,40 @@ public class QueryServiceImpl {
             return Math.min(ResourceConfig.masterParallelism(), cap);
         }
         int capacity = budget.clusterCapacity();
-        int p = ParallelismCalculator.decide(tables, this::probeTableStats, capacity, cap);
+        int p = ParallelismCalculator.decide(tables, t -> probeTableStats(t, statsCache), capacity, cap);
         log.info("初始并行度决策: queryId=未定, 扫描表={}, 集群容量={}, 每query上限={}, 并行度={}",
                 tables.stream().map(TableRef::qualifiedName).toList(), capacity, cap, p);
         return p;
     }
 
-    /** 按表探查统计：经连接器提供者取该 catalog 的连接器，调 {@code getTableStats} 接口（失败 → null 未知）。 */
-    private TableStats probeTableStats(TableRef table) {
+    /**
+     * 按表探查统计：经连接器提供者取该 catalog 的连接器，调 {@code getTableStats} 接口（失败 → null 未知）。
+     * 结果按「catalog.schema.table」记入本次查询的 {@code statsCache}（{@link #probeSourceRows} 复用）。
+     */
+    private TableStats probeTableStats(TableRef table, Map<String, TableStats> statsCache) {
+        String key = probeKey(table);
+        if (statsCache.containsKey(key)) {
+            return statsCache.get(key);
+        }
+        TableStats stats = null;
         try {
             DojaoConnector conn = connectorProvider.get(table.catalog());
-            return conn.getTableStats(table.catalog(), table.schema(), table.table());
+            stats = conn.getTableStats(table.catalog(), table.schema(), table.table());
         } catch (Exception e) {
             log.warn("表元数据探查失败（回退默认并行度）: {} - {}", table.qualifiedName(), e.getMessage());
-            return null;
         }
+        statsCache.put(key, stats);
+        return stats;
+    }
+
+    private static String probeKey(TableRef table) {
+        return (table.catalog() == null ? "" : table.catalog()) + '\u0001'
+                + (table.schema() == null ? "" : table.schema()) + '\u0001'
+                + (table.table() == null ? "" : table.table());
+    }
+
+    private static String probeKey(TableRef table, String filter) {
+        return probeKey(table) + '\u0001' + (filter == null ? "" : filter);
     }
 
     /**
@@ -454,7 +489,7 @@ public class QueryServiceImpl {
      * {@code WHERE id between 3 and 8}（整表 46 万 → 实际 6 行）会把 Scan 进度条永远钉在 0。
      * 连接器不覆写估算 → 默认退化为整表 {@code TABLE_ROWS}（与旧行为一致）。</p>
      */
-    private Map<String, Long> probeSourceRows(LogicalPlan plan) {
+    private Map<String, Long> probeSourceRows(LogicalPlan plan, Map<String, TableStats> statsCache) {
         if (connectorProvider == null) {
             return Map.of();
         }
@@ -463,11 +498,27 @@ public class QueryServiceImpl {
             return Map.of();
         }
         java.util.Map<String, Long> out = new java.util.HashMap<>();
+        // 无谓词 → 直接复用途径的 getTableStats 结果（estimateRows 的默认实现就是整表 rowCount）；
+        // 有谓词 → 按「表 + 谓词」缓存 estimateRows，同表多扫描点不重复探查。
+        java.util.Map<String, Long> rowEstimates = new java.util.HashMap<>();
         for (ScanTableExtractor.ScannedTable scan : scans) {
             TableRef t = scan.table();
             try {
-                DojaoConnector conn = connectorProvider.get(t.catalog());
-                long rows = conn.estimateRows(t.catalog(), t.schema(), t.table(), scan.filter());
+                String filter = scan.filter();
+                long rows;
+                if (filter == null || filter.isBlank()) {
+                    TableStats stats = probeTableStats(t, statsCache);
+                    rows = stats == null ? -1L : stats.rowCount();
+                } else {
+                    String key = probeKey(t, filter);
+                    if (rowEstimates.containsKey(key)) {
+                        rows = rowEstimates.get(key);
+                    } else {
+                        DojaoConnector conn = connectorProvider.get(t.catalog());
+                        rows = conn.estimateRows(t.catalog(), t.schema(), t.table(), filter);
+                        rowEstimates.put(key, rows);
+                    }
+                }
                 if (rows > 0) {
                     String key = (t.schema() == null ? "" : t.schema())
                             + "." + (t.table() == null ? "" : t.table());
@@ -710,6 +761,10 @@ public class QueryServiceImpl {
             }
             if (distributedWrite) {
                 totalRows = ((AbstractDistributedOperator) op).totalOutputRows();
+            } else if (op instanceof com.dojao.core.operator.DistributedScanOperator scan
+                    && scan.hasSink()) {
+                // scan-sink（纯扫描+投影就地写）：数据页不回 Master，行数 = 各分区写入行数之和
+                totalRows = scan.writtenRows();
             }
             qm.markFinished();
         } catch (Exception e) {

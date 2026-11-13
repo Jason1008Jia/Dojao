@@ -234,6 +234,12 @@ public final class ControlSerde {
         if (j.onRightFilter() != null) {
             b.setOnRightFilter(j.onRightFilter());
         }
+        for (GroupKeyExpression g : j.leftComputed()) {
+            b.addLeftComputed(toGroupKeyExpression(g));
+        }
+        for (GroupKeyExpression g : j.rightComputed()) {
+            b.addRightComputed(toGroupKeyExpression(g));
+        }
         return b.build();
     }
 
@@ -243,13 +249,18 @@ public final class ControlSerde {
         for (JoinAliasMsg a : m.getOutputAliasesList()) {
             aliases.add(new FragmentSpec.JoinAlias(a.getSourceName(), a.getOccurrence(), a.getAliasName()));
         }
+        List<GroupKeyExpression> leftComputed = m.getLeftComputedList().stream()
+                .map(ControlSerde::fromGroupKeyExpression).toList();
+        List<GroupKeyExpression> rightComputed = m.getRightComputedList().stream()
+                .map(ControlSerde::fromGroupKeyExpression).toList();
         return new FragmentSpec.JoinStep(m.getLeftKeyColumnsList(), m.getRightKeyColumnsList(),
                 JoinType.valueOf(m.getJoinType().name()), m.getMemoryLimit(), m.getNumPartitions(),
                 FragmentSpec.JoinAlgorithm.valueOf(m.getAlgorithm().name()),
                 ArrowSchemaIpc.decode(m.getRightSchemaIpc().toByteArray()),
                 ArrowSchemaIpc.decode(m.getLeftSchemaIpc().toByteArray()),
                 aliases,
-                m.getOnLeftFilter(), m.getOnRightFilter());
+                m.getOnLeftFilter(), m.getOnRightFilter(),
+                leftComputed, rightComputed);
     }
 
     private static AggregationDtoMsg toAggregationDto(FragmentSpec.AggregationDto a) {
@@ -445,7 +456,7 @@ public final class ControlSerde {
                 m.getOutputColumnsList());
     }
 
-    private static SinkStepMsg toSinkStep(FragmentSpec.SinkStep s) {
+    public static SinkStepMsg toSinkStep(FragmentSpec.SinkStep s) {
         SinkStepMsg.Builder b = SinkStepMsg.newBuilder()
                 .setCatalog(s.catalog())
                 .setSchema(s.schema())
@@ -456,10 +467,26 @@ public final class ControlSerde {
         return b.build();
     }
 
-    private static FragmentSpec.SinkStep fromSinkStep(SinkStepMsg m) {
+    public static FragmentSpec.SinkStep fromSinkStep(SinkStepMsg m) {
         List<String> cols = m.getTargetColumnsList();
         return new FragmentSpec.SinkStep(m.getCatalog(), m.getSchema(), m.getTable(),
                 cols.isEmpty() ? null : cols);
+    }
+
+    /** 扫描分片侧投影 ↔ proto（scan-sink：Worker 扫完先投影）。 */
+    public static ScanProjectionMsg toScanProjection(FragmentSpec.ScanProjection p) {
+        ScanProjectionMsg.Builder b = ScanProjectionMsg.newBuilder()
+                .addAllOutputColumns(p.outputColumns())
+                .addAllComputedColumns(p.computedColumns());
+        for (GroupKeyExpression g : p.expressions()) {
+            b.addExpressions(toGroupKeyExpression(g));
+        }
+        return b.build();
+    }
+
+    public static FragmentSpec.ScanProjection fromScanProjection(ScanProjectionMsg m) {
+        return new FragmentSpec.ScanProjection(m.getOutputColumnsList(), m.getComputedColumnsList(),
+                m.getExpressionsList().stream().map(ControlSerde::fromGroupKeyExpression).toList());
     }
 
     /** 片内 top-N 截断尾 ↔ proto（可空；空 = 不下推）。 */
@@ -493,8 +520,14 @@ public final class ControlSerde {
                 for (GroupKeyExpression g : p.groupKeyExpressions()) {
                     pb.addGroupKeyExpressions(toGroupKeyExpression(g));
                 }
+                if (p.filterAfterProject() != null && !p.filterAfterProject().isBlank()) {
+                    pb.setFilterAfterProject(p.filterAfterProject());
+                }
                 if (p.expand() != null) {
                     pb.setExpand(toExpandStep(p.expand()));
+                }
+                if (p.outputColumns() != null) {
+                    pb.addAllOutputColumns(p.outputColumns());
                 }
                 b.setProducer(pb.build());
             }
@@ -638,7 +671,9 @@ public final class ControlSerde {
                 List<GroupKeyExpression> gks = m.getGroupKeyExpressionsList().stream()
                         .map(ControlSerde::fromGroupKeyExpression).toList();
                 FragmentSpec.Producer producer = new FragmentSpec.Producer(m.getFragmentId(),
-                        m.getSelfWorkerId(), fromScanStep(m.getScan()), fromPartitionStep(m.getPartition()), gks);
+                        m.getSelfWorkerId(), fromScanStep(m.getScan()), fromPartitionStep(m.getPartition()), gks,
+                        m.getFilterAfterProject().isBlank() ? null : m.getFilterAfterProject())
+                        .withOutputColumns(m.getOutputColumnsList());
                 return m.hasExpand() ? producer.withExpand(fromExpandStep(m.getExpand())) : producer;
             }
             case CONSUMER -> {

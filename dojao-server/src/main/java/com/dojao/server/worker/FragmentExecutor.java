@@ -321,6 +321,22 @@ public final class FragmentExecutor {
             if (!spec.groupKeyExpressions().isEmpty()) {
                 scan = new ExpressionProjectOperator(scan, spec.groupKeyExpressions());
             }
+            // 投影后行级过滤（投影型派生源：外层 WHERE 引用派生别名）：派生列此时已物化在页尾，
+            // 在哈希分区之前逐行过滤（少 shuffle，且与单机「派生体算完再过滤」语义一致）
+            if (spec.filterAfterProject() != null && !spec.filterAfterProject().isBlank()) {
+                for (String cond : SqlTextUtil.splitConjuncts(spec.filterAfterProject())) {
+                    if (!cond.isBlank()) {
+                        scan = new FilterOperator(scan, cond);
+                    }
+                }
+            }
+            // 投影型派生源的声明输出列：派生列是<b>追加</b>到扫描页尾的，派生关系的对外 schema
+            // 却只有内层 SELECT 的输出列 —— 这里裁回声明列（顺序即声明顺序）。不裁剪会让基表扫描
+            // 列（含与派生别名同名的列）一起流进 join 页：join 输出出现重名列，下游按名解析取到
+            // 首个（泄漏的基表列），外连接孤儿行 / 下一层 ON 表达式键全部算错。
+            if (spec.outputColumns() != null) {
+                scan = new ProjectOperator(scan, spec.outputColumns());
+            }
             // 多维聚合展开（ROLLUP/CUBE/GROUPING SETS）：扫描之后、按 (维度…, gid) 哈希分区之前
             // 把每行复制成 N 份 —— 基表只扫这一次，各维度组合靠 __grouping_id 在聚合端分开
             if (spec.expand() != null) {

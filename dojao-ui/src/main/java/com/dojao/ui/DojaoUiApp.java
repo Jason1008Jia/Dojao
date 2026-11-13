@@ -293,6 +293,7 @@ public final class DojaoUiApp {
         app.get("/api/connectors", this::listConnectors);
         app.post("/api/catalog/test", this::testCatalogConnection);
         app.post("/api/catalog", this::createCatalog);
+        app.delete("/api/catalog/{name}", this::deleteCatalog);
 
         // API: 元数据目录树（catalog → schema → table，首页左侧）
         app.get("/api/metadata/catalogs", this::listCatalogs);
@@ -1021,6 +1022,62 @@ public final class DojaoUiApp {
             ctx.status(500).json(Map.of("error", "创建过程被中断"));
         } catch (Exception e) {
             log.warn("[catalog] 新建 catalog 失败: {}", Errors.describe(e));
+            ctx.status(500).json(Map.of("error", Errors.describe(e)));
+        }
+    }
+
+    /**
+     * DELETE /api/catalog/{name} —— 注销 catalog（执行 {@code DROP CATALOG <name>}）。
+     *
+     * <p>与新建走同一条 SQL 执行线：提交到 {@link QueryMonitor} 后同步轮询到终态。
+     * 只注销元数据注册，<b>不删除数据源里的任何数据</b>；权限（catalog 属主）由
+     * {@code MetadataExecutor.dropCatalog} 在服务端校验。名字先做字符集校验，
+     * 不拼任何未校验文本进 SQL。</p>
+     */
+    private void deleteCatalog(Context ctx) {
+        QueryMonitor m = requireMonitor(ctx);
+        if (m == null) return;
+        try {
+            String name = CatalogCreateSupport.requireName(ctx.pathParam("name"));
+            MonitorSubmit submitted = m.submit("DROP CATALOG " + name, viewerOf(ctx));
+            if (!"SUBMITTED".equals(submitted.state())) {
+                ctx.status(400).json(Map.of("error",
+                        submitted.message() == null ? "提交失败" : submitted.message()));
+                return;
+            }
+
+            long deadline = System.currentTimeMillis() + CATALOG_CREATE_TIMEOUT_MS;
+            MonitorResult result = m.result(submitted.queryId(), 0, 1);
+            while (!isTerminalState(result.state()) && System.currentTimeMillis() < deadline) {
+                Thread.sleep(CATALOG_CREATE_POLL_MS);
+                result = m.result(submitted.queryId(), 0, 1);
+            }
+            if (!isTerminalState(result.state())) {
+                ctx.status(504).json(Map.of(
+                        "error", "删除超时（" + (CATALOG_CREATE_TIMEOUT_MS / 1000) + " 秒），"
+                                + "可到任务列表查看 queryId=" + submitted.queryId(),
+                        "queryId", submitted.queryId(),
+                        "state", result.state()));
+                return;
+            }
+            if (!"FINISHED".equals(result.state())) {
+                ctx.status(400).json(Map.of(
+                        "error", result.error() == null ? ("执行失败: " + result.state()) : result.error(),
+                        "queryId", submitted.queryId(),
+                        "state", result.state()));
+                return;
+            }
+            log.info("[catalog] 删除 catalog name={} viewer={} queryId={}",
+                    name, viewerOf(ctx), submitted.queryId());
+            ctx.json(Map.of("ok", true, "queryId", submitted.queryId(),
+                    "message", "Catalog '" + name + "' 已删除"));
+        } catch (IllegalArgumentException e) {
+            ctx.status(400).json(Map.of("error", e.getMessage()));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            ctx.status(500).json(Map.of("error", "删除过程被中断"));
+        } catch (Exception e) {
+            log.warn("[catalog] 删除 catalog 失败: {}", Errors.describe(e));
             ctx.status(500).json(Map.of("error", Errors.describe(e)));
         }
     }

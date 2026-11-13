@@ -8,6 +8,7 @@ import com.dojao.spi.function.ScalarFunction;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
+import org.apache.arrow.vector.DateDayVector;
 import org.apache.arrow.vector.DecimalVector;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float8Vector;
@@ -220,7 +221,7 @@ public final class ExprEvaluator {
 
     /** 结果类型取自参数的多态函数：任一参数静态为字符串 → 结果按字符串输出。 */
     private static final Set<String> POLYMORPHIC_FUNCTIONS = Set.of(
-            "coalesce", "nvl", "nullif", "greatest", "least");
+            "coalesce", "nvl", "ifnull", "if_null", "nullif", "greatest", "least");
 
     /** 全 NULL 结果的静态类型类别（决定输出向量类型）。 */
     private enum NullKind { NONE, STRING, DOUBLE, DECIMAL, BIGINT, BIT }
@@ -407,13 +408,27 @@ public final class ExprEvaluator {
         if (idx == null) {
             throw new IllegalStateException("表达式列不存在: " + name + "（可用: " + indexOf.keySet() + "）");
         }
-        FieldVector v = root.getVector(idx);
+        return cellValue(root.getVector(idx), row);
+    }
+
+    /**
+     * 读取单元格 → 表达式值模型（表达式求值的<b>唯一取值入口</b>，{@link ScalarEvaluator} 共用）。
+     *
+     * <p>★Arrow 15 的 {@code DateDayVector.getObject(row)} 返回 {@link Integer}（epoch <b>天</b>），
+     * 而 {@code ScalarSupport.toZoned} / {@code ExprBuiltins.toZoned} 把任何 Number 当 epoch
+     * <b>毫秒</b>解析 —— 直接透传会让 {@code to_date(receipt_date)} / {@code year(d)} 等日期函数
+     * 全部落到 1970-01-01（20311 天被当成 20 秒）。这里在取值处把 DATE 列归一为
+     * {@link java.time.LocalDate}，与 TIMESTAMP 列 {@code getObject} 本就返回
+     * {@code LocalDateTime} 的口径对齐。</p>
+     *
+     * <p>varchar 列 getObject 返回 byte[] / Text：归一化为 String，保证字符串分组稳定可比。</p>
+     */
+    public static Object cellValue(FieldVector v, int row) {
         if (v.isNull(row)) return null;
+        if (v instanceof DateDayVector d) return java.time.LocalDate.ofEpochDay(d.get(row));
         Object val = v.getObject(row);
-        // varchar 列 getObject 返回 byte[] / Text：归一化为 String，保证字符串分组稳定可比
         if (val instanceof byte[] bytes) return new String(bytes, StandardCharsets.UTF_8);
         if (val instanceof org.apache.arrow.vector.util.Text text) return text.toString();
-        if (val instanceof java.sql.Timestamp || val instanceof java.sql.Date) return val;
         return val;
     }
 

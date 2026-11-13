@@ -50,6 +50,32 @@ public interface WorkerGateway {
                       BlockingQueue<ScanEvent> resultQueue);
 
     /**
+     * 派发一个分区扫描任务，可选<b>分片侧投影 + 就地写</b>（scan-sink：CTAS / INSERT 的纯扫描+投影形态）。
+     *
+     * <p>与 6 参重载的唯一区别是 {@code projection} / {@code sink}：</p>
+     * <ul>
+     *   <li>{@code projection} 非空 → Worker 扫完切片先投影（纯列投影 / 标量表达式投影）再处理；</li>
+     *   <li>{@code sink} 非空 → Worker 投影后<b>就地写目标表</b>，数据页<b>不回传 Master</b>，
+     *       只在完成时回传 {@link ScanEvent.ScanFinished#rows()}（写入行数）。</li>
+     * </ul>
+     *
+     * <p>默认实现抛 {@link UnsupportedOperationException}（调用方 Planner 据此回退 Master 写路径），
+     * 生产网关与本地测试网关须覆盖。</p>
+     */
+    default void dispatchScan(String workerId, String jobId, String taskId,
+                              String catalog, ScanSlice slice,
+                              FragmentSpec.SortLimitStep tail,
+                              FragmentSpec.ScanProjection projection,
+                              FragmentSpec.SinkStep sink,
+                              BlockingQueue<ScanEvent> resultQueue) {
+        if (projection == null && sink == null) {
+            dispatchScan(workerId, jobId, taskId, catalog, slice, tail, resultQueue);
+            return;
+        }
+        throw new UnsupportedOperationException("该 WorkerGateway 不支持扫描分片就地写");
+    }
+
+    /**
      * 取消一个已派发的分区任务（Master 主动放弃：查询失败 / 算子关闭）。
      *
      * <p>Worker 侧须中断该任务的执行线程并停止放事件；被取消的任务不再发终止事件。

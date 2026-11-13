@@ -62,6 +62,28 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
     /** 元数据缓存是否已过期。 */
     private volatile boolean cacheDirty = true;
 
+    /**
+     * 表统计短 TTL 缓存 —— <b>进程内静态共享</b>，跨 {@link #copy()} 实例生效。
+     *
+     * <p>Master 的 {@code ConnectorProvider} 每次取连接器都返回 {@code copy()}（新实例），实例级
+     * 缓存对同一次查询里的多次探查完全无效。而 {@code getTableStats} 一次要 3~4 次 JDBC 往返
+     * （system.tables + EXPLAIN ESTIMATE + 采样读 + system.columns），规划期并行度决策、
+     * Scan 进度分母、join 选型会反复探查同一批表 —— 远端 ClickHouse 上这就是「提交后算子
+     * 迟迟不展开」的数秒耗时。</p>
+     *
+     * <p>统计只用于并行度 / 算法选型 / 进度条，<b>不影响正确性</b>；60 秒 TTL 内复用快照可接受。</p>
+     */
+    private static final long STATS_CACHE_TTL_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(60);
+    private static final int STATS_CACHE_MAX_ENTRIES = 1024;
+    private static final ConcurrentHashMap<String, CachedTableStats> STATS_CACHE = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, CachedBytes> BYTES_CACHE = new ConcurrentHashMap<>();
+
+    private record CachedTableStats(long stampNanos, TableStats stats) {
+    }
+
+    private record CachedBytes(long stampNanos, long bytes) {
+    }
+
     /** Arrow 内存分配器，用于 JDBC → Arrow 转换。 */
     private final BufferAllocator allocator;
 
@@ -498,6 +520,12 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
         if (!catalogExists(catalog)) {
             throw new IllegalArgumentException("Catalog '" + catalog + "' does not exist");
         }
+        String cacheKey = jdbcUrl + '\u0001' + schema + '\u0001' + table;
+        long now = System.nanoTime();
+        CachedTableStats cached = STATS_CACHE.get(cacheKey);
+        if (cached != null && now - cached.stampNanos() < STATS_CACHE_TTL_NANOS) {
+            return cached.stats();
+        }
         // ① 元数据真实体积（无权限 → [-1,-1]）→ ② 整表 EXPLAIN 行数 × 采样平均行长 → ③ 未知
         long[] raw = fetchRawStats(schema, table);
         JdbcSizeEstimator.Estimate est = JdbcSizeEstimator.estimate(this, catalog, schema, table, null,
@@ -509,7 +537,29 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
             // 列统计权限不足 → 降级为空，不拖垮整表统计（体积/行数才是 join 选型要的）
             cols = List.of();
         }
-        return new TableStats(catalog, schema, table, est.rowCount(), est.byteSize(), cols);
+        TableStats stats = new TableStats(catalog, schema, table, est.rowCount(), est.byteSize(), cols);
+        // 全未知（权限 / 探查失败）不缓存：下次可能恢复，别让一次抖动影响 60 秒
+        if (stats.rowCount() > 0 || stats.byteSize() > 0) {
+            putCached(STATS_CACHE, cacheKey, new CachedTableStats(now, stats));
+        }
+        return stats;
+    }
+
+    /** 写入统计缓存；超过上限先清过期项，仍满则整体清空（统计只是启发式，不做精细淘汰）。 */
+    private static <V> void putCached(ConcurrentHashMap<String, V> cache, String key, V value) {
+        if (cache.size() >= STATS_CACHE_MAX_ENTRIES) {
+            long now = System.nanoTime();
+            cache.entrySet().removeIf(e -> {
+                Object v = e.getValue();
+                long stamp = v instanceof CachedTableStats t ? t.stampNanos()
+                        : v instanceof CachedBytes b ? b.stampNanos() : now;
+                return now - stamp >= STATS_CACHE_TTL_NANOS;
+            });
+            if (cache.size() >= STATS_CACHE_MAX_ENTRIES) {
+                cache.clear();
+            }
+        }
+        cache.put(key, value);
     }
 
     /**
@@ -575,9 +625,21 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
         if (!catalogExists(catalog)) {
             return -1L;
         }
+        String cacheKey = jdbcUrl + '\u0001' + schema + '\u0001' + table + '\u0001'
+                + (filter == null ? "" : filter);
+        long now = System.nanoTime();
+        CachedBytes cached = BYTES_CACHE.get(cacheKey);
+        if (cached != null && now - cached.stampNanos() < STATS_CACHE_TTL_NANOS) {
+            return cached.bytes();
+        }
         long[] raw = fetchRawStats(schema, table);
-        return JdbcSizeEstimator.estimate(this, catalog, schema, table, filter,
+        long bytes = JdbcSizeEstimator.estimate(this, catalog, schema, table, filter,
             raw[0], raw[1], f -> explainRows(schema, table, f), SIZE_SAMPLE_ROWS).byteSize();
+        // 未知（-1）不缓存：本次规划按未知走保守算法，下一次探查可能成功
+        if (bytes > 0) {
+            putCached(BYTES_CACHE, cacheKey, new CachedBytes(now, bytes));
+        }
+        return bytes;
     }
 
     @Override

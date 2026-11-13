@@ -112,6 +112,33 @@
              tab 列表由 js/sql-console.js 渲染；＋ 新建，打开 读本地 .sql/.txt。 -->
         <div class="sql-console-tabs-bar">
           <div class="sql-console-tabs" id="sql-console-tabs"></div>
+          <!-- 默认 catalog：编辑器里可直接写两段式 schema.table，提交时自动补全成
+               catalog.schema.table（见 js/catalog.js completeCatalogQualifiers）。 -->
+          <div class="sql-catalog-pick" id="sql-catalog-pick"
+               title="当前 catalog：编辑器里可直接写 schema.table，提交时自动补全">
+            <svg class="sql-catalog-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <ellipse cx="12" cy="5" rx="8" ry="3"/>
+              <path d="M4 5v14c0 1.66 3.58 3 8 3s8-1.34 8-3V5"/>
+              <path d="M4 12c0 1.66 3.58 3 8 3s8-1.34 8-3"/>
+            </svg>
+            <span class="sql-catalog-label">Catalog</span>
+            <!-- 自绘下拉：原生 select 只作为取值/选项的数据源（视觉隐藏），
+                 弹层由 js/catalog.js 渲染，样式与整套 UI 一致，不再跟随系统原生菜单。 -->
+            <button type="button" class="sql-catalog-btn" id="sql-catalog-btn"
+                    aria-haspopup="listbox" aria-expanded="false" aria-label="选择默认 catalog">
+              <span class="sql-catalog-current" id="sql-catalog-current">—</span>
+              <svg class="sql-catalog-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M6 9l6 6 6-6"/>
+              </svg>
+            </button>
+            <select id="sql-catalog-select" class="sql-catalog-select"
+                    tabindex="-1" aria-hidden="true"
+                    onchange="onSqlCatalogChange()" aria-label="默认 catalog"></select>
+            <div class="sql-catalog-menu hidden" id="sql-catalog-menu"
+                 role="listbox" aria-label="catalog 列表"></div>
+          </div>
           <button type="button" class="sql-console-icon-btn" id="sql-new-console-btn"
                   title="新增查询控制台">＋</button>
           <button type="button" class="sql-console-icon-btn" id="sql-open-file-btn"
@@ -141,7 +168,7 @@
           <div class="sql-editor-body">
             <pre class="sql-highlight" id="sql-highlight" aria-hidden="true"><code id="sql-highlight-code"></code></pre>
             <textarea id="query-input" class="sql-editor" spellcheck="false"
-                      placeholder="输入 SQL 执行（Ctrl + Enter 运行；选中一段则只运行选中部分；多条语句用分号分隔，将按顺序串行执行。例如 select * from mysql.dga.users limit 10）"
+                      placeholder="输入 SQL 执行（Ctrl + Enter 运行；选中一段则只运行选中部分；多条语句用分号分隔，将按顺序串行执行。右侧选择 catalog 后可直接写 schema.table，例如 select * from dga.users limit 10）"
                       onkeydown="if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();submitQuery();}"></textarea>
           </div>
         </div>

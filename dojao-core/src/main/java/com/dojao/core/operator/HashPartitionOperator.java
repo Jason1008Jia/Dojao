@@ -648,7 +648,6 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
         int[] pids = distribution == FragmentSpec.Distribution.FIXED
                 ? fixedPartitions(rowCount)
                 : computePartitionsBulk(root, rowCount, keyIndices);
-
         // 2. 统计每个分区收多少行
         int[] counts = new int[numPartitions];
         for (int pid : pids) counts[pid]++;

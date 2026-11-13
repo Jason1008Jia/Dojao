@@ -538,23 +538,27 @@ public final class ResourceConfig {
     //       生效，派生只在「未显式设置」时兜底 —— 存量部署零改动。
 
     /** 本节点（按 role 口径；{@code both} 取 worker）内存总量键。 */
-    private static String nodeMemoryKey() {
-        return ROLE == Role.MASTER ? SYSTEM_MASTER_MEMORY : SYSTEM_WORKER_MEMORY;
+    private static String nodeMemoryKey(Role role) {
+        return role == Role.MASTER ? SYSTEM_MASTER_MEMORY : SYSTEM_WORKER_MEMORY;
     }
 
-    private static String nodeHeapKey() {
-        return ROLE == Role.MASTER ? SYSTEM_MASTER_HEAP : SYSTEM_WORKER_HEAP;
+    private static String nodeHeapKey(Role role) {
+        return role == Role.MASTER ? SYSTEM_MASTER_HEAP : SYSTEM_WORKER_HEAP;
     }
 
-    private static String nodeDirectKey() {
-        return ROLE == Role.MASTER ? SYSTEM_MASTER_DIRECT : SYSTEM_WORKER_DIRECT;
+    private static String nodeDirectKey(Role role) {
+        return role == Role.MASTER ? SYSTEM_MASTER_DIRECT : SYSTEM_WORKER_DIRECT;
     }
 
     /** 是否显式声明了节点内存（总量 / 堆 / 堆外任一）—— 决定是否启用派生（否则保持旧默认）。 */
     private static boolean nodeMemoryConfigured() {
-        return sizeValue(nodeMemoryKey(), 0L) > 0
-                || sizeValue(nodeHeapKey(), 0L) > 0
-                || sizeValue(nodeDirectKey(), 0L) > 0;
+        return nodeMemoryConfigured(ROLE);
+    }
+
+    private static boolean nodeMemoryConfigured(Role role) {
+        return sizeValue(nodeMemoryKey(role), 0L) > 0
+                || sizeValue(nodeHeapKey(role), 0L) > 0
+                || sizeValue(nodeDirectKey(role), 0L) > 0;
     }
 
     /** {@code query.memory.max} 是否显式配置。 */
@@ -644,7 +648,11 @@ public final class ResourceConfig {
      * 片段预算要摊的是 Arrow 实际能用的额度；用 JVM 全量会把每个片段放大，并发时过早撞 Arrow 上限。</p>
      */
     private static long fragmentDirectBytes() {
-        long nodeDirect = arrowDirectBudgetBytes();
+        return fragmentDirectBytes(ROLE);
+    }
+
+    private static long fragmentDirectBytes(Role role) {
+        long nodeDirect = arrowDirectBudgetBytes(role);
         long qmax = sizeValue(QUERY_MEMORY_MAX, 0L);
         long budget = qmax > 0
                 ? Math.min((long) (qmax * (1.0 - memoryHeapRatio())), nodeDirect)
@@ -666,17 +674,30 @@ public final class ResourceConfig {
      * &gt; 旧默认 2G。</p>
      */
     public static long slotMemoryBytes() {
+        return slotMemoryBytes(ROLE);
+    }
+
+    /**
+     * 指定角色的每 query 算子内存预算 —— <b>算子跑在哪一侧就用哪一侧的口径</b>。
+     *
+     * <p>Master 规划分布式算子时传 {@link Role#WORKER}：片段随计划下发到 Worker 执行，
+     * 预算必须按 Worker 的内存派生。若沿用 Master 口径，小内存 Master（如随包默认
+     * {@code system.master.memory = 2g}）会把 slot 压到 32M 下限并<b>随片段下发</b>，
+     * 结果 Worker 明明有 5g 也按 32M 溢写，JoinDecider 看到的预算同样失真 → 大表 join
+     * 全量退化 sort_merge。</p>
+     */
+    public static long slotMemoryBytes(Role role) {
         long explicit = sizeValue(QUERY_SLOT_MEMORY, 0L);
         if (explicit > 0) {
             return explicit;
         }
-        if (!nodeMemoryConfigured() && !queryMemoryMaxConfigured()) {
+        if (!nodeMemoryConfigured(role) && !queryMemoryMaxConfigured()) {
             return Math.max(1L, sizeValue(QUERY_SLOT_MEMORY, DEFAULT_SLOT_MEMORY_BYTES));
         }
         // 用 double 除（不可先 (long) 截断 3×0.8=2.4→2）：截断会把 slot 放大 20%，
         // 使三槽峰值 3×slot×ratio 反而超过 fragmentDirect，破坏「本片段全部算子并存也放得下」的保证。
         double divisor = Math.max(1.0, SLOT_PIPELINE * spillRatio());
-        return Math.max(MIN_SLOT_MEMORY_BYTES, (long) (fragmentDirectBytes() / divisor));
+        return Math.max(MIN_SLOT_MEMORY_BYTES, (long) (fragmentDirectBytes(role) / divisor));
     }
 
     /**

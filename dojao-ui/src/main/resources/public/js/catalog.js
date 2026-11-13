@@ -6,6 +6,7 @@
 // 懒加载：点开才拉下一级。展开到表级别后，点表把「列信息」逐行铺在表下面。
 // 表引用（catalog.schema.table）只通过**拖拽**落到 SQL 编辑器（点表不再回填）。
 // 右键节点 → 「刷新」：重拉该节点的下一级（服务端不推送元数据变更，新建的表靠这个刷出来）。
+// catalog 节点额外有「删除 Catalog」：二次确认后执行 DROP CATALOG（只注销元数据，不动数据源数据）。
 
 var CATALOG_ARROW_OPEN = '\u2212';    // −（已展开）
 var CATALOG_ARROW_CLOSED = '+';       // +（可展开）
@@ -22,6 +23,8 @@ function loadCatalogTree() {
     return httpGet('/api/metadata/catalogs')
         .then(function (d) {
             var cats = (d && d.catalogs) || [];
+            // 编辑器右侧的「默认 catalog」下拉框与目录树同源，同一份列表一起刷新
+            populateSqlCatalogSelect(cats);
             if (!cats.length) {
                 box.innerHTML = '<div class="catalog-empty">（无 catalog）</div>';
                 return;
@@ -32,6 +35,7 @@ function loadCatalogTree() {
             });
         })
         .catch(function (err) {
+            populateSqlCatalogSelect([]);
             box.innerHTML = '<div class="catalog-error">目录加载失败：'
                 + esc(oneLine(err && err.message ? err.message : err, 100)) + '</div>';
         });
@@ -50,6 +54,396 @@ function refreshCatalogTree() {
     loadCatalogTree().then(function () {
         if (btn) { btn.disabled = false; btn.classList.remove('spinning'); }
     });
+}
+
+/**
+ * 删除 catalog 的二次确认弹窗（危险操作，绝不点一下就删）。
+ *
+ * <p>确认后调 {@code DELETE /api/catalog/{name}}（服务端执行 DROP CATALOG）：只注销
+ * 元数据注册，数据源里的数据原样保留；删除成功重拉整棵树与默认 catalog 下拉框。</p>
+ */
+function confirmDeleteCatalog(catalog) {
+    var overlay = mgModal('删除 Catalog',
+        '<div class="mg-confirm">'
+        + '<span class="mg-confirm-ico">'
+        + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"'
+        + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+        + '<path d="M10.3 3.9 1.9 18a2 2 0 0 0 1.7 3h16.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
+        + '<path d="M12 9v5"/><path d="M12 17.6h.01"/></svg></span>'
+        + '<div class="mg-confirm-main">'
+        + '<div class="mg-confirm-title">确定删除 Catalog「<b>' + esc(catalog) + '</b>」？</div>'
+        + '<div class="mg-confirm-desc">只会注销元数据注册，<b>不会删除数据源中的任何数据</b>。'
+        + '删除后该 Catalog 下的表将无法再通过 Dojao 访问，且此操作不可撤销。</div>'
+        + '</div></div>'
+        + '<div class="mg-actions">'
+        + '<button type="button" class="mg-btn" data-act="cancel">取消</button>'
+        + '<button type="button" class="mg-btn danger" data-act="delete">删除 Catalog</button>'
+        + '</div>');
+    overlay.querySelector('.mg-modal').classList.add('mg-modal-sm');
+    overlay.querySelector('[data-act="cancel"]').onclick = mgClose;
+    overlay.querySelector('[data-act="delete"]').onclick = function () {
+        var btn = overlay.querySelector('[data-act="delete"]');
+        var cancel = overlay.querySelector('[data-act="cancel"]');
+        btn.disabled = true;
+        cancel.disabled = true;
+        btn.textContent = '删除中\u2026';
+        httpDelete('/api/catalog/' + encodeURIComponent(catalog))
+            .then(function (d) {
+                mgClose();
+                showToast((d && d.message) || ('Catalog ' + catalog + ' 已删除'));
+                refreshCatalogTree();
+            })
+            .catch(function (err) {
+                btn.disabled = false;
+                cancel.disabled = false;
+                btn.textContent = '删除';
+                showToast('删除失败：' + (err && err.message ? err.message : err));
+            });
+    };
+}
+
+// ==================== 编辑器默认 catalog：两段式 schema.table 自动补全 ====================
+//
+// 编辑器工具栏右侧的 catalog 下拉框 = 「当前 catalog」。选中后用户可以直接写两段式
+// `schema.table`，提交前补全成引擎要的三段式 `catalog.schema.table`（见
+// completeCatalogQualifiers，由 dashboard.js 的 doSubmitQuery 调用）。
+//
+// ★补全只在「表引用位置」进行（FROM / JOIN / INTO / UPDATE / TABLE 之后，以及 FROM 列表的
+//   逗号之后），且两段的第一段必须是该 catalog 下真实的 schema —— 否则 `SELECT u.user_id`
+//   这类「别名.列」会被误补成 `catalog.u.user_id`。
+
+var SQL_CATALOG_PREF_KEY = 'dojao.sql.catalog';
+/** catalog -> [schema]（选中时预取，供「第一段是不是 schema」判定）。 */
+var sqlCatalogSchemas = {};
+
+/** 当前选中的默认 catalog（'' = 未选择 / 未加载）。 */
+function sqlCatalogSelection() {
+    var sel = document.getElementById('sql-catalog-select');
+    return sel ? sel.value : '';
+}
+
+/**
+ * 用顶层 catalog 列表刷新下拉框（记住上次选择；已不存在的选择退回第一个）。
+ * 由 {@link loadCatalogTree} 调用 —— 目录树与下拉框永远来自同一份列表。
+ */
+function populateSqlCatalogSelect(catalogs) {
+    var sel = document.getElementById('sql-catalog-select');
+    if (!sel) return;
+    var cats = catalogs || [];
+    var saved = '';
+    try { saved = localStorage.getItem(SQL_CATALOG_PREF_KEY) || ''; } catch (e) { saved = ''; }
+    sel.innerHTML = '';
+    if (!cats.length) {
+        var none = document.createElement('option');
+        none.value = '';
+        none.textContent = '（无 catalog）';
+        sel.appendChild(none);
+        sel.disabled = true;
+        sel.title = '没有可用的 catalog：需写完整的 catalog.schema.table';
+        syncSqlCatalogPick();
+        return;
+    }
+    sel.disabled = false;
+    cats.forEach(function (c) {
+        var opt = document.createElement('option');
+        opt.value = c;
+        opt.textContent = c;
+        sel.appendChild(opt);
+    });
+    sel.value = cats.indexOf(saved) >= 0 ? saved : cats[0];
+    try { localStorage.setItem(SQL_CATALOG_PREF_KEY, sel.value); } catch (e) { /* 隐私模式忽略 */ }
+    syncSqlCatalogPick();
+    loadSqlCatalogSchemas(sel.value);
+}
+
+/** 下拉框切换：记住选择 + 预取该 catalog 的 schema 列表。 */
+function onSqlCatalogChange() {
+    var sel = document.getElementById('sql-catalog-select');
+    if (!sel) return;
+    try { localStorage.setItem(SQL_CATALOG_PREF_KEY, sel.value || ''); } catch (e) { /* 隐私模式忽略 */ }
+    syncSqlCatalogPick();
+    loadSqlCatalogSchemas(sel.value);
+}
+
+// ---------------- 自绘 catalog 下拉（原生 select 只作为数据源）----------------
+
+/** 把隐藏 select 的当前值 / 可用性 / 提示同步到自绘胶囊。 */
+function syncSqlCatalogPick() {
+    var sel = document.getElementById('sql-catalog-select');
+    var pick = document.getElementById('sql-catalog-pick');
+    var btn = document.getElementById('sql-catalog-btn');
+    var cur = document.getElementById('sql-catalog-current');
+    if (!sel || !pick || !btn || !cur) return;
+    cur.textContent = sel.value || '（无 catalog）';
+    btn.disabled = !!sel.disabled;
+    pick.title = sel.title || '当前 catalog';
+    pick.classList.toggle('disabled', !!sel.disabled);
+    if (sel.disabled) closeSqlCatalogMenu();
+}
+
+/** 按 select 的 options 渲染下拉弹层（当前项高亮）。 */
+function renderSqlCatalogMenu() {
+    var sel = document.getElementById('sql-catalog-select');
+    var menu = document.getElementById('sql-catalog-menu');
+    if (!sel || !menu) return;
+    menu.innerHTML = '';
+    if (!sel.options.length) {
+        menu.innerHTML = '<div class="sql-catalog-opt-empty">（无 catalog）</div>';
+        return;
+    }
+    Array.prototype.forEach.call(sel.options, function (opt) {
+        var row = document.createElement('div');
+        var active = (opt.value === sel.value);
+        row.className = 'sql-catalog-opt' + (active ? ' active' : '');
+        row.setAttribute('role', 'option');
+        row.setAttribute('aria-selected', active ? 'true' : 'false');
+        row.textContent = opt.textContent;
+        row.title = opt.value;
+        row.onclick = function () {
+            sel.value = opt.value;
+            closeSqlCatalogMenu();
+            onSqlCatalogChange();   // 记住选择 + 预取 schema + 同步胶囊
+        };
+        menu.appendChild(row);
+    });
+}
+
+/** 开 / 关下拉弹层。 */
+function toggleSqlCatalogMenu(force) {
+    var menu = document.getElementById('sql-catalog-menu');
+    var pick = document.getElementById('sql-catalog-pick');
+    var btn = document.getElementById('sql-catalog-btn');
+    if (!menu || !pick || !btn || btn.disabled) return;
+    var open = (typeof force === 'boolean') ? force : menu.classList.contains('hidden');
+    if (!open) { closeSqlCatalogMenu(); return; }
+    renderSqlCatalogMenu();
+    menu.classList.remove('hidden');
+    pick.classList.add('open');
+    btn.setAttribute('aria-expanded', 'true');
+}
+
+/** 收起下拉弹层（幂等）。 */
+function closeSqlCatalogMenu() {
+    var menu = document.getElementById('sql-catalog-menu');
+    var pick = document.getElementById('sql-catalog-pick');
+    var btn = document.getElementById('sql-catalog-btn');
+    if (menu) menu.classList.add('hidden');
+    if (pick) pick.classList.remove('open');
+    if (btn) btn.setAttribute('aria-expanded', 'false');
+}
+
+/** 绑定自绘下拉（首页初始化调一次）。 */
+function bindSqlCatalogPicker() {
+    var btn = document.getElementById('sql-catalog-btn');
+    if (!btn || btn.dataset.bound) return;
+    btn.dataset.bound = '1';
+    btn.onclick = function (e) {
+        e.stopPropagation();
+        toggleSqlCatalogMenu();
+    };
+    // 点胶囊外面收起（捕获阶段：内部点击先判定 contains，弹层选项不受影响）
+    document.addEventListener('mousedown', function (e) {
+        var pick = document.getElementById('sql-catalog-pick');
+        if (pick && !pick.contains(e.target)) closeSqlCatalogMenu();
+    }, true);
+    document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape') closeSqlCatalogMenu();
+    });
+    window.addEventListener('resize', closeSqlCatalogMenu);
+    window.addEventListener('scroll', closeSqlCatalogMenu, true);
+    syncSqlCatalogPick();
+}
+
+/** 拉某 catalog 的 schema 名字（只用于补全判定，不做任何展示）。 */
+function loadSqlCatalogSchemas(catalog) {
+    var sel = document.getElementById('sql-catalog-select');
+    if (!catalog) {
+        if (sel) sel.title = '未选择 catalog：需写完整的 catalog.schema.table';
+        syncSqlCatalogPick();
+        return Promise.resolve();
+    }
+    return httpGet('/api/metadata/catalogs/' + encodeURIComponent(catalog) + '/schemas')
+        .then(function (d) {
+            sqlCatalogSchemas[catalog] = ((d && d.schemas) || []).slice();
+            if (sel) {
+                sel.title = '当前 catalog：' + catalog
+                    + '（编辑器可直接写 schema.table，提交时自动补全为 ' + catalog + '.schema.table）';
+            }
+            syncSqlCatalogPick();
+        })
+        .catch(function () {
+            sqlCatalogSchemas[catalog] = [];
+            if (sel) sel.title = '当前 catalog：' + catalog + '（schema 列表加载失败，不会自动补全）';
+            syncSqlCatalogPick();
+        });
+}
+
+/** 表引用位置的关键字（其后紧跟的标识符是表名）。 */
+var SQL_TABLE_REF_KEYWORDS = {
+    from: 1, join: 1, into: 1, update: 1, table: 1, truncate: 1, describe: 1
+};
+/** 结束表引用列表（FROM 子句的其余部分）的关键字。 */
+var SQL_TABLE_REF_END_KEYWORDS = {
+    where: 1, group: 1, having: 1, order: 1, limit: 1, union: 1, intersect: 1,
+    except: 1, qualify: 1, window: 1, on: 1, using: 1, set: 1, values: 1
+};
+/** 表名前后可能出现但从不是表名的关键字（`CREATE TABLE IF NOT EXISTS db.t` / `INSERT INTO TABLE db.t`）。 */
+var SQL_TABLE_REF_SKIP_KEYWORDS = { if: 1, not: 1, exists: 1, only: 1, table: 1 };
+
+/**
+ * 把编辑器 SQL 里的两段式表引用补全成三段式。
+ *
+ * <p>只改「表引用位置」且第一段命中当前 catalog 的真实 schema 的两段名；字符串、注释、
+ * 引号标识符内的文本原样保留。三段式（含更多段）不动，因此全限定的 SQL 完全不受影响。</p>
+ *
+ * @param {string} sql 用户书写的 SQL（可能是批量：按分号分隔）
+ * @return {string} 补全后的 SQL；无 catalog / 无 schema 信息时原样返回
+ */
+function completeCatalogQualifiers(sql) {
+    var text = String(sql || '');
+    var catalog = sqlCatalogSelection();
+    if (!catalog) return text;
+    var schemas = sqlCatalogSchemas[catalog];
+    if (!schemas || !schemas.length) return text;
+    var schemaSet = {};
+    schemas.forEach(function (s) { schemaSet[String(s).toLowerCase()] = 1; });
+    var catalogLower = catalog.toLowerCase();
+
+    var tokens = tokenizeSqlText(text);
+    var inFrom = false;      // 是否处在 FROM 的表引用列表里（逗号后是下一张表）
+    var expectTable = false; // 下一个标识符是否就是表名
+    var sawSelect = false;   // 当前括号层是否见过 SELECT：只有「语句里的 FROM」才是表引用
+    var lastIdent = '';      // 上一个标识符（`DELETE FROM` 的 FROM 前面是 delete）
+    var stack = [];          // 括号栈：进子查询时保存外层状态
+    var inserts = [];        // 待插入 `catalog.` 的位置（第一段表名的起始 offset）
+
+    for (var i = 0; i < tokens.length; i++) {
+        var t = tokens[i];
+        if (t.type === 'punct') {
+            if (t.text === '(') {
+                stack.push({ inFrom: inFrom, expectTable: expectTable, sawSelect: sawSelect });
+                inFrom = false;
+                expectTable = false;
+                sawSelect = false;
+            } else if (t.text === ')') {
+                var outer = stack.pop();
+                inFrom = outer ? outer.inFrom : false;
+                sawSelect = outer ? outer.sawSelect : false;
+                expectTable = false;    // ')' 后面跟的是派生表别名，不是表名
+            } else if (t.text === ',') {
+                if (inFrom) expectTable = true;
+            } else if (t.text === ';') {
+                inFrom = false;
+                expectTable = false;
+                sawSelect = false;
+                lastIdent = '';
+            }
+            continue;
+        }
+        if (t.type !== 'ident') continue;   // 字符串 / 引号标识符：不参与补全
+        var low = t.text.toLowerCase();
+
+        if (expectTable) {
+            if (SQL_TABLE_REF_SKIP_KEYWORDS[low]) continue;
+            // 收集表名的各段：a[.b[.c…]]
+            var j = i + 1;
+            var parts = 1;
+            while (j + 1 < tokens.length && tokens[j].type === 'punct' && tokens[j].text === '.'
+                    && tokens[j + 1].type === 'ident') {
+                parts++;
+                j += 2;
+            }
+            expectTable = false;
+            if (parts === 2) {
+                var first = t.text.toLowerCase();
+                if (first !== catalogLower && schemaSet[first]) inserts.push(t.start);
+            }
+            i = j - 1;   // parts 段已消费（含点号）
+            continue;
+        }
+
+        if (low === 'select') sawSelect = true;
+
+        if (SQL_TABLE_REF_KEYWORDS[low]) {
+            // ★ FROM 有两种：语句级 `SELECT … FROM t` / `DELETE FROM t` 才是表引用；
+            //   函数内部的 `TRIM(x FROM col)` / `EXTRACT(year FROM col)` 不是 —— 误判会把
+            //   `FROM col` 后面的列引用补成 catalog.schema.col。以此二判据区分。
+            var isTableFrom = low !== 'from' || sawSelect || lastIdent === 'delete';
+            if (isTableFrom) {
+                if (low === 'from' || low === 'join') inFrom = true;
+                expectTable = true;
+            }
+            lastIdent = low;
+            continue;
+        }
+        if (SQL_TABLE_REF_END_KEYWORDS[low]) {
+            inFrom = false;
+            expectTable = false;
+        }
+        lastIdent = low;
+    }
+
+    if (!inserts.length) return text;
+    inserts.sort(function (a, b) { return b - a; });
+    var out = text;
+    for (var k = 0; k < inserts.length; k++) {
+        out = out.slice(0, inserts[k]) + catalog + '.' + out.slice(inserts[k]);
+    }
+    return out;
+}
+
+/**
+ * 轻量 SQL 词法切分：只区分「标识符 / 标点 / 其它（字符串、引号标识符）」，
+ * 字符串与 `--`、`/* *\/` 注释整段吞掉——补全绝不能改到它们的内容。
+ *
+ * @return {Array<{type:string, text:string, start:number, end:number}>}
+ */
+function tokenizeSqlText(text) {
+    var out = [];
+    var i = 0;
+    var n = text.length;
+    function isIdentStart(ch) { return /[A-Za-z_]/.test(ch); }
+    function isIdentPart(ch) { return /[A-Za-z0-9_$]/.test(ch); }
+
+    while (i < n) {
+        var ch = text.charAt(i);
+        if (/\s/.test(ch)) { i++; continue; }
+        if (ch === '-' && text.charAt(i + 1) === '-') {
+            i += 2;
+            while (i < n && text.charAt(i) !== '\n') i++;
+            continue;
+        }
+        if (ch === '/' && text.charAt(i + 1) === '*') {
+            i += 2;
+            while (i < n && !(text.charAt(i) === '*' && text.charAt(i + 1) === '/')) i++;
+            i = Math.min(n, i + 2);
+            continue;
+        }
+        if (ch === "'" || ch === '"' || ch === '`' || ch === '[') {
+            var close = ch === '[' ? ']' : ch;
+            var qs = i++;
+            while (i < n) {
+                if (text.charAt(i) === close) {
+                    // `''` / `""` / `` `` `` 为转义，继续吞
+                    if (close !== ']' && text.charAt(i + 1) === close) { i += 2; continue; }
+                    i++;
+                    break;
+                }
+                i++;
+            }
+            out.push({ type: 'other', text: text.slice(qs, i), start: qs, end: i });
+            continue;
+        }
+        if (isIdentStart(ch)) {
+            var s = i++;
+            while (i < n && isIdentPart(text.charAt(i))) i++;
+            out.push({ type: 'ident', text: text.slice(s, i), start: s, end: i });
+            continue;
+        }
+        out.push({ type: 'punct', text: ch, start: i, end: i + 1 });
+        i++;
+    }
+    return out;
 }
 
 /**
@@ -197,7 +591,17 @@ function buildTreeNode(label, level, path, meta) {
     row.oncontextmenu = function (e) {
         e.preventDefault();      // 屏蔽浏览器原生菜单
         e.stopPropagation();
-        showContextMenu([{ label: menuLabel, onClick: loadChildren }], e.clientX, e.clientY);
+        var items = [{ label: menuLabel, onClick: loadChildren }];
+        // catalog 节点额外提供删除；schema / table 只刷新
+        if (level === 'catalog') {
+            items.push({ sep: true });
+            items.push({
+                label: '删除 Catalog',
+                danger: true,
+                onClick: function () { confirmDeleteCatalog(path[0]); }
+            });
+        }
+        showContextMenu(items, e.clientX, e.clientY);
     };
 
     return node;

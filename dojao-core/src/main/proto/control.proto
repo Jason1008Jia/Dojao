@@ -239,6 +239,10 @@ message JoinStepMsg {
   // 外连接仍按孤儿行输出（保留侧不能提前过滤掉整行）。
   string on_left_filter = 10;
   string on_right_filter = 11;
+  // JOIN ON 等值键含表达式时，左右两侧需在 Worker 本地 join 之前物化的合成列
+  // （derivedColumn 为哨兵名，exprText 为去限定符后的表达式）。空 = 无表达式键（旧行为）。
+  repeated GroupKeyExpressionMsg left_computed = 12;
+  repeated GroupKeyExpressionMsg right_computed = 13;
 }
 
 message JoinAliasMsg {
@@ -362,6 +366,15 @@ message SinkStepMsg {
   repeated string target_columns = 4;
 }
 
+// 扫描分片侧投影（scan-sink 就地写）：Worker 扫完切片后先投影（透传列按 output_columns 顺序
+// 组装，计算列由 expressions 求值），再写 SinkStepMsg 指定的目标表。expressions 为空 = 纯列投影
+// （ProjectOperator 语义），非空 = 标量表达式投影（ScalarProjectOperator 语义）。
+message ScanProjectionMsg {
+  repeated string output_columns = 1;                       // 最终输出列顺序
+  repeated string computed_columns = 2;                     // 其中由表达式计算出的列名
+  repeated GroupKeyExpressionMsg expressions = 3;           // 表达式列：derived_column = 输出列名
+}
+
 // 顶层 ORDER BY + LIMIT/OFFSET 的片内截断尾（top-N 下推）：挂在最终产生结果的分区流尾部，
 // Worker 本地按 order_by_keys 排序后只回传前 offset+limit 行（Master 再在候选集上做全局
 // 排序取 [offset, offset+limit)）。order_by_keys ∈ 该分片输出 schema（升/降见 ascending）。
@@ -382,6 +395,13 @@ message ProducerMsg {
   PartitionStepMsg partition = 4;
   repeated GroupKeyExpressionMsg group_key_expressions = 5;   // 空 = 无 GROUP BY 表达式派生列
   ExpandStepMsg expand = 6;                                   // 未设置 = 无多维聚合展开
+  // 投影后行级过滤（外层 WHERE 下推到派生关系、引用派生别名）：派生列物化之后、哈希分区之前
+  // 逐行求值 —— 别名列此时已在页中，不把整侧派生表推回物化路径。
+  string filter_after_project = 7;
+  // 投影型派生源的声明输出列（内层 SELECT 输出列，按声明顺序）：非空 → 扫描列 + 派生列物化 +
+  // 过滤之后只保留这些列。派生关系的对外 schema 就是它；不裁剪会让基表扫描列（含与派生列同名的
+  // 列）泄漏进 join 页，下游按名解析取到错误的列（外连接孤儿行被填上错误的值）。
+  repeated string output_columns = 8;
 }
 
 message ConsumerMsg {
@@ -519,6 +539,11 @@ message DispatchScanRequest {
   // 切片私有载荷（连接器自定义字节，引擎只搬运不解释）。空 = 整表切片（用 request 直接读），
   // 也是老 Master / 谓词型连接器（MySQL / PostgreSQL）的常态。
   bytes split_payload = 9;
+  // 扫描分片侧投影（可空）：Worker 扫描后先按此投影再处理 sink / 回传。
+  ScanProjectionMsg projection = 10;
+  // 分片就地写目标（可空）：非空 → Worker 投影后直接写目标表，不回传数据页，只回传
+  // FINISHED(row_count)。数据永不经过 Master（CTAS / INSERT INTO 的纯扫描+投影形态）。
+  SinkStepMsg sink = 11;
 }
 
 message DispatchFragmentRequest {

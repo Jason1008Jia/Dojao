@@ -51,7 +51,7 @@ public final class NetworkScanResultQueue extends AbstractQueue<ScanEvent>
     private void send(ScanEvent e) {
         switch (e) {
             case ScanEvent.ScanPage p -> stream.sendPage(p.page());
-            case ScanEvent.ScanFinished f -> stream.finished();
+            case ScanEvent.ScanFinished f -> stream.finished(f.rows());   // scan-sink 写入行数经 FINISHED 回传
             case ScanEvent.ScanFailed f -> stream.failed(f.cause());
         }
     }

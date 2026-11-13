@@ -18,10 +18,10 @@ public final class ConditionalFunctions {
     }
 
     public static void registerAll() {
-        reg("nvl", "空值替换 nvl(a,b)：a 为 null 返回 b，否则 a", args -> {
-            ScalarSupport.requireArity("nvl", args, 2);
-            return args[0] != null ? args[0] : args[1];
-        });
+        reg("nvl", "空值替换 nvl(a,b)：a 为 null 返回 b，否则 a", nvl("nvl"));
+        // MySQL / ClickHouse 写法，与 nvl 完全等价（if_null 见 ClickHouse ifNull）
+        reg("ifnull", "空值替换 ifnull(a,b)：a 为 null 返回 b，否则 a", nvl("ifnull"));
+        reg("if_null", "空值替换 if_null(a,b)：a 为 null 返回 b，否则 a", nvl("if_null"));
         reg("coalesce", "首个非 null 值（全 null → null）", args -> {
             ScalarSupport.requireAtLeast("coalesce", args, 1);
             for (Object a : args) {
@@ -55,6 +55,14 @@ public final class ConditionalFunctions {
 
     private static void reg(String name, String display, Function<Object[], Object> impl) {
         ScalarFunctionRegistry.register(ScalarSupport.fn(name, display, impl));
+    }
+
+    /** 二参数空值替换实现（nvl / ifnull / if_null 共用；错误消息带实际函数名）。 */
+    private static Function<Object[], Object> nvl(String name) {
+        return args -> {
+            ScalarSupport.requireArity(name, args, 2);
+            return args[0] != null ? args[0] : args[1];
+        };
     }
 
     /** 等值判定：两数值按 double 值比较；其余按字符串比较。 */

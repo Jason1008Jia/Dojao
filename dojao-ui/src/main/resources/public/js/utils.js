@@ -47,6 +47,7 @@ function httpJson(method, path, body) {
 }
 var httpGet = function (p) { return httpJson('GET', p); };
 var httpPost = function (p, b) { return httpJson('POST', p, b); };
+var httpDelete = function (p) { return httpJson('DELETE', p); };
 
 // ==================== 格式化 ====================
 

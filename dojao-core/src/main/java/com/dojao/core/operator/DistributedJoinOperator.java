@@ -158,6 +158,32 @@ public class DistributedJoinOperator extends AbstractDistributedOperator
     }
 
     /**
+     * 带算法 + 列裁剪 + ON 单侧残差谓词 + <b>ON 表达式键</b>的单 join 构造。
+     *
+     * <p>{@code leftComputed} / {@code rightComputed} 是该侧 ON 表达式物化出的合成列
+     * （发送端在哈希分区前追加到页尾，键名即合成列名）；空列表 = 无表达式键。</p>
+     */
+    public DistributedJoinOperator(String queryId,
+                                   String leftCatalog, String leftSchema, String leftTable, List<String> leftKeys,
+                                   String rightCatalog, String rightSchema, String rightTable, List<String> rightKeys,
+                                   JoinType joinType, long memoryLimit, int numPartitions,
+                                   WorkerGateway gateway, DojaoConnector leftProbe, DojaoConnector rightProbe,
+                                   List<WorkerRegistration> workers,
+                                   String leftFilter, String rightFilter,
+                                   FragmentSpec.JoinAlgorithm algorithm,
+                                   List<String> leftColumns, List<String> rightColumns,
+                                   String onLeftFilter, String onRightFilter,
+                                   List<GroupKeyExpression> leftComputed,
+                                   List<GroupKeyExpression> rightComputed) {
+        this(queryId, leftCatalog, leftSchema, leftTable, leftKeys, leftProbe, leftFilter,
+                List.of(new JoinLink(leftKeys, rightKeys, joinType,
+                        rightCatalog, rightSchema, rightTable, rightProbe, rightFilter, algorithm,
+                        rightColumns, null, onLeftFilter, onRightFilter)
+                        .withKeyComputed(leftComputed, rightComputed)),
+                memoryLimit, numPartitions, gateway, workers, null, leftColumns);
+    }
+
+    /**
      * 完整构造（多 join 链 / 带 followUp）：{@code followUp} 非 null 时最末层 Consumer 链式执行
      * 聚合 / 窗口（worker 本地 join → 本地后续计算 → 回传，零二次交换，master 不吸原始 join 行）。
      *
@@ -503,13 +529,24 @@ public class DistributedJoinOperator extends AbstractDistributedOperator
         //      firstColumns / link.rightColumns()（空 = 全列），否则空桶退回声明值时列数会与其他分区不同。
         //   b) ChainedJoinConsumer（followUp 非 null）：在 a) 的 join 输出上再做同 key 聚合 / 窗口 ——
         //      聚合 = 分组键列 + 聚合结果列；窗口 = join 全列 + 窗口函数列。
-        List<Field> wire = new ArrayList<>(
-                sourceFields(0, firstProbe, firstCatalog, firstSchema, firstTable, firstColumns));
+        List<Field> base0 = sourceFields(0, firstProbe, firstCatalog, firstSchema, firstTable, firstColumns);
+        // T0 页尾先物化第 1 层的 ON 表达式键（推导不出类型 → 保持未声明，回退首条页 schema）
+        List<Field> firstWire = appendJoinKeyComputed(base0,
+                links.isEmpty() ? List.of() : links.get(0).leftComputed());
+        List<Field> wire = firstWire != null ? new ArrayList<>(firstWire) : new ArrayList<>(base0);
         int idx = 1;
-        for (JoinLink link : links) {
+        for (int k = 0; k < links.size(); k++) {
+            JoinLink link = links.get(k);
             List<Field> right = sourceFields(idx, link.rightProbe(), link.rightCatalog(), link.rightSchema(),
                     link.rightTable(), link.rightColumns());
+            List<Field> rightExpanded = appendJoinKeyComputed(right, link.rightComputed());
+            if (rightExpanded != null) right = rightExpanded;
             wire = joinOutputFields(link.joinType(), wire, right, link.leftKeys(), link.rightKeys());
+            // 本层输出是下一层的左页：下一层的 ON 表达式键在重分区前物化（页尾）
+            if (k + 1 < links.size()) {
+                List<Field> next = appendJoinKeyComputed(wire, links.get(k + 1).leftComputed());
+                if (next != null) wire = next;
+            }
             idx++;
         }
         if (!windowChain.isEmpty()) {

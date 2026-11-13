@@ -22,8 +22,10 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -297,6 +299,43 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
                 continue;
             }
             out.add(rf);
+        }
+        return out;
+    }
+
+    /**
+     * JOIN ON 表达式键的<b>合成列声明</b>：把这些派生列（合成列名 + 表达式文本）的静态类型追加到
+     * {@code base} 之后 —— 顺序与 Worker 侧 {@code ExpressionProjectOperator} 追加的实际页列严格
+     * 一致（都在页面末尾）。
+     *
+     * <p><b>同名覆盖</b>：合成列名与 {@code base} 中已有列同名时，旧列必须<b>丢弃</b>（不是追加第二份）——
+     * 与 {@code ExpressionProjectOperator} 的覆盖语义一致。链式 join 每层都复用同一合成列名
+     * （如 {@code __jk_expr_L0}），旧键留着会让按名解析（首次出现优先）绑到上一层过期键。</p>
+     *
+     * <p>{@code base == null}（该侧无连接器元数据 / 未声明）或任一表达式推断不出静态类型 →
+     * 返回 {@code null}（整侧不声明，Worker 退回「首张页定 schema」的旧行为，绝不猜类型）。</p>
+     */
+    public static List<Field> appendJoinKeyComputed(List<Field> base, List<GroupKeyExpression> computed) {
+        if (computed == null || computed.isEmpty()) return base;
+        if (base == null) return null;
+        Map<String, Field> byName = new LinkedHashMap<>();
+        for (Field f : base) byName.putIfAbsent(f.getName(), f);
+        Set<String> shadowed = new LinkedHashSet<>();
+        for (GroupKeyExpression g : computed) shadowed.add(g.derivedColumn());
+        List<Field> out = new ArrayList<>(base.size() + computed.size());
+        for (Field f : base) {
+            if (!shadowed.contains(f.getName())) out.add(f);
+        }
+        for (GroupKeyExpression g : computed) {
+            ArrowType t;
+            try {
+                t = com.dojao.core.operator.expr.ExprTypeInference.infer(
+                        com.dojao.core.operator.expr.ExprParser.parse(g.exprText()), byName);
+            } catch (RuntimeException e) {
+                return null;
+            }
+            if (t == null) return null;
+            out.add(new Field(g.derivedColumn(), FieldType.nullable(t), null));
         }
         return out;
     }

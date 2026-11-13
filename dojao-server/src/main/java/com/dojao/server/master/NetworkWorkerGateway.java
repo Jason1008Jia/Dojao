@@ -79,8 +79,18 @@ public final class NetworkWorkerGateway implements WorkerGateway {
                              String catalog, com.dojao.spi.bean.ScanSlice slice,
                              FragmentSpec.SortLimitStep tail,
                              BlockingQueue<ScanEvent> resultQueue) {
-        ResultSink sink = new ScanSink(taskId, resultQueue);
-        router.register(taskId, sink);
+        dispatchScan(workerId, jobId, taskId, catalog, slice, tail, null, null, resultQueue);
+    }
+
+    @Override
+    public void dispatchScan(String workerId, String jobId, String taskId,
+                             String catalog, com.dojao.spi.bean.ScanSlice slice,
+                             FragmentSpec.SortLimitStep tail,
+                             FragmentSpec.ScanProjection projection,
+                             FragmentSpec.SinkStep sink,
+                             BlockingQueue<ScanEvent> resultQueue) {
+        ResultSink resultSink = new ScanSink(taskId, resultQueue);
+        router.register(taskId, resultSink);
         DispatchScanRequest.Builder b = DispatchScanRequest.newBuilder()
                 .setWorkerId(workerId)
                 .setJobId(jobId)
@@ -88,13 +98,22 @@ public final class NetworkWorkerGateway implements WorkerGateway {
                 .setCatalog(catalog)
                 .setRequest(ControlSerde.toRead(slice.request()))
                 .addAllClusterNodes(clusterNodes())
-                .addAllCatalogs(catalogDefsFor(List.of(catalog)));
+                .addAllCatalogs(catalogDefsFor(
+                        sink == null || sink.catalog().equals(catalog)
+                                ? List.of(catalog)
+                                : List.of(catalog, sink.catalog())));
         // 切片私有载荷（连接器自定义字节，引擎只搬运不解释）；空 = 整表切片
         if (slice.hasSplit()) {
             b.setSplitPayload(com.google.protobuf.ByteString.copyFrom(slice.split().payload()));
         }
         if (tail != null) {
             b.setTail(ControlSerde.toSortLimitStep(tail));
+        }
+        if (projection != null) {
+            b.setProjection(ControlSerde.toScanProjection(projection));
+        }
+        if (sink != null) {
+            b.setSink(ControlSerde.toSinkStep(sink));
         }
         DispatchScanRequest req = b.build();
         if (!dispatch(workerId, ControlActions.DISPATCH_SCAN, req)) {
@@ -367,8 +386,9 @@ public final class NetworkWorkerGateway implements WorkerGateway {
 
         @Override
         public void finished(long rowCount) throws Exception {
-            // 扫描路径无行数语义；终止事件必须确认交付（静默丢弃 = 扫描 Task 永远 RUNNING）
-            deliverTerminal(queue, new ScanEvent.ScanFinished(taskId), "扫描完成事件");
+            // 普通扫描 rowCount 恒 0；scan-sink 携带目标表写入行数。终止事件必须确认交付
+            // （静默丢弃 = 扫描 Task 永远 RUNNING）
+            deliverTerminal(queue, new ScanEvent.ScanFinished(taskId, rowCount), "扫描完成事件");
         }
 
         @Override

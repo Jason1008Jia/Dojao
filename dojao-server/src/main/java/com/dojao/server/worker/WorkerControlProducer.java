@@ -6,6 +6,7 @@ import com.dojao.core.operator.FragmentSpec;
 import com.dojao.core.operator.MaterializedCteConnector;
 import com.dojao.core.operator.OrderByTail;
 import com.dojao.core.operator.Operator;
+import com.dojao.core.operator.ScalarProjectOperator;
 import com.dojao.core.operator.ShuffleReader;
 import com.dojao.core.planner.PlanningContext;
 import com.dojao.core.rpc.control.CancelTaskRequest;
@@ -161,6 +162,10 @@ public final class WorkerControlProducer implements FlightProducer {
         String desc = "scan " + req.getCatalog() + "." + read.schema() + "." + read.table();
         // 片内 top-N 截断尾（Master 下推）：空 = 全量回传（无顶层 ORDER BY LIMIT 下推）
         FragmentSpec.SortLimitStep tail = req.hasTail() ? ControlSerde.fromSortLimitStep(req.getTail()) : null;
+        // scan-sink：分片侧投影 + 就地写（CTAS / INSERT 的纯扫描+投影形态，数据不回 Master）
+        FragmentSpec.ScanProjection projection = req.hasProjection()
+                ? ControlSerde.fromScanProjection(req.getProjection()) : null;
+        FragmentSpec.SinkStep sink = req.hasSink() ? ControlSerde.fromSinkStep(req.getSink()) : null;
         // 结果回传专用独立客户端（用交换层共享分配器，与流根同 root → 零拷贝安全）；
         // 复用 masterClient 会跨 root 序列化失败 → 流被取消（Master 侧 "client cancelled"）。
         NetworkScanResultQueue queue = new NetworkScanResultQueue(
@@ -169,7 +174,7 @@ public final class WorkerControlProducer implements FlightProducer {
         // 阻塞中的消费者片段后面（同 §submitLeafTask 的死锁说明）
         wm.submitLeafTask(new WorkerTask(taskId, req.getJobId(), desc, 1), (task, worker) -> {
             try {
-                scanAndSend(taskId, req.getCatalog(), slice, tail, queue);
+                scanAndSend(taskId, req.getCatalog(), slice, tail, projection, sink, queue);
             } finally {
                 queue.close();                    // 被取消也主动完成流，避免 Master 侧 doExchange 悬挂
                 registry.killByQuery(req.getJobId());   // 任务结束：杀该 query 绑定的外部进程（幂等）
@@ -277,12 +282,20 @@ public final class WorkerControlProducer implements FlightProducer {
      * Worker 侧执行体：独立连接器副本读分区直到 EOF → 逐页回传 → 成功 / 失败各发对应终止事件。
      * {@code tail} 非 null（顶层 ORDER BY LIMIT 下推命中）时把扫描源包成截断尾链 —— 本地排序 +
      * 截断到 offset+limit 行后再逐页回传（回传候选集而非全量，Master 在候选集上全局排序取区间）。
+     *
+     * <p><b>scan-sink</b>：{@code projection} 非空先投影，{@code sink} 非空则投影后就地写目标表
+     * （{@code connector.write}），数据页<b>不回传 Master</b>，完成时仅回传
+     * {@link ScanEvent.ScanFinished#rows()} 写入行数。</p>
      */
     private void scanAndSend(String taskId, String catalog, ScanSlice slice,
                              FragmentSpec.SortLimitStep tail,
+                             FragmentSpec.ScanProjection projection,
+                             FragmentSpec.SinkStep sink,
                              NetworkScanResultQueue queue) {
         DojaoConnector conn = null;
+        DojaoConnector writeConn = null;
         Operator op = null;
+        long written = 0L;
         try {
             // 物化 CTE 的哨兵 catalog 不在注册表里：数据就在切片载荷中，用无状态解码连接器。
             conn = MaterializedCteConnector.isCteCatalog(catalog)
@@ -291,7 +304,13 @@ public final class WorkerControlProducer implements FlightProducer {
             // 谓词在数据所在地执行：连接器认识的推给数据源，引擎注册函数谓词由引擎在本节点补 Filter
             // （必须在 top-N 截断尾之前 —— 语义是「先过滤再取前 N 行」）
             Operator source = ConnectorScanOperator.openWithEngineFilter(conn, slice.request(), slice.split());
+            if (projection != null) {
+                source = applyProjection(source, projection);
+            }
             op = tail != null ? OrderByTail.wrap(source, tail) : source;
+            if (sink != null) {
+                writeConn = provider.get(sink.catalog());   // 写会话独立副本（与读游标互不影响）
+            }
             op.open();
             Page page;
             while (true) {
@@ -301,10 +320,22 @@ public final class WorkerControlProducer implements FlightProducer {
                     throw new java.util.concurrent.CancellationException("scan cancelled: " + taskId);
                 }
                 if ((page = op.next()).isEOF()) break;
-                // put 已接管页生命周期（发送/丢弃都会 close）—— 此处不得再 close
-                queue.put(new ScanEvent.ScanPage(taskId, page));   // 网络回传即背压
+                if (sink != null) {
+                    // 就地写：连接器 write 只读页不关页，所有权仍归本循环 → 写完自行 close
+                    int rows = page.getRowCount();
+                    writeConn.write(new com.dojao.spi.bean.WriteRequest(
+                            sink.catalog(), sink.schema(), sink.table(), page, sink.targetColumns()));
+                    written += rows;
+                    page.close();
+                } else {
+                    // put 已接管页生命周期（发送/丢弃都会 close）—— 此处不得再 close
+                    queue.put(new ScanEvent.ScanPage(taskId, page));   // 网络回传即背压
+                }
             }
-            queue.offer(new ScanEvent.ScanFinished(taskId), 1, TimeUnit.SECONDS);
+            if (writeConn != null) {
+                writeConn.finishWrite();   // 本分片写会话收尾（落盘 / flush）
+            }
+            queue.offer(new ScanEvent.ScanFinished(taskId, written), 1, TimeUnit.SECONDS);
         } catch (java.util.concurrent.CancellationException ce) {
             // 取消 ≠ 失败：静默退出，不发 ScanFailed（Master 侧已放弃该任务）。
         } catch (Throwable t) {
@@ -325,7 +356,28 @@ public final class WorkerControlProducer implements FlightProducer {
                 } catch (Throwable ignored) {
                 }
             }
+            if (writeConn != null) {
+                try {
+                    writeConn.finishWrite();   // 幂等：异常路径也把已写批次落盘
+                } catch (Throwable ignored) {
+                }
+            }
         }
+    }
+
+    /**
+     * 分片侧投影：{@code expressions} 非空 → {@link ScalarProjectOperator}（透传列 + 计算列），
+     * 否则 {@link ProjectOperator}（纯列投影，含重复列与列改名由 outputColumns 表达）。
+     */
+    private static Operator applyProjection(Operator source, FragmentSpec.ScanProjection p) {
+        if (p.expressions().isEmpty()) {
+            return new com.dojao.core.operator.ProjectOperator(source, p.outputColumns());
+        }
+        List<ScalarProjectOperator.Projection> items = p.expressions().stream()
+                .map(g -> new ScalarProjectOperator.Projection(g.exprText(), g.derivedColumn()))
+                .toList();
+        return new ScalarProjectOperator(source, p.outputColumns(),
+                new java.util.LinkedHashSet<>(p.computedColumns()), items);
     }
 
     /** 为某个 exchange 建接收端并登记进 Worker 的交换注册表（与 LocalWorkerGateway 同构）。 */

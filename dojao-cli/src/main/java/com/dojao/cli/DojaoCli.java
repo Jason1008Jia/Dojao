@@ -76,6 +76,20 @@ public final class DojaoCli {
     private ResultFormatter.Format format = ResultFormatter.Format.TABLE;
     private boolean timing = true;
 
+    static {
+        // ★CLI 的 logback 配置叫 logback-cli.xml（不会被 logback 自动发现），只在本入口主动装载。
+        //   原因：分发包 lib/* 与 IDE 全 classpath 中 dojao-cli.jar 排在 dojao-server.jar 之前，
+        //   而 logback 只加载第一个 logback.xml —— 配置留在 logback.xml 会把同 classpath 的
+        //   Master/UI 的 INFO 一起压成 WARN（Javalin 启动横幅、前端提交的 SQL 都不再打印）。
+        //   用户显式 -Dlogback.configurationFile=... 时尊重用户设置。
+        if (System.getProperty("logback.configurationFile") == null) {
+            java.net.URL url = DojaoCli.class.getResource("/logback-cli.xml");
+            if (url != null) {
+                System.setProperty("logback.configurationFile", url.toString());
+            }
+        }
+    }
+
     public static void main(String[] args) {
         System.exit(new DojaoCli().run(args));
     }

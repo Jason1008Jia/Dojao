@@ -4,6 +4,13 @@
     <statusListener class="ch.qos.logback.core.status.NopStatusListener"/>
 
     <!--
+      ★本文件必须叫 logback-cli.xml，不能叫 logback.xml：分发包 lib/* 与 IDE 全 classpath 里
+      dojao-cli.jar 都排在 dojao-server.jar 之前，而 logback 只自动加载 classpath 上第一个
+      logback.xml —— 之前叫 logback.xml 时，这里的 root=WARN 把同 classpath 的 Master/UI
+      的 INFO 全部压掉（Javalin 启动横幅、前端提交的 SQL 都不再打印，启动只剩寥寥几行）。
+      DojaoCli.main 启动时会主动把 -Dlogback.configurationFile 指向本文件（见 DojaoCli 静态块），
+      所以 CLI 的安静口径不变，又不影响同 classpath 的 Master/Worker。
+
       日志一律写 stderr：stdout 只放查询结果，保证 `-F csv > out.csv` / `-F json` 拿到的是干净数据。
       级别默认 WARN —— Arrow / gRPC 的 INFO 日志（内存分配、连接建立等）对 CLI 用户是噪音，
       需要排查时用 -Dlogback.configurationFile=... 或改这里。

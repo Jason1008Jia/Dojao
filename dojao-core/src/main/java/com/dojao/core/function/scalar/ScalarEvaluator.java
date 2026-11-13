@@ -1,5 +1,6 @@
 package com.dojao.core.function.scalar;
 
+import com.dojao.core.operator.expr.ExprEvaluator;
 import com.dojao.core.planner.SqlTextUtil;
 
 import org.apache.arrow.memory.BufferAllocator;
@@ -119,7 +120,9 @@ public final class ScalarEvaluator {
             for (int i = 0; i < input.length; i++) {
                 if (colIndices[i] >= 0) {
                     FieldVector v = root.getVector(colIndices[i]);
-                    Object val = v.isNull(r) ? null : v.getObject(r);
+                    // ★统一取值入口：DATE 列 getObject 是 Integer(epoch days)，须归一为 LocalDate，
+                    //   否则 to_date(d)/year(d) 会把天数当 epoch 毫秒 → 1970-01-01。
+                    Object val = ExprEvaluator.cellValue(v, r);
                     // 比较参数：列值与字面量比较 → Boolean（null 列视为不满足条件 → 假）
                     if (cmpOps[i] != null) {
                         input[i] = val == null

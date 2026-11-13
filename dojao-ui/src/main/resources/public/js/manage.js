@@ -166,6 +166,8 @@ function mgModal(title, bodyHtml) {
     }
     overlay.querySelector('.mg-title').textContent = title;
     overlay.querySelector('.mg-body').innerHTML = bodyHtml || '';
+    // 复位弹窗宽度修饰（调用方可加 mg-modal-sm 等；下次打开若不重新加就恢复默认宽度）
+    overlay.querySelector('.mg-modal').className = 'mg-modal';
     overlay.classList.add('show');
     return overlay;
 }

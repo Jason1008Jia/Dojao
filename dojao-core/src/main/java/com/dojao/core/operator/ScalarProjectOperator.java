@@ -114,6 +114,9 @@ public final class ScalarProjectOperator extends AbstractMeasurableOperator {
     /** 更新上游算子引用（列裁剪优化使用，须在 {@link #doOpen()} 前调用）。 */
     public void setUpstream(Operator upstream) { this.upstream = upstream; }
 
+    /** 上游算子（scan-sink 形态探测用）。 */
+    public Operator upstream() { return upstream; }
+
     /** 表达式引用的上游列（供列裁剪）。 */
     public Set<String> expressionColumns() {
         Set<String> cols = new LinkedHashSet<>();

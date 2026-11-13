@@ -90,16 +90,27 @@ public final class ExpressionProjectOperator extends AbstractMeasurableOperator 
 
             // 2) 零拷贝 transfer 原始列到新向量（掏空原向量，与 Page.select 同款）。
             //    重建 root：原列 + 派生列（Arrow 15 无就地 addVector）。
-            List<Field> fields = new ArrayList<>(inRoot.getSchema().getFields());
+            //    ★派生列**覆盖**同名原列：链式 join 的中间结果是「上一层 join 输出 + 新的 ON 表达式键」，
+            //      上一层留下的同名合成列（如每层都是 __jk_expr_L0）必须先丢弃，否则页内两份同名列，
+            //      下游 HashJoin / 投影按名解析（首次出现优先）会拿到上一层那份过期键 → 静默错行。
+            Set<String> shadowed = new LinkedHashSet<>();
+            for (FieldVector d : derived) shadowed.add(d.getField().getName());
+            List<Field> inFields = inRoot.getSchema().getFields();
+            List<Field> fields = new ArrayList<>(inFields.size() + derived.size());
             List<FieldVector> vectors = new ArrayList<>(fields.size() + derived.size());
             for (int i = 0; i < inRoot.getFieldVectors().size(); i++) {
                 FieldVector src = inRoot.getVector(i);
-                FieldVector dst = fields.get(i).createVector(allocator);
+                if (shadowed.contains(inFields.get(i).getName())) {
+                    src.clear();   // 被派生列覆盖：原向量不再进入新页，释放其 buffer
+                    continue;
+                }
+                FieldVector dst = inFields.get(i).createVector(allocator);
                 src.makeTransferPair(dst).transfer();
                 // 直接 transfer 不推进 lastSet：置位使 setValueCount 的 fillHoles 变 no-op，
                 // 避免 var offset 被清零（与 Page.select 零拷贝分支同款）
                 if (dst instanceof BaseVariableWidthVector dv) dv.setLastSet(rowCount - 1);
                 dst.setValueCount(rowCount);
+                fields.add(inFields.get(i));
                 vectors.add(dst);
             }
             for (FieldVector d : derived) {

@@ -6,6 +6,7 @@ import com.dojao.core.operator.expr.ExprBuiltins;
 import com.dojao.core.operator.expr.ExprEvaluator;
 import com.dojao.core.operator.expr.ExprNode;
 import com.dojao.core.operator.expr.ExprParser;
+import com.dojao.core.operator.expr.ExprTypeInference;
 import com.dojao.core.function.scalar.ScalarExpr;
 import com.dojao.core.function.scalar.ScalarFunctionRegistry;
 import com.dojao.core.function.table.TableFunctionOperator;
@@ -123,6 +124,21 @@ public final class Planner {
     private final Set<String> auxiliaryOperatorQueryIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private long cteCatalogSequence;
+
+    /**
+     * 规划期元数据探查缓存（本实例 = 本次查询的一次规划）。
+     *
+     * <p>join 算法选型 / EXPLAIN 估算会在同一次规划里对同一张表反复探查：两表 join 先按
+     * {@code estimateBytes} 选算法，随后又按 {@code sideRows} 估输出行数、按 {@code safeStats}
+     * 取 NDV；多 join 链的每层右表还会被「首表估算 + 本层选型 + 本层输出估算」各探一次。
+     * 对远端数据源（ClickHouse 的 {@code getTableStats} 要 3~4 次 JDBC 往返）这就是规划期
+     * 数秒的来源。统计只影响算法选型 / 展示进度，**不影响正确性**，一次规划内复用同一份结果安全。</p>
+     *
+     * <p>planner 规划是单线程的（见 {@code prefetchSiblingStores} 的同源约束），普通 {@link HashMap} 足够。</p>
+     */
+    private final Map<String, TableStats> probeStatsCache = new HashMap<>();
+    private final Map<String, Long> probeRowsCache = new HashMap<>();
+    private final Map<String, Long> probeBytesCache = new HashMap<>();
 
     /**
      * 待生效的多维聚合展开（{@code ROLLUP/CUBE/GROUPING SETS}）。
@@ -589,14 +605,26 @@ public final class Planner {
             throw unsupported("CUBE/ROLLUP/GROUPING SETS 含标量子查询");
         }
 
-        // 1) 分类原 SELECT 项：维度列（裸列标识符）∪ 聚合项；窗口/星号/表达式列明确不支持
-        // 分组集合成员 / SELECT 列统一按去限定符的单标识符比较（t.a 与 a 视作同维度）。
+        // 1) 分类原 SELECT 项：维度列（裸列标识符）∪ 聚合项 ∪ 常量字面量（'' / 数值 / TRUE / FALSE / NULL）；
+        //    窗口/星号/表达式列明确不支持。分组集合成员 / SELECT 列统一按去限定符的单标识符比较
+        //    （t.a 与 a 视作同维度）。
+        //    ★常量字面量（`SELECT …, '' , ''`）不是维度也不是聚合：每条腿都原样输出它，且在规范列里
+        //    各占一个槽位 —— 否则要么直接报「不支持的 SELECT 表达式」，要么被当成维度去 memberNorm
+        //    校验而失败（线上 GROUPING SETS 带常量列的缺陷）。
         Set<String> memberNorm = new HashSet<>();
         for (List<Expression> set : gs.sets()) {
             for (Expression m : set) memberNorm.add(plannerNorm(SqlTextUtil.stripQualifier(m.text())));
         }
         List<String> dimIds = new ArrayList<>();
         List<LogicalPlan.SelectItem> aggItems = new ArrayList<>();
+        // 2) 规范输出列按原 SELECT 项顺序（结果列头顺序与用户 SQL 一致）；维列去重、聚合与常量按项
+        //    逐位保留。各腿输出与规范槽位的对应由 childSlots 完成。
+        //    ★腿内 SELECT 项必须按<b>规范列顺序</b>排列（而非「维度在前、聚合在后」）：UnionAllOperator
+        //    的 align 假定 childSlots 严格升序，槽位乱序会把常量列当成缺席槽位补 NULL（且漏掉
+        //    后移的聚合列）。legPartKinds/legPartValues 与 canonical 逐位平行，建腿时按序取用。
+        List<String> canonical = new ArrayList<>();
+        List<String> legPartKinds = new ArrayList<>();   // "dim" | "agg" | "const"
+        List<Object> legPartValues = new ArrayList<>();  // dim→String id / agg→SelectItem / const→String[]{text,out}
         for (LogicalPlan.SelectItem item : select.selectItems()) {
             String text = item.expression().text().trim();
             // 聚合项按「整项聚合 <b>或</b> 聚合嵌在表达式里」判定（与 buildAggregation 的
@@ -605,6 +633,9 @@ public final class Planner {
             // SELECT 项，否则会被误判成「既不是维度也不是聚合」而规划失败（压测缺陷 3）。
             if (itemHasAggregate(item)) {
                 aggItems.add(item);
+                canonical.add(item.alias().orElse(aggOutputName(text)));
+                legPartKinds.add("agg");
+                legPartValues.add(item);
                 continue;
             }
             if (item.expression() instanceof Expression.WindowFunction
@@ -614,6 +645,15 @@ public final class Planner {
             if (isStarExpansion(text)) {
                 throw unsupported("CUBE/ROLLUP/GROUPING SETS 的 SELECT 不支持 *，须显式列出维度列与聚合");
             }
+            if (isLiteralSelectText(text)) {
+                // 重复常量（如两个 ''）要各自占一列：第二个起加 _2 / _3 后缀避免列名冲突
+                //（UnionAll 的槽位按列名映射，重名会让两列挤到同一槽位）。
+                String out = uniqueSelectName(canonical, item.alias().orElse(SqlTextUtil.normalize(text)));
+                canonical.add(out);
+                legPartKinds.add("const");
+                legPartValues.add(new String[]{text, out});
+                continue;
+            }
             String id = SqlTextUtil.stripQualifier(text).trim();
             if (!SqlTextUtil.isSingleIdentifier(id)) {
                 throw unsupported("CUBE/ROLLUP/GROUPING SETS 的 SELECT 表达式: " + text);
@@ -621,23 +661,15 @@ public final class Planner {
             if (!memberNorm.contains(plannerNorm(id))) {
                 throw unsupported("SELECT 列 " + id + " 既不是分组维度列也不是聚合函数");
             }
-            if (!containsPlannerNorm(dimIds, id)) dimIds.add(id);
+            if (!containsPlannerNorm(dimIds, id)) {
+                dimIds.add(id);
+                canonical.add(id);
+                legPartKinds.add("dim");
+                legPartValues.add(id);
+            }
         }
         if (aggItems.isEmpty()) {
             throw unsupported("CUBE/ROLLUP/GROUPING SETS 的 SELECT 必须含 ≥1 个聚合函数（纯维度多腿 = 重复 DISTINCT）");
-        }
-
-        // 2) 规范输出列按原 SELECT 项顺序（结果列头顺序与用户 SQL 一致）；维列去重、聚合按项逐位保留。
-        //    各腿输出与规范槽位的对应由 childSlots 完成（UnionAll 按槽位重排），故腿内顺序无约束。
-        List<String> canonical = new ArrayList<>();
-        for (LogicalPlan.SelectItem item : select.selectItems()) {
-            String text = item.expression().text().trim();
-            if (itemHasAggregate(item)) {
-                canonical.add(item.alias().orElse(aggOutputName(text)));
-            } else {
-                String id = SqlTextUtil.stripQualifier(text).trim();
-                if (!containsPlannerNorm(canonical, id)) canonical.add(id);
-            }
         }
         if (canonical.isEmpty()) {
             throw unsupported("CUBE/ROLLUP/GROUPING SETS 无输出列");
@@ -667,26 +699,47 @@ public final class Planner {
                 setNorm.add(plannerNorm(SqlTextUtil.stripQualifier(m.text())));
                 legGroupBy.add(m);
             }
+            // 腿内 SELECT 项按规范列顺序逐位生成：维度列只在本组合参与时出现，聚合与常量恒出现。
+            // 由此腿输出列的下标即规范列下标的一个严格升序子序列 ⇒ childSlots 直接就是这些下标。
             List<LogicalPlan.SelectItem> legItems = new ArrayList<>();
-            for (String d : dimIds) {
-                if (setNorm.contains(plannerNorm(d))) {
+            List<Integer> slotList = new ArrayList<>();
+            List<String> expectCols = new ArrayList<>();
+            for (int k = 0; k < legPartKinds.size(); k++) {
+                String kind = legPartKinds.get(k);
+                if ("dim".equals(kind)) {
+                    String d = (String) legPartValues.get(k);
+                    if (!setNorm.contains(plannerNorm(d))) continue;
                     legItems.add(new LogicalPlan.SelectItem(new Expression.OpaqueExpr(d), Optional.empty()));
+                    expectCols.add(canonical.get(k));
+                } else if ("agg".equals(kind)) {
+                    legItems.add((LogicalPlan.SelectItem) legPartValues.get(k));
+                    expectCols.add(canonical.get(k));
+                } else {
+                    // 常量字面量：别名钉成规范列名，UnionAll 槽位按名对齐
+                    String[] textOut = (String[]) legPartValues.get(k);
+                    legItems.add(new LogicalPlan.SelectItem(
+                            new Expression.OpaqueExpr(textOut[0]), Optional.of(textOut[1])));
+                    expectCols.add(canonical.get(k));
                 }
+                slotList.add(k);
             }
-            legItems.addAll(aggItems);
             LogicalPlan.Select leg = new LogicalPlan.Select(legItems,
                     select.fromRelations(), select.joins(), select.where(),
                     legGroupBy, select.having(), select.scalarSubqueries());
             PhysicalNode legNode = buildQuery(leg, null);
-            int[] slots = new int[legNode.outputColumns().size()];
-            for (int j = 0; j < slots.length; j++) {
-                int idx = indexOfPlannerNorm(canonical, legNode.outputColumns().get(j));
-                if (idx < 0) {
-                    throw unsupported("CUBE 腿输出列 [" + legNode.outputColumns().get(j)
-                            + "] 无法映射到规范列（腿: " + legItems + "）");
-                }
-                slots[j] = idx;
+            if (legNode.outputColumns().size() != slotList.size()) {
+                throw unsupported("CUBE 腿输出列数 [" + legNode.outputColumns()
+                        + "] 与腿 SELECT 项数 [" + legItems.size() + "] 不一致");
             }
+            // 槽位按位置映射，须再校验腿输出列名逐位与规范列同名（否则输出顺序被改写时会静默错列）
+            for (int j = 0; j < legNode.outputColumns().size(); j++) {
+                if (!plannerNorm(legNode.outputColumns().get(j)).equals(plannerNorm(expectCols.get(j)))) {
+                    throw unsupported("CUBE 腿输出列 [" + legNode.outputColumns()
+                            + "] 与预期 [" + expectCols + "] 不一致");
+                }
+            }
+            int[] slots = new int[slotList.size()];
+            for (int j = 0; j < slots.length; j++) slots[j] = slotList.get(j);
             childSlots.add(slots);
             legNodes.add(legNode);
         }
@@ -729,17 +782,29 @@ public final class Planner {
             sets.add(members);
         }
 
-        // 单腿 SELECT 项：维度列取首次出现（与 canonical 去重口径一致），聚合项原位
+        // 单腿 SELECT 项：维度列取首次出现（与 canonical 去重口径一致），聚合项原位，
+        // 常量字面量逐项保留（重复常量各自占一列，输出名加后缀避免重名）
         List<LogicalPlan.SelectItem> items = new ArrayList<>();
         Set<String> emitted = new LinkedHashSet<>();
+        List<String> itemOutNames = new ArrayList<>();
         for (LogicalPlan.SelectItem item : select.selectItems()) {
+            String text = item.expression().text().trim();
             if (itemHasAggregate(item)) {
                 items.add(item);
+                itemOutNames.add(item.alias().orElse(aggOutputName(text)));
                 continue;
             }
-            String id = SqlTextUtil.stripQualifier(item.expression().text().trim()).trim();
+            if (isLiteralSelectText(text)) {
+                String out = uniqueSelectName(itemOutNames, item.alias().orElse(SqlTextUtil.normalize(text)));
+                items.add(new LogicalPlan.SelectItem(
+                        new Expression.OpaqueExpr(text), Optional.of(out)));
+                itemOutNames.add(out);
+                continue;
+            }
+            String id = SqlTextUtil.stripQualifier(text).trim();
             if (emitted.add(plannerNorm(id))) {
                 items.add(new LogicalPlan.SelectItem(new Expression.OpaqueExpr(id), Optional.empty()));
+                itemOutNames.add(id);
             }
         }
         List<Expression> groupBy = new ArrayList<>(expandDims.size());
@@ -770,6 +835,35 @@ public final class Planner {
             }
         }
         return dims;
+    }
+
+    /**
+     * SELECT 项是否是一个<b>常量字面量</b>（字符串 {@code '...'} / 数值 / {@code TRUE} / {@code FALSE} /
+     * {@code NULL}）。
+     *
+     * <p>多维聚合（CUBE/ROLLUP/GROUPING SETS）里常量既不是维度也不是聚合：它不参与分组，但每条
+     * 腿都要原样输出一列（{@code SELECT …, '' }）。只认纯字面量 —— 含列引用或函数调用的表达式
+     * 仍按「不支持」处理，避免把非确定值误当成常量。</p>
+     */
+    private static boolean isLiteralSelectText(String text) {
+        String t = text == null ? "" : text.trim();
+        if (t.isEmpty()) return false;
+        if (t.equalsIgnoreCase("NULL") || t.equalsIgnoreCase("TRUE") || t.equalsIgnoreCase("FALSE")) {
+            return true;
+        }
+        if (t.length() >= 2 && t.charAt(0) == '\'' && t.charAt(t.length() - 1) == '\'') return true;
+        String body = t;
+        if (body.charAt(0) == '+' || body.charAt(0) == '-') body = body.substring(1);
+        return !body.isEmpty()
+                && body.matches("(\\d+(\\.\\d*)?|\\.\\d+)([eE][+-]?\\d+)?");
+    }
+
+    /** 常量 SELECT 项的输出名：与已有列重名时加 {@code _2} / {@code _3} 后缀。 */
+    private static String uniqueSelectName(List<String> taken, String base) {
+        String name = base;
+        int n = 2;
+        while (containsPlannerNorm(taken, name)) name = base + "_" + n++;
+        return name;
     }
 
     /** 集合成员文本 → 维度列名（按去限定符 + 归一化匹配，取 SELECT 里的写法）。 */
@@ -1166,6 +1260,15 @@ public final class Planner {
                     "DistributedWrite[" + ins.catalog() + "." + ins.schema() + "." + ins.table() + "]",
                     dist, innerRoot.outputColumns(), innerRoot);
         }
+        // scan-sink 门控：内层 = 纯分布式扫描（可带一层列/表达式投影）。分片在各自 Worker 本地
+        // 投影后直接写目标表（get_json_object 等重表达式随数据所在节点并行求值），数据页不回 Master。
+        ScanSinkShape scanShape = detectScanSink(innerRoot);
+        if (scanShape != null) {
+            attachScanSink(scanShape, ins.catalog(), ins.schema(), ins.table(), targetColumns);
+            return new PhysicalNode(
+                    "DistributedWrite[" + ins.catalog() + "." + ins.schema() + "." + ins.table() + "]",
+                    scanShape.scan(), innerRoot.outputColumns(), innerRoot);
+        }
         // 否则回退：Master 侧 TableSinkOperator 逐页写出（含标量投影 / 列重排 / CASE 派生等非分布式包装，
         // v1 暂不下推投影描述）
         int writeParallelism = Math.max(1, context.parallelism());
@@ -1219,6 +1322,37 @@ public final class Planner {
             } catch (Exception e) {
                 targetColumns = null;   // 元数据不可得 → 退回用 Page schema 列名
             }
+        }
+        // scan-sink 门控（纯扫描 + 投影）：各分片投影后就地写 staging，Master 只编排覆盖生命周期
+        ScanSinkShape scanShape = detectScanSink(innerRoot);
+        if (scanShape != null) {
+            DistributedScanOperator scan = scanShape.scan();
+            AtomicReference<String> staging = new AtomicReference<>();
+            final List<String> sinkColumns = targetColumns;
+            Runnable prepare = () -> {
+                if (!connector.tableExists(ins.catalog(), ins.schema(), ins.table())) {
+                    throw new IllegalStateException("INSERT OVERWRITE 目标表不存在: "
+                            + ins.catalog() + "." + ins.schema() + "." + ins.table());
+                }
+                if (!oe.supportsOverwrite(ins.catalog(), ins.schema(), ins.table())) {
+                    throw new IllegalStateException("INSERT OVERWRITE 目标数据源权限不足，无法覆盖: "
+                            + ins.catalog() + "." + ins.schema() + "." + ins.table());
+                }
+                String s = oe.beginOverwrite(ins.catalog(), ins.schema(), ins.table());
+                staging.set(s);
+                scan.setProjection(scanShape.projection());
+                scan.setSink(new FragmentSpec.SinkStep(ins.catalog(), ins.schema(), s, sinkColumns));
+            };
+            Runnable success = () ->
+                    oe.commitOverwrite(ins.catalog(), ins.schema(), ins.table(), staging.get());
+            Runnable abort = () -> {
+                String s = staging.get();
+                if (s != null) oe.abortOverwrite(ins.catalog(), ins.schema(), ins.table(), s);
+            };
+            scan.setSinkLifecycle(prepare, success, abort);
+            return new PhysicalNode(
+                    "DistributedOverwrite[" + ins.catalog() + "." + ins.schema() + "." + ins.table() + "]",
+                    scan, innerRoot.outputColumns(), innerRoot);
         }
         // 非分布式内层（纯扫描 / 复杂投影 / VALUES）：Master 侧 TableSinkOperator 逐页写出，覆盖
         // 生命周期（begin → 每页写 staging → 全部写完 commit / 失败 abort）由算子编排 ——
@@ -1287,6 +1421,15 @@ public final class Planner {
         if (innerRoot.operator() instanceof AbstractDistributedOperator dist) {
             return buildDistributedCreateTableAsSelect(ctas, innerRoot, connector,
                     catalog, schema, table, dist);
+        }
+        // scan-sink 门控（纯扫描 + 投影）：类型推导成功才下沉，否则回退下面 Master 写路径
+        ScanSinkShape scanShape = detectScanSink(innerRoot);
+        if (scanShape != null) {
+            PhysicalNode scanSink = buildScanSinkCreateTableAsSelect(ctas, innerRoot, connector,
+                    catalog, schema, table, scanShape);
+            if (scanSink != null) {
+                return scanSink;
+            }
         }
         // 写并行度 = 上游扫描并行度（硬约束：上游多少 写入时就多少）
         int writeParallelism = Math.max(1, context.parallelism());
@@ -1366,6 +1509,205 @@ public final class Planner {
         return new PhysicalNode(
                 "DistributedCTAS[" + catalog + "." + schema + "." + table + "]",
                 dist, innerRoot.outputColumns(), innerRoot);
+    }
+
+    // ==================== 扫描分片就地写（scan-sink：纯扫描 + 投影） ====================
+
+    /**
+     * scan-sink 识别结果：{@code scan} 是内层查询折叠后的分布式扫描算子，{@code projection} 是
+     * Master 侧原本要执行的投影（null = 无投影），{@code outputColumns} 是终端输出列顺序。
+     */
+    private record ScanSinkShape(DistributedScanOperator scan,
+                                 FragmentSpec.ScanProjection projection,
+                                 List<String> outputColumns) {
+    }
+
+    /**
+     * 识别「纯扫描 + 可选一层投影」形态 —— {@code DistributedScanOperator} 之上没有会改变行集的
+     * 算子（JOIN / 聚合 / 窗口 / 过滤 / Limit 都在别处门控）。
+     *
+     * <p>命中后把 Master 侧的投影降成 {@link FragmentSpec.ScanProjection} 随切片下发，各 Worker
+     * 在自己那段数据上做投影（{@code get_json_object} 这类重表达式随之并行）；扫描列集同步
+     * 收窄到投影真正引用的列（写入语句不走 {@code optimizeColumns}，这里补上）。</p>
+     *
+     * <p>返回 null = 非此形态 / 带截断下推（LIMIT 会让分区只产出候选集，与整表写入语义冲突）。</p>
+     */
+    private ScanSinkShape detectScanSink(PhysicalNode innerRoot) {
+        Operator op = innerRoot.operator();
+        DistributedScanOperator scan;
+        FragmentSpec.ScanProjection projection = null;
+        List<String> outCols = innerRoot.outputColumns();
+        if (op instanceof DistributedScanOperator ds) {
+            scan = ds;
+        } else if (op instanceof ScalarProjectOperator sp
+                && sp.upstream() instanceof DistributedScanOperator ds) {
+            scan = ds;
+            List<GroupKeyExpression> exprs = sp.projections().stream()
+                    .map(p -> new GroupKeyExpression(p.outputName(), p.exprText())).toList();
+            projection = new FragmentSpec.ScanProjection(sp.outputColumns(),
+                    List.copyOf(sp.computedColumns()), exprs);
+            outCols = sp.outputColumns();
+        } else if (op instanceof ProjectOperator p && !p.isAliased()
+                && p.upstream() instanceof DistributedScanOperator ds) {
+            scan = ds;
+            projection = new FragmentSpec.ScanProjection(p.columns(), List.of(), List.of());
+            outCols = p.columns();
+        } else {
+            return null;
+        }
+        // 截断下推（顶层 LIMIT / ORDER BY LIMIT）会让各分区只产出候选集 → 写入语义必须是全量
+        if (scan.hasTruncation()) {
+            return null;
+        }
+        // 列裁剪：只读投影引用的列 + 引擎谓词引用的列（空 = 连接器语义读全表）
+        if (projection != null) {
+            Set<String> need = new LinkedHashSet<>();
+            Set<String> computed = new HashSet<>(projection.computedColumns());
+            for (String c : projection.outputColumns()) {
+                if (!computed.contains(c)) need.add(c);
+            }
+            for (GroupKeyExpression g : projection.expressions()) {
+                collectExprColumns(g.exprText(), need);
+            }
+            if (scan.engineFilter()) {
+                need.addAll(engineFilterColumns(scan.predicates()));
+            }
+            if (!need.isEmpty()) {
+                scan.setColumns(new ArrayList<>(need));
+            }
+        }
+        return new ScanSinkShape(scan, projection, outCols);
+    }
+
+    /** 收集表达式文本引用的列（去限定符）—— 与 {@code ScalarProjectOperator} 两条求值路径同口径。 */
+    private static void collectExprColumns(String exprText, Set<String> out) {
+        try {
+            out.addAll(new ExprEvaluator(ExprParser.parse(exprText)).columnArgs());
+            return;
+        } catch (RuntimeException ignored) {
+            // 非通用表达式（个别标量函数语法）→ 回退 ScalarExpr 解析
+        }
+        Optional<ScalarExpr> fn = ScalarExpr.tryParse(exprText);
+        fn.ifPresent(e -> out.addAll(
+                new com.dojao.core.function.scalar.ScalarEvaluator(e).columnArgs()));
+    }
+
+    /** 把投影 + 写目标挂到扫描算子（INSERT INTO：目标表已存在，无语义性副作用）。 */
+    private void attachScanSink(ScanSinkShape shape, String catalog, String schema, String table,
+                                List<String> targetColumns) {
+        shape.scan().setProjection(shape.projection());
+        shape.scan().setSink(new FragmentSpec.SinkStep(catalog, schema, table, targetColumns));
+    }
+
+    /**
+     * 静态推导 scan-sink 终端输出列的 Arrow 类型（CTAS 建目标表用；null = 推导不出 → 调用方回退
+     * Master 写路径）。
+     *
+     * <p>源列走连接器精确 {@code sourceFields}（与 {@code AbstractDistributedOperator.scanFields}
+     * 同口径），计算列走 {@link ExprTypeInference}。任一列推导不出即整体放弃 —— 绝不能猜一个类型
+     * 去建表（写回时类型不符会静默错值或直接失败）。</p>
+     */
+    private List<Field> inferScanSinkFields(ScanSinkShape shape, DojaoConnector sourceProbe) {
+        DistributedScanOperator scan = shape.scan();
+        ReadRequest req = scan.baseRequest();
+        List<String> cols = scan.selectedColumns();
+        List<Field> sourceFields = AbstractDistributedOperator.scanFields(
+                sourceProbe, req.catalog(), req.schema(), req.table(),
+                cols.isEmpty() ? null : cols);
+        Map<String, Field> byName = new LinkedHashMap<>();
+        Map<String, Field> lower = new HashMap<>();
+        for (Field f : sourceFields) {
+            byName.putIfAbsent(f.getName(), f);
+            lower.putIfAbsent(f.getName().toLowerCase(Locale.ROOT), f);
+        }
+        FragmentSpec.ScanProjection p = shape.projection();
+        Map<String, String> exprByColumn = new LinkedHashMap<>();
+        Set<String> computed = new HashSet<>();
+        if (p != null) {
+            for (GroupKeyExpression g : p.expressions()) {
+                exprByColumn.put(g.derivedColumn(), g.exprText());
+            }
+            computed.addAll(p.computedColumns());
+        }
+        List<Field> out = new ArrayList<>(shape.outputColumns().size());
+        for (String col : shape.outputColumns()) {
+            if (computed.contains(col)) {
+                String expr = exprByColumn.get(col);
+                if (expr == null) return null;
+                ExprNode node;
+                try {
+                    node = ExprParser.parse(expr);
+                } catch (RuntimeException e) {
+                    return null;
+                }
+                ArrowType t = ExprTypeInference.infer(node, byName);
+                if (t == null) return null;
+                Field src = byName.get(col) != null ? byName.get(col) : lower.get(col.toLowerCase(Locale.ROOT));
+                boolean nullable = src == null || src.isNullable();
+                out.add(new Field(col, new FieldType(nullable, t, null), List.of()));
+                continue;
+            }
+            Field src = byName.get(col) != null ? byName.get(col) : lower.get(col.toLowerCase(Locale.ROOT));
+            if (src == null) return null;
+            out.add(src);
+        }
+        return out;
+    }
+
+    /**
+     * CTAS scan-sink 分支：Master 只建表 + 收行数，各分片就地写。类型推导不出 → 返回 null，
+     * 调用方回退 Master 侧 {@code TableSinkOperator}（运行期按首片真实 schema 建表）。
+     */
+    private PhysicalNode buildScanSinkCreateTableAsSelect(LogicalPlan.CreateTableAsSelect ctas,
+                                                          PhysicalNode innerRoot,
+                                                          DojaoConnector connector,
+                                                          String catalog, String schema, String table,
+                                                          ScanSinkShape shape) {
+        List<Field> fields = inferScanSinkFields(shape, connectorFor(shape.scan().baseRequest().catalog()));
+        if (fields == null || fields.isEmpty()) {
+            System.err.println("[Planner] CTAS scan-sink 目标表列类型无法静态推导，回退 Master 写路径: "
+                    + catalog + "." + schema + "." + table);
+            return null;
+        }
+        List<String> targetColumns = null;
+        if (ctas.columnAliases().isPresent()) {
+            List<String> aliases = ctas.columnAliases().get();
+            if (aliases.size() != fields.size()) {
+                throw unsupported("CTAS 列别名数量与输出列不一致: 别名 " + aliases.size()
+                        + "，输出列 " + fields.size());
+            }
+            List<Field> renamed = new ArrayList<>(fields.size());
+            for (int i = 0; i < fields.size(); i++) {
+                Field f = fields.get(i);
+                renamed.add(new Field(aliases.get(i), f.getFieldType(), f.getChildren()));
+            }
+            fields = renamed;
+            targetColumns = new ArrayList<>(aliases);
+        }
+        AtomicBoolean created = new AtomicBoolean();
+        final List<Field> ctasFields = fields;
+        final List<String> ctasTargetColumns = targetColumns;
+        DistributedScanOperator scan = shape.scan();
+        // 投影 / 写目标 / 输出列在规划期就挂上（EXPLAIN 可见、计划列也正确）；prepare 只留 DDL 副作用
+        scan.setProjection(shape.projection());
+        scan.setSink(new FragmentSpec.SinkStep(catalog, schema, table, ctasTargetColumns));
+        scan.setOutputFields(ctasFields);
+        Runnable prepare = () -> {
+            boolean c = connector.createTable(catalog, schema, table, ctasFields, ctas.ifNotExists());
+            created.set(c);
+            if (!c) scan.skipDispatch();   // 表已存在 → 不派发、rows=0（不触碰既有表）
+        };
+        Runnable success = () -> { };
+        Runnable abort = () -> {
+            if (created.get()) {
+                try { connector.dropTable(catalog, schema, table); }
+                catch (Throwable ignored) { }
+            }
+        };
+        scan.setSinkLifecycle(prepare, success, abort);
+        return new PhysicalNode(
+                "DistributedCTAS[" + catalog + "." + schema + "." + table + "]",
+                scan, innerRoot.outputColumns(), innerRoot);
     }
 
     private LogicalPlan.Select asSelect(LogicalPlan plan) {
@@ -1658,7 +2000,7 @@ public final class Planner {
         if (rel.subquery().isPresent()) {
             // 表函数（FROM TABLE(fn(常量))）：表生成器语义，独立切片，无 LATERAL / 列引用
             if (rel.subquery().get() instanceof LogicalPlan.TableFunction tf) {
-                return buildTableFunction(tf);
+                return applyRelationFilter(buildTableFunction(tf), rel);
             }
             if (rel.subquery().get() instanceof LogicalPlan.SetOperation innerSo) {
                 // 派生表 / CTE 查询体是集合运算（UNION [ALL]）：结果列名取首个操作数
@@ -1666,6 +2008,7 @@ public final class Planner {
                 PhysicalNode innerNode = buildSetOperation(innerSo);
                 PhysicalNode current = applyOrderLimit(innerNode, innerSo.orderBy(),
                         innerSo.limit(), innerSo.offset());
+                current = applyRelationFilter(current, rel);
                 if (extraPredicate.isPresent()) {
                     current = applyFilterIfSimple(current, extraPredicate.get(), "派生表外层 WHERE");
                 }
@@ -1681,6 +2024,7 @@ public final class Planner {
             // 静默忽略（`SELECT count(*) FROM (SELECT ... LIMIT 200) t` 返回全表计数）。
             PhysicalNode current = applyOrderLimit(innerNode, inner.orderBy(),
                     inner.limit(), inner.offset());
+            current = applyRelationFilter(current, rel);
             if (extraPredicate.isPresent()) {
                 // 与残留 WHERE 同一路径（同一判据：FilterOperator 能不能编译）—— 谓词形态随算子能力扩展，
                 // 这里绝不能再各留一张会漂移的硬编码白名单。
@@ -1745,7 +2089,7 @@ public final class Planner {
         }
         String residualFilter = localParts.isEmpty() ? null : String.join(" AND ", localParts);
         // 估算行数（EXPLAIN 用）：连接器元数据 rowCount × 谓词过滤比例；探不到 → UNKNOWN（不显示）
-        long estimatedRows = JoinCardinality.sideRows(JoinDecider.StatsProbe.of(conns.get(0)),
+        long estimatedRows = JoinCardinality.sideRows(statsProbe(conns.get(0)),
                 rel.catalog(), schema, table,
                 estimateFilter(relScanFilter(rel), extraPredicate.orElse(null)));
         PhysicalNode node = new PhysicalNode("ParallelTableScan[" + schema + "." + table + "]",
@@ -1762,6 +2106,23 @@ public final class Planner {
             scan.setFetchLimit(0L);
         }
         return node;
+    }
+
+    /**
+     * 派生关系上挂的谓词（{@link com.dojao.grammar.optimize.PredicatePushdown} 把「只引用本关系」
+     * 的 WHERE 合取项搬进 {@code rel.filter()}）。
+     *
+     * <p>基表分支在扫描端兑现（{@code scan.pushdown} / 本地 Filter）；派生分支（表函数 / 集合运算 /
+     * 子查询）过去只认 {@code extraPredicate} ⇒ 谓词<b>静默丢失</b>。分布式派生路径由
+     * {@code planDerivedProjection} 的 {@code filterAfterProject} 消费同一谓词，本地必须补上，
+     * 否则同一 SQL 两条路径结果不同（实测：join 链上的聚合派生表 + {@code WHERE q2_val > 0}，
+     * 单机比分布式多一行）。</p>
+     */
+    private PhysicalNode applyRelationFilter(PhysicalNode node, LogicalPlan.ResolvedRelation rel) {
+        if (rel.filter().isEmpty()) {
+            return node;
+        }
+        return applyFilterIfSimple(node, rel.filter().get().text(), "派生表谓词");
     }
 
     /**
@@ -1881,9 +2242,10 @@ public final class Planner {
      * @param innerKeys      聚合分组键（= 派生基表分区键）
      * @param aggregations   聚合函数（输出列名 = 派生体输出列）
      * @param caseProjections 聚合输入的 CASE/IF 派生列投影（可空）
-     * @param havingFilter   派生体<b>聚合后</b>过滤（已做聚合→输出列名替换）：派生内层 HAVING
-     *                       <b>与</b>「挂在派生关系上的谓词」以 {@code AND} 相连（列全部 ∈
-     *                       {@code outputColumns}），可 null
+     * @param havingFilter   派生体<b>算完之后</b>的过滤，可 null：<b>聚合型</b> = 派生内层 HAVING
+     *                       <b>与</b>「挂在派生关系上的谓词」以 {@code AND} 相连（已做聚合→输出列名
+     *                       替换，列全部 ∈ {@code outputColumns}）；<b>投影型</b> = 外层 WHERE 下推
+     *                       到派生关系、引用派生别名的谓词（投影后、哈希分区前过滤）
      * @param outputColumns  派生体可见输出列（分组键 + 聚合输出列，与聚合算子输出序一致）
      * @param projections    投影型派生源的逐行表达式派生列（无聚合）；空 = 聚合型派生源
      * @param window         窗口型派生源的单窗口组（无聚合）；null = 非窗口型派生源
@@ -2140,7 +2502,7 @@ public final class Planner {
                 + ", workers=" + workers.size()
                 + ", partitions=" + parallelism + "]";
         // 估算行数（EXPLAIN 用）：与本地扫描同口径（元数据 rowCount × 谓词过滤比例）
-        long estimatedRows = JoinCardinality.sideRows(JoinDecider.StatsProbe.of(probeConn),
+        long estimatedRows = JoinCardinality.sideRows(statsProbe(probeConn),
                 rel.catalog(), schema, table,
                 estimateFilter(relScanFilter(rel), extraPredicate.orElse(null)));
         PhysicalNode node = new PhysicalNode(name, scan, outCols, List.of()).withEstimate(estimatedRows);
@@ -2361,14 +2723,23 @@ public final class Planner {
             throw unsupported("JOIN 关系无法定位: "
                     + first.leftAlias() + " / " + first.rightAlias());
         }
+        // 左表声明列沿 join 链逐层传递：第一层取左表关系的声明列，之后取上一层 join 的输出声明列。
+        // 空 probe 分区（RIGHT/FULL 的某分区左页一页未收）靠它构造「右行 + 左列全 NULL」的输出 schema；
+        // 与分布式 StageScheduler.leftFieldsForChain 同口径。
+        List<Field> leftDeclared = declaredRightFields(relByAlias.get(normalize(first.leftAlias())));
         PhysicalNode current = buildJoin(left, right, first,
+                relByAlias.get(normalize(first.rightAlias())), leftDeclared);
+        leftDeclared = joinDeclaredOutput(leftDeclared, left, right, first,
                 relByAlias.get(normalize(first.rightAlias())));
 
         for (int i = 1; i < joins.size(); i++) {
             LogicalPlan.JoinInfo ji = joins.get(i);
             PhysicalNode r = scans.get(normalize(ji.rightAlias()));
             if (r == null) throw unsupported("JOIN 右表无法定位: " + ji.rightAlias());
-            current = buildJoin(current, r, ji, relByAlias.get(normalize(ji.rightAlias())));
+            LogicalPlan.ResolvedRelation jr = relByAlias.get(normalize(ji.rightAlias()));
+            PhysicalNode prev = current;
+            current = buildJoin(current, r, ji, jr, leftDeclared);
+            leftDeclared = joinDeclaredOutput(leftDeclared, prev, r, ji, jr);
         }
         // 按原始 FROM 顺序套上行展开（内连接下展开位置不影响结果；表达式可引用已 join 的列）
         if (hasUnnest) {
@@ -2437,6 +2808,7 @@ public final class Planner {
             return null;
         }
         boolean changed = false;
+        List<MaterializedCteScanOperator.Store> fresh = new ArrayList<>();
         List<LogicalPlan.ResolvedRelation> out = new ArrayList<>(rels.size());
         for (LogicalPlan.ResolvedRelation rel : rels) {
             LogicalPlan body = rel.subquery().orElse(null);
@@ -2445,6 +2817,7 @@ public final class Planner {
                 boolean alreadyMaterialized = materializedCtes.containsKey(body);
                 if (!alreadyMaterialized && (all || !derivedStreamable(rel))) {
                     registerDerivedStore(rel, body);
+                    fresh.add(materializedCtes.get(body));
                     alreadyMaterialized = true;
                 }
                 if (alreadyMaterialized) {
@@ -2455,7 +2828,49 @@ public final class Planner {
             }
             out.add(rel);
         }
+        prefetchSiblingStores(fresh);
         return changed ? out : null;
+    }
+
+    /**
+     * <b>同一层的多个派生体并行物化</b> —— 旧实现逐个惰性执行（{@code planSlices → wirePayloads}），
+     * 一层有 N 个派生体就串行跑 N 个完整子查询；嵌套派生表越多，join 算子 open 前越慢。
+     *
+     * <p><b>规划期只做规划，执行推迟到首次取载荷</b>：这里的 {@link #prepareMaterializedBodies()}
+     * 把全部物化体的查询体先规划完（规划会写 Planner 的可变状态 {@code materializedCtes} 等，
+     * 只能单线程跑）。真正的执行（{@code wirePayloads()}：跑子查询 → 落盘 → 编码载荷）挂到
+     * {@link MaterializedCteScanOperator.Store#linkPrefetchGroup}，由 open 期首次
+     * {@code planSlices → wirePayloads()} 触发 —— 规划期 {@code Planner.plan()} 返回前查询还没
+     * 登记进 {@code QueryManager}，此时派发的 Worker 片段会被僵尸片段回收判成「Master 不认」而取消。</p>
+     *
+     * <p>单个体不设预取组 —— 保持原来的惰性物化，避免把最终会回退 Master 单机的计划提前拉进执行。</p>
+     */
+    private void prefetchSiblingStores(List<MaterializedCteScanOperator.Store> fresh) {
+        if (fresh.size() < 2) {
+            return;
+        }
+        prepareMaterializedBodies();
+        MaterializedCteScanOperator.Store.linkPrefetchGroup(fresh);
+    }
+
+    /**
+     * 把当前登记的全部物化体（含规划过程中<b>新登记</b>的嵌套派生体）的查询体规划完。
+     * 幂等：已规划的 Store 直接返回缓存。
+     */
+    private void prepareMaterializedBodies() {
+        while (true) {
+            int before = materializedCtes.size();
+            for (MaterializedCteScanOperator.Store store : new ArrayList<>(materializedCtes.values())) {
+                try {
+                    store.prepare();
+                } catch (Throwable ignored) {
+                    // 规划失败留到执行期由 Store 缓存并上抛（保持原来的错误可见性）。
+                }
+            }
+            if (materializedCtes.size() == before) {
+                return;
+            }
+        }
     }
 
     /** 派生体能否走现有「派生源」流式流水线（{@link #planDerived} 可解析）；解析失败按不支持处理。 */
@@ -2463,6 +2878,9 @@ public final class Planner {
         try {
             return planDerived(rel) != null;
         } catch (RuntimeException e) {
+            String name = rel.table() == null || rel.table().isBlank() ? "subquery" : rel.table();
+            System.err.printf("[Planner] 派生流水线解析异常（%s，%d 列）：%s%n",
+                    name, rel.columns().size(), e);
             return false;
         }
     }
@@ -2558,10 +2976,17 @@ public final class Planner {
     }
 
     /**
-     * 派生表单个输出列的类型：基表裸列 → 原类型；count → BIGINT；sum/avg → DOUBLE；min/max → 入参列类型。
+     * 派生表单个输出列的类型：基表裸列 → 原类型；count → BIGINT；sum/avg/min/max 按<b>输入列类型</b>
+     * 推导。
      *
-     * <p>条件聚合按改写后的普通聚合定类型：{@code count_if} → BIGINT、{@code sum_if} → DOUBLE、
-     * {@code min_if/max_if} → value 参数（第一个逗号参数）的类型。</p>
+     * <p>★这里必须与 {@link AggregationSpec#outputArrowType(org.apache.arrow.vector.types.pojo.Field)}
+     * / {@code AggregationHashTable.resultTypeFor} 同口径 —— 声明列用于空分区输出 schema，类型错了
+     * 会在 `assemble` 里把实际 BIGINT 数据按 DOUBLE 解释（{@code sum(int)} 变成 {@code 1.5E-323}）。
+     * 具体：{@code sum(整型)} → BIGINT、{@code sum/avg(DECIMAL)} → 放宽 DECIMAL、{@code min/max(整型/浮点)}
+     * → DOUBLE、{@code min/max(其他)} → 入参类型。</p>
+     *
+     * <p>条件聚合按改写后的普通聚合定类型：{@code count_if} → BIGINT、{@code sum_if} → 跟随 value
+     * 参数（第一个逗号参数）类型、{@code min_if/max_if} → value 参数类型。</p>
      */
     private static Field derivedFieldForItem(String text, String col, Map<String, Field> baseFields) {
         Field base = baseFields.get(SqlTextUtil.stripQualifier(text).toLowerCase(Locale.ROOT));
@@ -2571,22 +2996,34 @@ public final class Planner {
         Optional<SqlTextUtil.AggInfo> agg = SqlTextUtil.parseAggregate(text);
         if (agg.isEmpty()) return null;
         String fn = agg.get().function().toLowerCase(Locale.ROOT);
+        if ("count".equals(fn) || "count_distinct".equals(fn) || "count_if".equals(fn)) {
+            return new Field(col, FieldType.nullable(new ArrowType.Int(64, true)), null);
+        }
+        String argText = agg.get().arg();
+        if (fn.endsWith("_if")) {
+            // 条件聚合：value 是第一个顶层参数（第二参数为条件）
+            List<String> args = ScalarExpr.splitTopLevelComma(argText);
+            argText = args.isEmpty() ? null : args.get(0).trim();
+        }
+        Field arg = argText == null ? null : baseFields.get(
+                SqlTextUtil.stripQualifier(argText).toLowerCase(Locale.ROOT));
+        ArrowType argType = arg == null ? null : arg.getType();
+        ArrowType fp = new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE);
         return switch (fn) {
-            case "count", "count_distinct", "count_if" ->
-                    new Field(col, FieldType.nullable(new ArrowType.Int(64, true)), null);
-            case "sum", "avg", "sum_if" ->
-                    new Field(col, FieldType.nullable(
-                            new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)), null);
+            // SUM：整型 → BIGINT；DECIMAL → 放宽 DECIMAL；其余（含输入未知）→ DOUBLE
+            case "sum", "sum_if" -> new Field(col, FieldType.nullable(
+                    argType instanceof ArrowType.Int ? new ArrowType.Int(64, true)
+                            : argType instanceof ArrowType.Decimal d ? AggregationSpec.widenDecimal(d)
+                            : fp), null);
+            // AVG：DECIMAL → 放宽 DECIMAL；其余 → DOUBLE
+            case "avg" -> new Field(col, FieldType.nullable(
+                    argType instanceof ArrowType.Decimal d ? AggregationSpec.widenDecimal(d) : fp), null);
+            // MIN/MAX：数值（整型/浮点）→ DOUBLE；其他类型与输入同型
             case "min", "max", "min_if", "max_if" -> {
-                String argText = agg.get().arg();
-                if (fn.endsWith("_if")) {
-                    // 条件聚合：value 是第一个顶层参数（第二参数为条件）
-                    List<String> args = ScalarExpr.splitTopLevelComma(argText);
-                    argText = args.isEmpty() ? null : args.get(0).trim();
-                }
-                Field arg = argText == null ? null : baseFields.get(
-                        SqlTextUtil.stripQualifier(argText).toLowerCase(Locale.ROOT));
-                yield arg == null ? null : new Field(col, arg.getFieldType(), null);
+                if (argType == null) yield null;
+                ArrowType t = argType instanceof ArrowType.Int || argType instanceof ArrowType.FloatingPoint
+                        ? fp : argType;
+                yield new Field(col, FieldType.nullable(t), null);
             }
             default -> null;
         };
@@ -2594,6 +3031,18 @@ public final class Planner {
 
     private PhysicalNode buildJoin(PhysicalNode left, PhysicalNode right,
                                    LogicalPlan.JoinInfo ji, LogicalPlan.ResolvedRelation rightRel) {
+        return buildJoin(left, right, ji, rightRel, null);
+    }
+
+    /**
+     * @param declaredLeft 左表（probe 侧）<b>声明列</b>（下一层递归算出的左页静态 schema）。
+     *                     RIGHT / FULL join 的某分区 probe 侧一页未收时，用它造出「右行 + 左列全
+     *                     NULL」的输出 schema。与分布式 {@code StageScheduler.leftFieldsForChain}
+     *                     同口径；null = 不声明（旧行为，空 probe 分区会静默丢孤儿行）。
+     */
+    private PhysicalNode buildJoin(PhysicalNode left, PhysicalNode right,
+                                   LogicalPlan.JoinInfo ji, LogicalPlan.ResolvedRelation rightRel,
+                                   List<Field> declaredLeft) {
         // CROSS：无 join key，不分区，交给 CrossJoinOperator
         if (ji.joinType() == LogicalPlan.JoinType.CROSS) {
             return buildCrossJoin(left, right);
@@ -2605,6 +3054,25 @@ public final class Planner {
                 new ArrayList<>(right.outputColumns()), ji);
         List<String> leftKeys = keys.leftKeys();
         List<String> rightKeys = keys.rightKeys();
+        // ON 表达式键：先在两侧页尾物化合成列（单机 join 与 Worker 片段同一机制，页列序一致）
+        List<String> leftOut = new ArrayList<>(left.outputColumns());
+        List<String> rightOut = new ArrayList<>(right.outputColumns());
+        Operator leftSide = left.operator();
+        Operator rightSide = right.operator();
+        if (!keys.leftComputed().isEmpty()) {
+            leftSide = new ExpressionProjectOperator(leftSide, keys.leftComputed());
+            for (GroupKeyExpression g : keys.leftComputed()) leftOut.add(g.derivedColumn());
+            // 合成列必须成为计划树的一个节点：列裁剪靠 ExpressionProject 的 sourceColumns()
+            // 保住表达式引用的扫描列（只藏在算子链里 → 扫描会被裁成只剩键列 → 求值找不到列）。
+            left = new PhysicalNode("ExpressionProject[" + derivedNames(keys.leftComputed()) + "]",
+                    leftSide, leftOut, left);
+        }
+        if (!keys.rightComputed().isEmpty()) {
+            rightSide = new ExpressionProjectOperator(rightSide, keys.rightComputed());
+            for (GroupKeyExpression g : keys.rightComputed()) rightOut.add(g.derivedColumn());
+            right = new PhysicalNode("ExpressionProject[" + derivedNames(keys.rightComputed()) + "]",
+                    rightSide, rightOut, right);
+        }
 
         // 恒定并行 HashJoin：两侧各一个 HashPartitionOperator（每分区有界队列 + 后台分发线程），
         // N 个 join 工作线程按分区号各跑各的 build/probe/send。相同 join key 必然落到同一分区号，
@@ -2613,29 +3081,35 @@ public final class Planner {
         int partitions = Math.max(1, context.parallelism());
         // 全链路并行：每个分发线程对应一个 scan 线程，共享分区队列
         HashPartitionOperator leftPart = new HashPartitionOperator(
-                left.operator(), new ArrayList<>(leftKeys), partitions, partitions);
+                leftSide, new ArrayList<>(leftKeys), partitions, partitions);
         HashPartitionOperator rightPart = new HashPartitionOperator(
-                right.operator(), new ArrayList<>(rightKeys), partitions, partitions);
+                rightSide, new ArrayList<>(rightKeys), partitions, partitions);
         PhysicalNode leftNode = new PhysicalNode("HashPartition[" + leftKeys + "]",
-                leftPart, left.outputColumns(), left);
+                leftPart, leftOut, left);
         PhysicalNode rightNode = new PhysicalNode("HashPartition[" + rightKeys + "]",
-                rightPart, right.outputColumns(), right);
-        List<String> outCols = joinOutputColumns(jt, left.outputColumns(), right.outputColumns(),
+                rightPart, rightOut, right);
+        List<String> outCols = joinOutputColumns(jt, leftOut, rightOut,
                 leftKeys, rightKeys);
         // 单机回退 join 同样受 build 侧内存约束（HashJoinOperator 超预算 fail-fast）。
         // build 侧体量不可估 / 超预算 → 排序归并（两侧排序可溢写），避免「build side too large」。
-        List<Field> declaredRight = declaredRightFields(rightRel);
+        List<Field> declaredRight = AbstractDistributedOperator.appendJoinKeyComputed(
+                declaredRightFields(rightRel), keys.rightComputed());
+        // 左表声明列：同右表一样，只在本分区 probe 侧一页未收时用于兜底构造输出 schema
+        //（RIGHT/FULL 必须补发「右行 + 左列全 NULL」）。表达式键合成列同样追加到左页末尾。
+        declaredLeft = AbstractDistributedOperator.appendJoinKeyComputed(
+                declaredLeft, keys.leftComputed());
+        boolean sortMerge = localJoinUseSortMerge(keys, rightRel);
         Operator join;
         String name;
-        if (localJoinUseSortMerge(keys, rightRel)) {
+        if (sortMerge) {
             join = new SortMergeJoinOperator(
                     leftPart, rightPart, leftKeys, rightKeys, jt,
-                    context.memoryLimit(), partitions, declaredRight);
+                    context.memoryLimit(), partitions, declaredRight, declaredLeft);
             name = "SortMergeJoin[" + jt + ", " + leftKeys + "=" + rightKeys + "]";
         } else {
             join = new HashJoinOperator(
                     leftPart, rightPart, leftKeys, rightKeys, jt,
-                    context.memoryLimit(), partitions, declaredRight, null, false,
+                    context.memoryLimit(), partitions, declaredRight, declaredLeft, false,
                     keys.onLeftFilter(), keys.onRightFilter());
             name = "HashJoin[" + jt + ", " + leftKeys + "=" + rightKeys + "]";
         }
@@ -2644,6 +3118,44 @@ public final class Planner {
                 left.estimatedRows(), right.estimatedRows(),
                 JoinCardinality.UNKNOWN, JoinCardinality.UNKNOWN);
         return new PhysicalNode(name, join, outCols, leftNode, rightNode).withEstimate(estimatedRows);
+    }
+
+    /**
+     * 本层 join 输出页的<b>声明列</b>（= join 链下一层的左表声明列）。
+     *
+     * <p>拼法与 {@link HashJoinOperator#ensureOutputSchema} / {@link SortMergeJoinOperator} 一致：
+     * 左声明列 + 本层 ON 表达式键合成列 + 右声明列；INNER 且选哈希类 join 时剔除与左键同名的右键
+     * （排序归并保留）。任一环节取不到静态类型 → 返回 null（下一层退回旧行为，<b>不猜</b>）。
+     * 与分布式 {@code StageScheduler.leftFieldsForChain} 同口径。</p>
+     */
+    private List<Field> joinDeclaredOutput(List<Field> leftDeclared, PhysicalNode leftNode,
+                                           PhysicalNode rightNode, LogicalPlan.JoinInfo ji,
+                                           LogicalPlan.ResolvedRelation rightRel) {
+        if (leftDeclared == null) return null;
+        JoinKeys keys;
+        try {
+            keys = parseJoinKeys(new ArrayList<>(leftNode.outputColumns()),
+                    new ArrayList<>(rightNode.outputColumns()), ji);
+        } catch (RuntimeException e) {
+            return null;   // 非等值 / 解析不了：不声明（不猜）
+        }
+        List<Field> out = AbstractDistributedOperator.appendJoinKeyComputed(
+                leftDeclared, keys.leftComputed());
+        if (out == null) return null;
+        List<Field> rightDeclared = AbstractDistributedOperator.appendJoinKeyComputed(
+                declaredRightFields(rightRel), keys.rightComputed());
+        if (rightDeclared == null) return null;
+        out = new ArrayList<>(out);
+        boolean hashLike = !localJoinUseSortMerge(keys, rightRel);
+        boolean inner = mapJoinType(ji.joinType()) == JoinType.INNER;
+        for (Field rf : rightDeclared) {
+            if (hashLike && inner && keys.rightKeys().contains(rf.getName())
+                    && keys.leftKeys().contains(rf.getName())) {
+                continue;
+            }
+            out.add(rf);
+        }
+        return out;
     }
 
     /**
@@ -2667,7 +3179,7 @@ public final class Planner {
         try {
             DojaoConnector probe = rightRel == null ? null : connectorFor(rightRel.catalog());
             rightBytes = probe == null ? JoinDecider.UNKNOWN
-                    : JoinDecider.estimateBytes(JoinDecider.StatsProbe.of(probe),
+                    : JoinDecider.estimateBytes(statsProbe(probe),
                             rightRel.catalog(), rightRel.schema(), rightRel.table(), relScanFilter(rightRel));
         } catch (RuntimeException e) {
             rightBytes = JoinDecider.UNKNOWN;
@@ -2733,17 +3245,25 @@ public final class Planner {
                 rightRel.catalog(), rightRel.schema(), rightRel.table(), keys.rightKeys(),
                 jt, context.memoryLimit(), partitions,
                 context.workerGateway(), leftProbe, rightProbe, workers, leftFilter, rightFilter,
-                algorithm, leftColumns, rightColumns, keys.onLeftFilter(), keys.onRightFilter());
+                algorithm, leftColumns, rightColumns, keys.onLeftFilter(), keys.onRightFilter(),
+                keys.leftComputed(), keys.rightComputed());
 
-        List<String> outCols = joinOutputColumns(jt, new ArrayList<>(leftRel.columns()),
-                new ArrayList<>(rightRel.columns()), keys.leftKeys(), keys.rightKeys());
+        // 页列序 = 「左扫描列 + 左合成列」⋈「右扫描列 + 右合成列」（合成列由发送端追加到页尾）
+        List<String> outLeft = leftColumns == null || leftColumns.isEmpty()
+                ? new ArrayList<>(leftRel.columns()) : new ArrayList<>(leftColumns);
+        List<String> outRight = rightColumns == null || rightColumns.isEmpty()
+                ? new ArrayList<>(rightRel.columns()) : new ArrayList<>(rightColumns);
+        for (GroupKeyExpression g : keys.leftComputed()) outLeft.add(g.derivedColumn());
+        for (GroupKeyExpression g : keys.rightComputed()) outRight.add(g.derivedColumn());
+        List<String> outCols = joinOutputColumns(jt, outLeft, outRight,
+                keys.leftKeys(), keys.rightKeys());
         String name = "DistributedJoin[" + jt + ", " + keys.leftKeys() + "=" + keys.rightKeys()
                 + ", " + JoinExplain.label(algorithm)
                 + ", workers=" + workers.size() + ", partitions=" + partitions + "]";
         // 估算行数（EXPLAIN 用）：|L✕R| = |L|×|R|/max(ndv)；ndv 探不到 → 外键假设（输出 ≈ 大的一侧）
-        long leftRows = JoinCardinality.sideRows(JoinDecider.StatsProbe.of(leftProbe),
+        long leftRows = JoinCardinality.sideRows(statsProbe(leftProbe),
                 leftRel.catalog(), leftRel.schema(), leftRel.table(), leftFilter);
-        long rightRows = JoinCardinality.sideRows(JoinDecider.StatsProbe.of(rightProbe),
+        long rightRows = JoinCardinality.sideRows(statsProbe(rightProbe),
                 rightRel.catalog(), rightRel.schema(), rightRel.table(), rightFilter);
         long ndvLeft = JoinCardinality.ndvForKeys(
                 safeStats(leftProbe, leftRel.catalog(), leftRel.schema(), leftRel.table()), keys.leftKeys());
@@ -2835,6 +3355,10 @@ public final class Planner {
             // 分布式派生 join 的 JoinStep 通道尚未携带 ON 残差谓词 → 回退单机（语义完整，本地支持）。
             return null;
         }
+        if (jk.hasComputed()) {
+            // 派生聚合流水线的输出直接进 join，没有「发送端追加 ON 表达式合成列」的通道 → 回退单机。
+            return null;
+        }
         List<String> derivedKeys = leftIsDerived ? jk.leftKeys() : jk.rightKeys();
         List<String> peerKeys = leftIsDerived ? jk.rightKeys() : jk.leftKeys();
 
@@ -2853,7 +3377,8 @@ public final class Planner {
                 relScanFilter(peerRel),
                 jt, context.memoryLimit(), partitions,
                 context.workerGateway(), innerProbe, peerProbe, workers, dp.projections(), dp.window(),
-                dp.outerKeys(), dp.outerAggregations(), joinAlgorithm);
+                dp.outerKeys(), dp.outerAggregations(), dp.isProjection() ? dp.outputColumns() : null,
+                joinAlgorithm);
 
         List<String> outCols = leftIsDerived
                 ? joinOutputColumns(jt, dp.outputColumns(), peerCols, derivedKeys, peerKeys)
@@ -2887,12 +3412,12 @@ public final class Planner {
         long buildBytes;
         if (leftIsDerived) {
             // 派生在 SQL 左 ⇒ 右表（peer）是 build 侧。
-            buildBytes = JoinDecider.estimateBytes(JoinDecider.StatsProbe.of(peerProbe),
+            buildBytes = JoinDecider.estimateBytes(statsProbe(peerProbe),
                     peerRel.catalog(), peerRel.schema(), peerRel.table(), relScanFilter(peerRel));
         } else {
             // 派生在 SQL 右 ⇒ 派生流（内层聚合结果）是 build 侧，用内层源表体量做上界。
             ReadRequest req = dp.innerRequest();
-            buildBytes = JoinDecider.estimateBytes(JoinDecider.StatsProbe.of(innerProbe),
+            buildBytes = JoinDecider.estimateBytes(statsProbe(innerProbe),
                     req.catalog(), req.schema(), req.table(), req.filterExpression().orElse(null));
         }
         FragmentSpec.JoinAlgorithm auto =
@@ -2920,7 +3445,8 @@ public final class Planner {
 
     /**
      * 解析派生表（子查询 / CTE，<b>展平不了的那种</b>）为分布式执行描述 —— 限「单裸基表 + GROUP BY
-     * 裸分组键 + 内置五聚合（count / sum / avg / min / max）+ 聚合输入为裸列 / {@code CASE WHEN ... END} /
+     * 裸分组键 + 内置五聚合（count / sum / avg / min / max；<b>可为空</b> = {@code SELECT k ... GROUP BY k}
+     * 的 DISTINCT 去重）+ 聚合输入为裸列 / {@code CASE WHEN ... END} /
      * {@code IF(...)} / 算术表达式 + 可空内层 WHERE（合并 {@code inner.where()} 与优化器可能挂到基表的
      * {@code filter}）+ 可空内层 HAVING（引用本地聚合输出列 / 分组键）」。
      *
@@ -2930,7 +3456,7 @@ public final class Planner {
      *
      * <p>两表派生 join 与多表链里的派生源共用本方法 —— 派生体形态判定只有这一处实现。</p>
      *
-     * @return {@code null} = 形态不支持（分组键改名 / 非内置聚合 / 嵌套派生 / 无聚合 / 窗口 / 标量子查询…）
+     * @return {@code null} = 形态不支持（分组键改名 / 非内置聚合 / 嵌套派生 / 窗口 / 标量子查询…）
      *         → 调用方回退单机路径（本地完整支持，行为不变）
      */
     private DerivedPlan planDerived(LogicalPlan.ResolvedRelation derivedRel) {
@@ -3086,9 +3612,8 @@ public final class Planner {
                 keySelected[ki] = true;
             }
         }
-        if (aggs.isEmpty()) {
-            return null;   // GROUP BY 无聚合（等价 DISTINCT）→ 后置
-        }
+        // 零聚合 = DISTINCT 派生表（`SELECT k FROM t GROUP BY k`）。派生源按分组键哈希分区去重即可，
+        // 与「键 + 聚合」同一套流水线（AggregateStep 的 aggs 为空时只做分组去重）—— 不必物化。
         for (boolean sel : keySelected) {
             if (!sel) {
                 return null;   // 分组键未全部 SELECT → 派生体可见列 != 聚合输出，后置
@@ -3342,8 +3867,12 @@ public final class Planner {
      * （裸列 / 数值字面量 / 数值算术 / 比较与布尔 / 同型 CASE），其余（函数调用 / 混合分支 CASE /
      * 字符串参与算术）一律返回 null → 回退单机（行为不变，本地完整支持）。</p>
      *
-     * <p>派生<b>关系上挂的谓词</b>（{@code derivedRel.filter()}）引用派生输出列、需在投影之后再过滤 ——
-     * 本版不接受（返回 null 回退单机），保持「不引入未验证语义」。</p>
+     * <p>派生<b>关系上挂的谓词</b>（{@code derivedRel.filter()}，由外层 WHERE 下推）：只引用
+     * <b>基表裸列</b>（列名透传）→ 并入扫描过滤（投影前求值，语义等价）；引用<b>派生别名</b>
+     * （改名列 / 表达式列）→ 落成 Producer 的<b>投影后过滤</b>（派生列物化之后、哈希分区之前，
+     * 见 {@link com.dojao.core.operator.FragmentSpec.Producer#filterAfterProject()}）—— 两侧都是
+     * 大表派生源时，外层谓词不再把整侧推回物化路径（否则撞 {@code query.cte.wire.maxBytes}）。
+     * 谓词引用非派生输出列 / 与基表同名列歧义 → 返回 null 回退单机。</p>
      *
      * @param derivedRel 派生关系（{@code subquery} 非空）
      * @param inner      派生体内层的 {@code Select}（调用方已判：单 FROM / 无 join / 无标量子查询 / 空 GROUP BY）
@@ -3352,25 +3881,53 @@ public final class Planner {
                                               LogicalPlan.Select inner) {
         if (inner.distinct() || inner.having().isPresent()
                 || !inner.orderBy().isEmpty() || inner.limit().isPresent() || inner.offset().isPresent()) {
-            return null;   // DISTINCT / HAVING / 排序·分页：投影型无法表达 → 回退单机
-        }
-        if (derivedRel.filter().isPresent()) {
-            return null;   // 派生关系上的谓词：要在投影之后再过滤 → 后置
+            // DISTINCT / HAVING / 排序·分页：投影型无法表达 → 回退单机
+            return rejectProjection(derivedRel, "DISTINCT / HAVING / ORDER BY / LIMIT / OFFSET");
         }
         LogicalPlan.ResolvedRelation baseRel = inner.fromRelations().get(0);
         if (baseRel.subquery().isPresent()) {
-            return null;   // 嵌套派生：应由 tryFlattenSimpleDerived 逐层展平（不在此重复）
+            // 嵌套派生：应由 tryFlattenSimpleDerived 逐层展平（不在此重复）
+            return rejectProjection(derivedRel, "基表是未展平的嵌套派生 " + baseRel.table());
+        }
+        // 派生关系上的谓词（外层 WHERE 下推所致）：先解析出引用列集，投影项分析完后再判定
+        // 「并入扫描过滤（纯基表裸列）」还是「投影后过滤（引用派生别名）」。否则外层谓词一出现
+        // 就把整侧派生表推回物化路径（两侧大表会撞 query.cte.wire.maxBytes）。
+        String derivedFilter = null;
+        Set<String> filterCols = Set.of();
+        if (derivedRel.filter().isPresent()) {
+            derivedFilter = SqlTextUtil.stripQualifiers(derivedRel.filter().get().text());
+            Set<String> parsed = predicateColumns(derivedFilter);
+            if (parsed == null) {
+                // 谓词解析不出列 → 后置
+                return rejectProjection(derivedRel, "派生关系谓词无法解析: " + derivedFilter);
+            }
+            filterCols = parsed;
         }
         DojaoConnector probe = connectorFor(baseRel.catalog());
         if (probe == null) {
-            return null;
+            return rejectProjection(derivedRel, "连接器不存在: catalog=" + baseRel.catalog());
+        }
+        // 基表列清单：语义层给出的列为主；若被裁成空 / 极窄（列元数据缺失、过度裁剪），
+        // 用连接器目录补全 —— 星号展开、表达式源列解析与扫描的类型推断都以此为准。
+        // 只影响「读哪些列」的清单，不改变语义（多读的列由 needed 过滤，不会进输出）。
+        List<String> baseCols = new ArrayList<>(baseRel.columns());
+        try {
+            for (com.dojao.spi.bean.Column c : probe.getTableColumns(
+                    baseRel.catalog(), baseRel.schema(), baseRel.table())) {
+                if (c != null && c.name() != null && !containsIgnoreCase(baseCols, c.name())) {
+                    baseCols.add(c.name());
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // 元数据不可得 → 仅用语义层列清单
         }
         List<Field> baseFields;
         try {
             baseFields = AbstractDistributedOperator.scanFields(probe,
-                    baseRel.catalog(), baseRel.schema(), baseRel.table(), baseRel.columns());
+                    baseRel.catalog(), baseRel.schema(), baseRel.table(), baseCols);
         } catch (RuntimeException e) {
-            return null;   // 元数据不可得 → 类型无法推断
+            // 元数据不可得 → 类型无法推断
+            return rejectProjection(derivedRel, "基表列类型不可得: " + e);
         }
         Map<String, Field> typeOf = new HashMap<>();
         for (Field f : baseFields) {
@@ -3382,44 +3939,88 @@ public final class Planner {
         List<StageScheduler.DerivedProjection> projections = new ArrayList<>();
         // 外层实际引用的派生输出列（列裁剪收窄后的子集）：只物化被引用的列 / 只读其输入列。
         Set<String> wanted = lowerSet(derivedRel.columns());
+        // 谓词引用的派生别名必须物化（列裁剪不能把它裁掉，否则投影后过滤找不到列）
+        for (String c : filterCols) {
+            if (!containsIgnoreCase(baseCols, c)) {
+                wanted.add(c.toLowerCase(Locale.ROOT));
+            }
+        }
         // ★只在「外层至少引用了一个派生表达式列」时才裁剪表达式项：否则把唯一/全部表达式裁掉
         //   会令 projections 空 → 本路径放弃（退化为纯扫描，本可由展平路径承接）。
         boolean narrowExprs = !wanted.isEmpty() && hasWantedProjection(inner, wanted);
         for (LogicalPlan.SelectItem item : inner.selectItems()) {
             String text = item.expression().text().trim();
             if (isStarExpansion(text)) {
-                return null;   // SELECT * → 交给展平路径（那里按基表真实列展开）
+                // SELECT * / a.*：展开成基表真实列（与 tryFlattenSimpleDerived 同口径）；外层未引用的列
+                // 由 wanted 过滤 —— 例：`select *, coalesce(...) as org_id from t` 正是「裸列 + 表达式
+                // 派生列」的投影型形态，此前直接放弃 → 整侧派生表退回物化（大表会撞 wire 载荷上限）。
+                if (!starQualifierMatchesBase(text, baseRel)) {
+                    // `x.*` 指向未知关系 → 不展开，回退单机
+                    return rejectProjection(derivedRel, "星号限定符不匹配基表: " + text);
+                }
+                for (String col : baseCols) {
+                    if (!wanted.isEmpty() && !wanted.contains(col.toLowerCase(Locale.ROOT))) {
+                        continue;
+                    }
+                    if (!containsIgnoreCase(needed, col)) {
+                        needed.add(col);
+                    }
+                    if (!containsIgnoreCase(outputColumns, col)) {
+                        outputColumns.add(col);
+                    }
+                }
+                continue;
             }
             if (!item.windowCalls().isEmpty()) {
-                return null;   // 窗口嵌在表达式里 → 非「逐行投影」形态，回退单机
+                // 窗口嵌在表达式里 → 非「逐行投影」形态，回退单机
+                return rejectProjection(derivedRel, "SELECT 项含窗口函数: " + text);
             }
             if (!(item.expression() instanceof Expression.WindowFunction) && hasAggregateCall(text)) {
-                return null;   // 聚合（含嵌在表达式里的）→ 非「逐行投影」形态，回退单机
+                // 聚合（含嵌在表达式里的）→ 非「逐行投影」形态，回退单机
+                return rejectProjection(derivedRel, "SELECT 项含聚合调用: " + text);
             }
             if (SqlTextUtil.isColumnRef(text)) {
                 String col = SqlTextUtil.stripQualifier(text);
-                int ci = indexOfIgnoreCase(baseRel.columns(), col);
+                int ci = indexOfIgnoreCase(baseCols, col);
                 if (ci < 0) {
-                    return null;   // 裸列不在基表 → 回退单机
+                    // 裸列不在基表 → 回退单机
+                    return rejectProjection(derivedRel, "裸列不在基表: " + col
+                            + "（基表列数=" + baseCols.size() + "）");
                 }
-                String canonical = baseRel.columns().get(ci);
-                if (item.alias().isPresent() && !item.alias().get().equalsIgnoreCase(canonical)) {
-                    return null;   // 裸列改名 → 回退单机（表达式投影器只追加、不改名）
-                }
-                if (!wanted.isEmpty() && !wanted.contains(canonical.toLowerCase(Locale.ROOT))) {
-                    continue;   // 外层未引用的裸列 → 跳过（不读该列）
+                String canonical = baseCols.get(ci);
+                boolean renamed = item.alias().isPresent()
+                        && !item.alias().get().equalsIgnoreCase(canonical);
+                String outName = renamed ? item.alias().get() : canonical;
+                if (!wanted.isEmpty() && !wanted.contains(outName.toLowerCase(Locale.ROOT))) {
+                    continue;   // 外层未引用的派生列 → 跳过（不读该列）
                 }
                 if (!containsIgnoreCase(needed, canonical)) {
                     needed.add(canonical);
                 }
-                outputColumns.add(canonical);
+                if (containsIgnoreCase(outputColumns, outName)) {
+                    // 派生输出重名（如 `x AS y` 与裸列 y 并存）→ 回退单机
+                    return rejectProjection(derivedRel, "派生输出重名: " + outName);
+                }
+                if (renamed) {
+                    // 裸列改名：表达式投影器只追加不改名 ⇒ 把 `src AS dst` 落成「追加 dst = src」。
+                    // 页 = 基表扫描列 + 派生列（追加在末尾），与投影型派生源既有声明列口径一致。
+                    Field src = typeOf.get(canonical.toLowerCase(Locale.ROOT));
+                    if (src == null) {
+                        // 元数据里没有该列类型 → 声明列无从推断，回退单机
+                        return rejectProjection(derivedRel, "改名列无类型元数据: " + canonical);
+                    }
+                    projections.add(new StageScheduler.DerivedProjection(outName, canonical,
+                            new Field(outName, src.getFieldType(), null)));
+                }
+                outputColumns.add(outName);
                 continue;
             }
             String outName = item.alias().isPresent()
                     ? item.alias().get()
                     : (SqlTextUtil.parseAggregate(text).isPresent() ? null : SqlTextUtil.normalize(text));
             if (outName == null) {
-                return null;   // 无别名的聚合调用 → 非本形态
+                // 无别名的聚合调用 → 非本形态
+                return rejectProjection(derivedRel, "无别名的非列表达式项: " + text);
             }
             // 外层未引用的派生列 → 跳过：不解析表达式、不物化、不读输入列。
             if (narrowExprs && !wanted.contains(outName.toLowerCase(Locale.ROOT))) {
@@ -3429,28 +4030,33 @@ public final class Planner {
             try {
                 node = ExprParser.parse(text);
             } catch (RuntimeException e) {
-                return null;   // 表达式不能解析（含窗口 / 标量函数未注册）→ 后置
+                // 表达式不能解析（含窗口 / 标量函数未注册）→ 后置
+                return rejectProjection(derivedRel, "表达式无法解析: " + text + " → " + e);
             }
             Set<String> srcCols = new ExprEvaluator(node).columnArgs();
             Map<String, Field> srcFields = new HashMap<>(srcCols.size());
             for (String c : srcCols) {
-                int idx = indexOfIgnoreCase(baseRel.columns(), c);
+                int idx = indexOfIgnoreCase(baseCols, c);
                 if (idx < 0) {
-                    return null;   // 表达式引用列不在基表 → 回退单机
+                    // 表达式引用列不在基表 → 回退单机
+                    return rejectProjection(derivedRel, "表达式引用列不在基表: " + c
+                            + "（表达式 " + text + "，基表列数=" + baseCols.size() + "）");
                 }
-                String canonical = baseRel.columns().get(idx);
+                String canonical = baseCols.get(idx);
                 Field f = typeOf.get(canonical.toLowerCase(Locale.ROOT));
                 if (f == null) {
-                    return null;   // 元数据里没有该列的类型 → 回退单机
+                    // 元数据里没有该列的类型 → 回退单机
+                    return rejectProjection(derivedRel, "表达式源列无类型元数据: " + canonical);
                 }
                 srcFields.put(c, f);
             }
             Field field = inferExprField(outName, node, srcFields);
             if (field == null) {
-                return null;   // 类型不可静态推断 → 回退单机
+                // 类型不可静态推断 → 回退单机
+                return rejectProjection(derivedRel, "表达式结果类型不可推断: " + text);
             }
             for (String c : srcCols) {
-                String canonical = baseRel.columns().get(indexOfIgnoreCase(baseRel.columns(), c));
+                String canonical = baseCols.get(indexOfIgnoreCase(baseCols, c));
                 if (!containsIgnoreCase(needed, canonical)) {
                     needed.add(canonical);
                 }
@@ -3458,19 +4064,71 @@ public final class Planner {
             projections.add(new StageScheduler.DerivedProjection(outName, text, field));
             outputColumns.add(outName);
         }
+        // 派生别名与基表列同名（`SELECT f(x) AS x FROM t`，而 t 也有 x）：派生列是<b>追加</b>物化的，
+        // 页内出现两份同名 x，按名裁回声明列（ProjectOperator）只能取首个 ⇒ 会取到错误的基表列。
+        // 放弃下沉回退单机（本地走显式 Project，不受影响）。
+        for (StageScheduler.DerivedProjection p : projections) {
+            if (containsIgnoreCase(baseCols, p.column())) {
+                return rejectProjection(derivedRel, "派生列名与基表列重名: " + p.column());
+            }
+        }
         // 外层实际引用的派生列必须全部能产出（列裁剪可能把 rel.columns() 收窄成子集）
         for (String c : derivedRel.columns()) {
             if (!containsIgnoreCase(outputColumns, c)) {
-                return null;   // 改名 / 未选出的列 → 回退单机
+                // 改名 / 未选出的列 → 回退单机
+                return rejectProjection(derivedRel, "派生输出列无法产出: " + c
+                        + "（已产出 " + outputColumns + "，基表列数=" + baseCols.size() + "）");
+            }
+        }
+
+        // 谓词归类：纯基表裸列 → 并入扫描过滤（投影前求值，语义等价）；引用派生别名 → 投影后过滤
+        // （Producer 的 filterAfterProject：派生列物化之后、哈希分区之前逐行求值）。
+        String postFilter = null;
+        if (derivedFilter != null && !filterCols.isEmpty()) {
+            boolean allBase = true;
+            for (String c : filterCols) {
+                if (!containsIgnoreCase(baseCols, c)) {
+                    allBase = false;
+                    break;
+                }
+            }
+            if (!allBase) {
+                for (String c : filterCols) {
+                    boolean isBase = containsIgnoreCase(baseCols, c);
+                    boolean isAlias = containsIgnoreCase(outputColumns, c);
+                    if (!isBase && !isAlias) {
+                        // 引用非派生输出列 → Worker 侧无从求值，回退单机
+                        return rejectProjection(derivedRel, "谓词引用非派生输出列: " + c
+                                + "（谓词 " + derivedFilter + "）");
+                    }
+                    boolean aliasProjected = false;
+                    for (StageScheduler.DerivedProjection p : projections) {
+                        if (p.column().equalsIgnoreCase(c)) {
+                            aliasProjected = true;
+                            break;
+                        }
+                    }
+                    if (isBase && aliasProjected) {
+                        // 基表同名列与别名同名 → 页内列名歧义，回退单机
+                        return rejectProjection(derivedRel, "页内列名歧义（基表列与派生别名同名）: " + c);
+                    }
+                    if (isBase && !isAlias && !containsIgnoreCase(needed, c)) {
+                        needed.add(c);   // 谓词引用的基表裸列未投影 → 补进扫描（过滤先于投影后求值）
+                    }
+                }
+                postFilter = derivedFilter;
             }
         }
 
         // 派生内层 WHERE（inner.where + 优化器可能挂到基表的 filter）合并为单一谓词，整体下发扫描节点；
         // 引擎真正求值的那部分谓词列必须一并投影（投影先于过滤）。
         String innerFilter = null;
-        List<String> whereParts = new ArrayList<>(2);
+        List<String> whereParts = new ArrayList<>(3);
         inner.where().ifPresent(e -> whereParts.add(SqlTextUtil.stripQualifiers(e.text())));
         baseRel.filter().ifPresent(e -> whereParts.add(SqlTextUtil.stripQualifiers(e.text())));
+        if (postFilter == null && derivedFilter != null && !derivedFilter.isBlank()) {
+            whereParts.add(derivedFilter);   // 外层 WHERE 下推到派生关系、且只引用基表裸列
+        }
         if (!whereParts.isEmpty()) {
             String merged = String.join(" AND ", whereParts);
             innerFilter = merged;
@@ -3487,8 +4145,29 @@ public final class Planner {
                 ReadRequest.of(baseRel.catalog(), baseRel.schema(), baseRel.table()), needed);
         innerRequest = (innerFilter == null || innerFilter.isBlank())
                 ? innerRequest : innerRequest.withFilter(innerFilter);
-        return new DerivedPlan(innerRequest, List.of(), List.of(), List.of(), null, outputColumns,
+        // havingFilter 槽位在投影形态下承载「投影后过滤」（聚合形态承载聚合后过滤，见 DerivedPlan 文档）
+        return new DerivedPlan(innerRequest, List.of(), List.of(), List.of(), postFilter, outputColumns,
                 projections);
+    }
+
+    /** 谓词文本引用的列集（调用方已去限定符）；解析失败返回 {@code null}（调用方保守回退）。 */
+    private static Set<String> predicateColumns(String text) {
+        try {
+            return new ExprEvaluator(ExprParser.parse(text)).columnArgs();
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 投影型派生源<b>放弃下沉</b>的显式原因（规划期一次性日志，便于线上定位「为什么又走 A 方案物化」），
+     * 恒返回 {@code null} 供调用方直接 {@code return}。
+     */
+    private static DerivedPlan rejectProjection(LogicalPlan.ResolvedRelation derivedRel, String reason) {
+        String name = derivedRel.table() == null || derivedRel.table().isBlank()
+                ? "subquery" : derivedRel.table();
+        System.err.printf("[Planner] 投影型派生源无法下沉（%s）：%s%n", name, reason);
+        return null;
     }
 
     /**
@@ -3735,7 +4414,8 @@ public final class Planner {
     /** {@link DerivedPlan} → 舞台层的派生源描述（{@link StageScheduler.DerivedSource}）。 */
     private static StageScheduler.DerivedSource derivedSource(DerivedPlan dp, DojaoConnector innerProbe) {
         return new StageScheduler.DerivedSource(innerProbe, dp.innerRequest(), dp.innerKeys(),
-                dp.aggregations(), dp.caseProjections(), dp.havingFilter(), dp.projections(), dp.window());
+                dp.aggregations(), dp.caseProjections(), dp.havingFilter(), dp.projections(), dp.window(),
+                dp.outputColumns());
     }
 
     /** 派生基表的轻量虚节点：只承载列清单供共享 CASE/IF 解析器做列存在性校验（永不执行算子）。 */
@@ -3890,11 +4570,11 @@ public final class Planner {
         // 非末层不消费（那几层只用右表 = 可行性判据）。行宽用左首表口径（join 输出更宽 → 低估 → 保守）。
         // 首表是派生源时体量不可知（UNKNOWN）→ 末层选型走最保守的可溢写排序归并。
         long runningLeftRows = firstPlan == null
-                ? JoinCardinality.sideRows(JoinDecider.StatsProbe.of(firstProbe),
+                ? JoinCardinality.sideRows(statsProbe(firstProbe),
                         firstLeft.catalog(), firstLeft.schema(), firstLeft.table(), firstFilter)
                 : JoinCardinality.UNKNOWN;
         long runningLeftBytes = firstPlan == null
-                ? JoinDecider.estimateBytes(JoinDecider.StatsProbe.of(firstProbe),
+                ? JoinDecider.estimateBytes(statsProbe(firstProbe),
                         firstLeft.catalog(), firstLeft.schema(), firstLeft.table(), firstFilter)
                 : JoinCardinality.UNKNOWN;
         long avgRowBytes = (runningLeftRows > 0 && runningLeftBytes > 0)
@@ -3944,6 +4624,14 @@ public final class Planner {
                 JoinKeys keys = cross
                         ? new JoinKeys(List.of(), List.of())
                         : parseJoinKeys(accumCols, rightCols, ji);
+                // 派生源层没有「发送端追加合成列」的通道（派生聚合流水线的输出<b>直接</b>进 join，
+                // 中间没有地方插 ExpressionProject）→ 只有<b>右表侧</b>的 ON 表达式键才必须回退；
+                // 左表侧的合成列由上一层 Consumer 的 withNextComputed 追加（StageScheduler 支持），
+                // 不能一并拒绝 —— 否则「链上表达式键 + 派生右表」会整链放弃派生流水线、退到
+                // A 方案全量物化（哨兵表无统计 → 每层退化为 sort_merge，大表 join 溢写数十 GB）。
+                if (rightPlan != null && !keys.rightComputed().isEmpty()) {
+                    return null;
+                }
                 if (i == 0) {
                     // 首 join 的 probe 侧分区键：普通哈希 join = join 左键（共分区不变量）；
                     // CROSS 无键 ⇒ 用左表全列打散（空键分区会把左表全塞进 0 号桶 → 退化单机，
@@ -3966,7 +4654,7 @@ public final class Planner {
                                 ? chooseLastChainAlgorithm(runningLeftBytes, jt, rightProbe, rightRel,
                                         rightFilter, workers)
                                 : chooseChainAlgorithm(rightProbe, rightRel.catalog(), rightRel.schema(),
-                                        rightRel.table(), rightFilter, workers);
+                                        rightRel.table(), rightFilter, jt, workers);
                 links.add(new StageScheduler.JoinLink(keys.leftKeys(), keys.rightKeys(), jt,
                         rightPlan == null ? rightRel.catalog() : null,
                         rightPlan == null ? rightRel.schema() : null,
@@ -3975,7 +4663,8 @@ public final class Planner {
                         rightPlan == null ? scanColumns(rightCols, rightProbe, rightFilter) : null,
                         // CROSS 环节的左（probe）侧分区键 = 本层左表的全列（见 StageScheduler.JoinLink）
                         cross ? new ArrayList<>(accumCols) : null,
-                        keys.onLeftFilter(), keys.onRightFilter()));
+                        keys.onLeftFilter(), keys.onRightFilter())
+                        .withKeyComputed(keys.leftComputed(), keys.rightComputed()));
                 // 本层输出估算（EXPLAIN 末层行数 / 非末层累计下推）：左表的 join 键 ndv 拿不到
                 // （是上一层 join 的输出，连接器没有它的列统计）→ 传 UNKNOWN，由估算器按「维表报 pk、
                 // 事实表无统计」的形态用右侧 ndv 兜底；两侧都拿不到则退回外键假设（输出 ≈ 大的一侧）。
@@ -3985,7 +4674,7 @@ public final class Planner {
                     // 派生源层：右表体量 / ndv 都拿不到（派生体不是表，无列统计）→ 估算归零
                     outRows = JoinCardinality.UNKNOWN;
                 } else {
-                    long rightRows = JoinCardinality.sideRows(JoinDecider.StatsProbe.of(rightProbe),
+                    long rightRows = JoinCardinality.sideRows(statsProbe(rightProbe),
                             rightRel.catalog(), rightRel.schema(), rightRel.table(), rightFilter);
                     long ndvRight = JoinCardinality.ndvForKeys(
                             safeStats(rightProbe, rightRel.catalog(), rightRel.schema(), rightRel.table()),
@@ -3999,7 +4688,13 @@ public final class Planner {
                     runningLeftBytes = (rightPlan == null && outRows > 0 && avgRowBytes > 0)
                             ? outRows * avgRowBytes : JoinCardinality.UNKNOWN;
                 }
-                accumCols = joinOutputColumns(jt, accumCols, rightCols, keys.leftKeys(), keys.rightKeys());
+                // 本层两侧页列序 = 「扫描列 + 本侧 ON 表达式合成列」；输出列序据此推导
+                List<String> leftPageCols = new ArrayList<>(accumCols);
+                for (GroupKeyExpression g : keys.leftComputed()) leftPageCols.add(g.derivedColumn());
+                List<String> rightPageCols = new ArrayList<>(rightCols);
+                for (GroupKeyExpression g : keys.rightComputed()) rightPageCols.add(g.derivedColumn());
+                accumCols = joinOutputColumns(jt, leftPageCols, rightPageCols,
+                        keys.leftKeys(), keys.rightKeys());
             }
         } catch (RuntimeException e) {
             return null;   // 无法解析等值键 → 回退单机
@@ -4007,6 +4702,10 @@ public final class Planner {
 
         int partitions = Math.max(1, context.parallelism());
         String queryId = "query-" + Long.toHexString(System.nanoTime());
+        // 首层左侧是派生源时同样没有发送端合成列通道 → ON 表达式键回退单机
+        if (firstPlan != null && !links.get(0).leftComputed().isEmpty()) {
+            return null;
+        }
         if (firstPlan == null && !distributedFilterSupported(firstLeft)) {
             return null;   // 含引擎函数谓词 → 回退单机（本地 Filter 承接，结果正确）
         }
@@ -4034,13 +4733,77 @@ public final class Planner {
         return new PhysicalNode(name, op, accumCols, List.of()).withEstimate(chainEstimatedRows);
     }
 
-    /** 安全探表统计（探查失败 / 抛错 → null，估算层据此退回外键假设）。 */
-    private static TableStats safeStats(DojaoConnector probe, String catalog, String schema, String table) {
+    /** 安全探表统计（探查失败 / 抛错 → null，估算层据此退回外键假设），走本次规划的探查缓存。 */
+    private TableStats safeStats(DojaoConnector probe, String catalog, String schema, String table) {
         try {
-            return probe.getTableStats(catalog, schema, table);
+            return cachedStats(probe, catalog, schema, table);
         } catch (Exception e) {
             return null;
         }
+    }
+
+    private static String probeKey(String catalog, String schema, String table) {
+        return (catalog == null ? "" : catalog) + '\u0001'
+                + (schema == null ? "" : schema) + '\u0001'
+                + (table == null ? "" : table);
+    }
+
+    private static String probeKey(String catalog, String schema, String table, String filter) {
+        return probeKey(catalog, schema, table) + '\u0001' + (filter == null ? "" : filter);
+    }
+
+    /** 表统计（行数 / 体积 / 列统计）—— 同一次规划内按 表 缓存。 */
+    private TableStats cachedStats(DojaoConnector probe, String catalog, String schema, String table) {
+        String key = probeKey(catalog, schema, table);
+        if (probeStatsCache.containsKey(key)) {
+            return probeStatsCache.get(key);
+        }
+        TableStats stats = probe.getTableStats(catalog, schema, table);
+        probeStatsCache.put(key, stats);
+        return stats;
+    }
+
+    /**
+     * 把连接器适配成<b>本次规划内带缓存</b>的 {@link JoinDecider.StatsProbe}：
+     * 表统计 / 过滤后行数 / 过滤后字节三项按「表（+ 谓词）」去重，避免同一次规划对同表重复往返数据源。
+     * 探查抛错不缓存（下次仍会重试）。
+     */
+    private JoinDecider.StatsProbe statsProbe(DojaoConnector probe) {
+        JoinDecider.StatsProbe base = JoinDecider.StatsProbe.of(probe);
+        return new JoinDecider.StatsProbe() {
+            @Override
+            public TableStats stats(String catalog, String schema, String table) {
+                return cachedStats(probe, catalog, schema, table);
+            }
+
+            @Override
+            public long filteredRows(String catalog, String schema, String table, String filter) {
+                String key = probeKey(catalog, schema, table, filter);
+                if (!probeRowsCache.containsKey(key)) {
+                    probeRowsCache.put(key, base.filteredRows(catalog, schema, table, filter));
+                }
+                return probeRowsCache.get(key);
+            }
+
+            @Override
+            public long filteredBytes(String catalog, String schema, String table, String filter) {
+                String key = probeKey(catalog, schema, table, filter);
+                if (!probeBytesCache.containsKey(key)) {
+                    probeBytesCache.put(key, base.filteredBytes(catalog, schema, table, filter));
+                }
+                return probeBytesCache.get(key);
+            }
+
+            @Override
+            public double expandRatio() {
+                return base.expandRatio();
+            }
+
+            @Override
+            public double expandRatio(String catalog, String schema, String table) {
+                return base.expandRatio(catalog, schema, table);
+            }
+        };
     }
 
     /** 行数估算用的合并谓词文本（两段都空 → null；否则 AND 相连，各自补括号保持优先级）。 */
@@ -4168,9 +4931,9 @@ public final class Planner {
                                                            String rightCatalog, String rightSchema, String rightTable,
                                                            DojaoConnector rightProbe, String rightFilter,
                                                            JoinType jt, List<WorkerRegistration> workers) {
-        long leftBytes = JoinDecider.estimateBytes(JoinDecider.StatsProbe.of(leftProbe),
+        long leftBytes = JoinDecider.estimateBytes(statsProbe(leftProbe),
                 leftCatalog, leftSchema, leftTable, leftFilter);
-        long rightBytes = JoinDecider.estimateBytes(JoinDecider.StatsProbe.of(rightProbe),
+        long rightBytes = JoinDecider.estimateBytes(statsProbe(rightProbe),
                 rightCatalog, rightSchema, rightTable, rightFilter);
         long unit = JoinDecider.unit(context.memoryLimit(), weakestFreeBytes(workers));
         int nWorkers = workers.size();
@@ -4197,10 +4960,17 @@ public final class Planner {
      */
     private FragmentSpec.JoinAlgorithm chooseChainAlgorithm(DojaoConnector rightProbe, String rightCatalog,
                                                             String rightSchema, String rightTable, String rightFilter,
-                                                            List<WorkerRegistration> workers) {
-        long rightBytes = JoinDecider.estimateBytes(JoinDecider.StatsProbe.of(rightProbe),
+                                                            JoinType jt, List<WorkerRegistration> workers) {
+        long rightBytes = JoinDecider.estimateBytes(statsProbe(rightProbe),
                 rightCatalog, rightSchema, rightTable, rightFilter);
         long unit = JoinDecider.unit(context.memoryLimit(), weakestFreeBytes(workers));
+        // 逃生门与单 join / 链末层同口径：中间层不支持广播（需新的片段编排），强制 broadcast 时忽略。
+        JoinDecider.Decision forced = JoinDecider.forced(ResourceConfig.joinAlgorithm(),
+                JoinDecider.UNKNOWN, rightBytes, unit, workers.size(), jt);
+        if (forced != null && forced.algorithm() != JoinDecider.Algorithm.BROADCAST) {
+            System.err.printf("[Planner] join 链中间层选型（强制）%s%n", forced.describe());
+            return FragmentSpec.JoinAlgorithm.valueOf(forced.algorithm().name());
+        }
         return JoinDecider.tier(rightBytes, unit) == JoinDecider.Tier.LARGE
                 ? FragmentSpec.JoinAlgorithm.SORT_MERGE
                 : FragmentSpec.JoinAlgorithm.HASH;
@@ -4226,15 +4996,19 @@ public final class Planner {
                                                                 LogicalPlan.ResolvedRelation rightRel,
                                                                 String rightFilter,
                                                                 List<WorkerRegistration> workers) {
-        long rightBytes = JoinDecider.estimateBytes(JoinDecider.StatsProbe.of(rightProbe),
+        long rightBytes = JoinDecider.estimateBytes(statsProbe(rightProbe),
                 rightRel.catalog(), rightRel.schema(), rightRel.table(), rightFilter);
         long unit = JoinDecider.unit(context.memoryLimit(), weakestFreeBytes(workers));
         int nWorkers = workers.size();
 
         JoinDecider.Decision forced = JoinDecider.forced(ResourceConfig.joinAlgorithm(),
                 leftBytes, rightBytes, unit, nWorkers, jt);
+        // 左表是上一层 join 的中间结果，只有连接器统计没有它的体量 → 用「只约束 build 侧」的
+        // 可行性判据（哈希 / 广播都可能），而不是 decide() 遇未知就退排序归并。
         JoinDecider.Decision d = forced != null ? forced
-                : JoinDecider.decide(leftBytes, rightBytes, unit, nWorkers, jt);
+                : leftBytes == JoinDecider.UNKNOWN
+                        ? JoinDecider.rightFeasible(rightBytes, unit, jt)
+                        : JoinDecider.decide(leftBytes, rightBytes, unit, nWorkers, jt);
         System.err.printf("[Planner] join 链末层选型 %s%n", d.describe());
         return FragmentSpec.JoinAlgorithm.valueOf(d.algorithm().name());
     }
@@ -4261,14 +5035,49 @@ public final class Planner {
      * 在匹配阶段求值（谓词为假的左行不参与探测、为假的右行不参与匹配，随后按孤儿行规则输出）。</p>
      */
     private record JoinKeys(List<String> leftKeys, List<String> rightKeys,
-                            String onLeftFilter, String onRightFilter) {
+                            String onLeftFilter, String onRightFilter,
+                            List<GroupKeyExpression> leftComputed,
+                            List<GroupKeyExpression> rightComputed) {
+        JoinKeys {
+            leftComputed = leftComputed == null ? List.of() : List.copyOf(leftComputed);
+            rightComputed = rightComputed == null ? List.of() : List.copyOf(rightComputed);
+        }
+
         JoinKeys(List<String> leftKeys, List<String> rightKeys) {
             this(leftKeys, rightKeys, null, null);
+        }
+
+        JoinKeys(List<String> leftKeys, List<String> rightKeys, String onLeftFilter, String onRightFilter) {
+            this(leftKeys, rightKeys, onLeftFilter, onRightFilter, List.of(), List.of());
         }
 
         boolean hasOnFilters() {
             return onLeftFilter != null || onRightFilter != null;
         }
+
+        boolean hasComputed() {
+            return !leftComputed.isEmpty() || !rightComputed.isEmpty();
+        }
+    }
+
+    /**
+     * 一侧 JOIN 键：裸列（{@code computed == null}，键就是该列）或<b>表达式键</b>
+     * （{@code computed} 非空，键是物化出的合成列，见 {@link #toKeySide}）。
+     */
+    private record JoinKeySide(String column, GroupKeyExpression computed) {
+    }
+
+    /** 登记一对等值键（裸列直用；表达式键附上待物化的合成列定义）。 */
+    private static void addJoinKeyPair(List<String> leftKeys, List<String> rightKeys,
+                                       List<GroupKeyExpression> leftComputed,
+                                       List<GroupKeyExpression> rightComputed,
+                                       String leftText, String rightText) {
+        JoinKeySide lk = toKeySide(leftText, 0, leftKeys.size());
+        JoinKeySide rk = toKeySide(rightText, 1, rightKeys.size());
+        leftKeys.add(lk.column());
+        rightKeys.add(rk.column());
+        if (lk.computed() != null) leftComputed.add(lk.computed());
+        if (rk.computed() != null) rightComputed.add(rk.computed());
     }
 
     /** 解析 ON 条件的等值 join 键 + 单侧残差谓词（单机 {@link #buildJoin} 与分布式路径共用）。 */
@@ -4276,6 +5085,8 @@ public final class Planner {
         String cond = ji.condition().text();
         List<String> leftKeys = new ArrayList<>();
         List<String> rightKeys = new ArrayList<>();
+        List<GroupKeyExpression> leftComputed = new ArrayList<>();
+        List<GroupKeyExpression> rightComputed = new ArrayList<>();
         List<String> leftResiduals = new ArrayList<>();
         List<String> rightResiduals = new ArrayList<>();
         for (String rawConjunct : SqlTextUtil.splitTopLevelKeyword(cond, "AND")) {
@@ -4283,8 +5094,10 @@ public final class Planner {
             String c = SqlTextUtil.stripQualifiers(rawConjunct);
             List<String> sides = SqlTextUtil.splitTopLevelEquals(c);
             if (sides.size() == 2) {
-                String a = SqlTextUtil.stripQualifier(sides.get(0));
-                String b = SqlTextUtil.stripQualifier(sides.get(1));
+                // 一侧可以是任意表达式（如 coalesce(if(dept_id='',null,dept_id), if(bu_id='',null,bu_id))）：
+                // 表达式键物化成合成列后，所有 join 算子仍按裸列名匹配（见 toKeySide）。
+                String aText = sides.get(0).trim();
+                String bText = sides.get(1).trim();
                 // 限定符优先（两侧有同名列时唯一的消歧依据）：h.id = u.uid 这类必须按别名定向。
                 List<String> rawSides = SqlTextUtil.splitTopLevelEquals(rawConjunct);
                 Integer sa = rawSides.size() == 2
@@ -4292,21 +5105,41 @@ public final class Planner {
                 Integer sb = rawSides.size() == 2
                         ? sideFromQualifiers(rawSides.get(1), ji.leftAlias(), ji.rightAlias()) : null;
                 if (sa != null && sb != null && !sa.equals(sb)) {
-                    if (sa == 0) { leftKeys.add(a); rightKeys.add(b); }
-                    else { leftKeys.add(b); rightKeys.add(a); }
+                    addJoinKeyPair(leftKeys, rightKeys, leftComputed, rightComputed,
+                            sa == 0 ? aText : bText, sa == 0 ? bText : aText);
                     continue;
                 }
-                boolean aInLeft = leftCols.contains(a), aInRight = rightCols.contains(a);
-                boolean bInLeft = leftCols.contains(b), bInRight = rightCols.contains(b);
-                if (aInLeft && bInRight) {
-                    leftKeys.add(a);
-                    rightKeys.add(b);
-                    continue;
-                }
-                if (bInLeft && aInRight) {
-                    leftKeys.add(b);
-                    rightKeys.add(a);
-                    continue;
+                boolean aRef = SqlTextUtil.isColumnRef(aText);
+                boolean bRef = SqlTextUtil.isColumnRef(bText);
+                if (aRef && bRef) {
+                    // 旧口径：裸列按名成员关系（两侧有同名列时 a 在左 & b 在右 也成立，
+                    // 这正是 region = region 这类无限定符 ON 能解的依据，不能丢）。
+                    boolean aInLeft = leftCols.contains(aText), aInRight = rightCols.contains(aText);
+                    boolean bInLeft = leftCols.contains(bText), bInRight = rightCols.contains(bText);
+                    if (aInLeft && bInRight) {
+                        addJoinKeyPair(leftKeys, rightKeys, leftComputed, rightComputed, aText, bText);
+                        continue;
+                    }
+                    if (bInLeft && aInRight) {
+                        addJoinKeyPair(leftKeys, rightKeys, leftComputed, rightComputed, bText, aText);
+                        continue;
+                    }
+                } else {
+                    // 至少一侧是表达式键：先按限定符归侧（链式 join 的表达式常限定到链上更早的表，
+                    // 如 yj.sub_id，而 leftAlias 只是紧邻右表的上一张表），限定符判不出再按列集归属。
+                    String rawA = rawSides.size() == 2 ? rawSides.get(0) : aText;
+                    String rawB = rawSides.size() == 2 ? rawSides.get(1) : bText;
+                    Integer ea = sa != null ? sa
+                            : keySideWithQualifiers(rawA, aText, leftCols, rightCols,
+                                    ji.leftAlias(), ji.rightAlias());
+                    Integer eb = sb != null ? sb
+                            : keySideWithQualifiers(rawB, bText, leftCols, rightCols,
+                                    ji.leftAlias(), ji.rightAlias());
+                    if (ea != null && eb != null && !ea.equals(eb)) {
+                        addJoinKeyPair(leftKeys, rightKeys, leftComputed, rightComputed,
+                                ea == 0 ? aText : bText, ea == 0 ? bText : aText);
+                        continue;
+                    }
                 }
                 // 不是跨侧等值键 —— 若只引用一侧，就是 ON 残差谓词（如 l.dt = '2026-08-23'）。
                 String side = residualSide(rawConjunct, c, leftCols, rightCols,
@@ -4326,7 +5159,65 @@ public final class Planner {
         }
         return new JoinKeys(leftKeys, rightKeys,
                 leftResiduals.isEmpty() ? null : String.join(" AND ", leftResiduals),
-                rightResiduals.isEmpty() ? null : String.join(" AND ", rightResiduals));
+                rightResiduals.isEmpty() ? null : String.join(" AND ", rightResiduals),
+                leftComputed, rightComputed);
+    }
+
+    /**
+     * 判断 ON 等值的一侧文本归属哪一侧：裸列按列名成员关系；表达式按它引用的全部列都只属于
+     * 一侧来判定（两侧都有 / 解析不了 → {@code null}）。返回 {@code 0} = 左，{@code 1} = 右。
+     */
+    private static Integer keySide(String text, List<String> leftCols, List<String> rightCols) {
+        if (SqlTextUtil.isColumnRef(text)) {
+            String col = SqlTextUtil.stripQualifier(text);
+            boolean inLeft = leftCols.contains(col);
+            boolean inRight = rightCols.contains(col);
+            if (inLeft && !inRight) return 0;
+            if (inRight && !inLeft) return 1;
+            return null;
+        }
+        java.util.Set<String> cols;
+        try {
+            cols = new ExprEvaluator(ExprParser.parse(text)).columnArgs();
+        } catch (RuntimeException e) {
+            return null;
+        }
+        if (cols.isEmpty()) return null;
+        // 表达式可以解析到某侧 = 它引用的每个列该侧都能提供。列同时出现在两侧（如 sub_id）不构成
+        // 反证 —— 线上 `coalesce(if(dept_id='',null,dept_id), …, if(sub_id='',null,sub_id)) = org_id`
+        // 的 sub_id 右侧也有，旧口径「在右侧出现 ⇒ 不能算左侧」直接判不出侧而报「无法解析 JOIN 键」。
+        boolean allLeft = true;
+        boolean allRight = true;
+        for (String col : cols) {
+            if (!leftCols.contains(col)) allLeft = false;
+            if (!rightCols.contains(col)) allRight = false;
+        }
+        if (allLeft && allRight) return null;   // 两侧都能解析（全是同名列）→ 真歧义
+        if (allLeft) return 0;
+        if (allRight) return 1;
+        return null;
+    }
+
+    /**
+     * 把一侧 ON 键文本转成可执行的键：裸列直接当键；<b>表达式键</b>物化为合成列
+     * {@code __jk_expr_L<n>} / {@code __jk_expr_R<n>}（{@code __jk_} 前缀在 {@code SELECT *} 中隐藏），
+     * 由 Master（单机 join）/ Worker（片段 Producers、MiddleJoinConsumer）在 join 前用
+     * {@code ExpressionProjectOperator} 追加到该侧页尾。<b>两边物化后的页列序必须与声明列一致</b>，
+     * 这也是表达式键 join 在后续阶段（聚合 / 窗口）一律回退单机的原因（见 {@link #isBareJoin}）。
+     */
+    private static JoinKeySide toKeySide(String text, int side, int index) {
+        String t = text.trim();
+        if (SqlTextUtil.isColumnRef(t)) {
+            return new JoinKeySide(SqlTextUtil.stripQualifier(t), null);
+        }
+        String name = JOIN_KEY_ALIAS_PREFIX + "expr_" + (side == 0 ? "L" : "R") + index;
+        return new JoinKeySide(name, new GroupKeyExpression(name, t));
+    }
+
+    /** 合成列名拼接（计划树显示 / 调度日志用）。 */
+    private static String derivedNames(List<GroupKeyExpression> computed) {
+        return computed.stream().map(GroupKeyExpression::derivedColumn)
+                .collect(Collectors.joining(", "));
     }
 
     /**
@@ -4354,6 +5245,26 @@ public final class Planner {
             }
             return qualifierSide == 0 ? "L" : "R";
         }
+        // 链式 join：ON 里的限定符可能指向<b>累积左结果中的更早表</b>（如 4 表链的 u1），而
+        // leftAlias 只是紧邻右表的上一张表（q2）⇒ sideFromQualifiers 认不出。只要出现了限定符、
+        // 且没有任何一个指向右表，同时引用的列左侧都能提供，就属于左侧残差（与表达式键的
+        // keySideWithQualifiers 同一口径）。否则退回下面的严格成员关系判定。
+        if (rightAlias != null && !rightAlias.isEmpty()) {
+            java.util.Set<String> quals = qualifiersOf(rawConjunct);
+            if (!quals.isEmpty()) {
+                boolean anyRight = false;
+                for (String q : quals) {
+                    if (matchesAlias(q, rightAlias)) { anyRight = true; break; }
+                }
+                if (!anyRight) {
+                    boolean allInLeft = true;
+                    for (String col : cols) {
+                        if (!leftCols.contains(col)) { allInLeft = false; break; }
+                    }
+                    if (allInLeft) return "L";
+                }
+            }
+        }
         boolean allLeft = true;
         boolean allRight = true;
         for (String col : cols) {
@@ -4373,6 +5284,53 @@ public final class Planner {
      */
     private static Integer sideFromQualifiers(String rawExpr, String leftAlias, String rightAlias) {
         if (leftAlias == null || rightAlias == null) return null;
+        java.util.Set<String> qualifiers = qualifiersOf(rawExpr);
+        boolean left = false;
+        boolean right = false;
+        for (String q : qualifiers) {
+            if (matchesAlias(q, leftAlias)) left = true;
+            else if (matchesAlias(q, rightAlias)) right = true;
+        }
+        if (left == right) return null;   // 都没认出来 / 两侧都有
+        return left ? 0 : 1;
+    }
+
+    /**
+     * 表达式键的归侧（{@link #sideFromQualifiers} 的宽松版，仅用于「至少一侧是表达式」的分支）。
+     *
+     * <p>链式 join 的 {@code JoinInfo.leftAlias()} 只是<b>紧邻右表的上一张表</b>（如 {@code szmh}），
+     * 而 ON 里的列常限定到链上更早的表（{@code yj.sub_id}）—— 限定符一个都不指向右表，就只可能属于
+     * 左侧累积结果。此时也不能退回按列名成员关系：列名与右表输出重名（{@code sub_id} 两侧都有）时
+     * 成员关系必然判不出侧，旧实现会直接报「无法解析 JOIN 键」。</p>
+     *
+     * <p>限定符指向右表 → 右；指向左表/其它（祖先别名、全限定名）且不指向右 → 左；
+     * 两侧都出现（真歧义）或无任何限定符 → 退回列集归属。</p>
+     */
+    private static Integer keySideWithQualifiers(String rawText, String text,
+                                                 List<String> leftCols, List<String> rightCols,
+                                                 String leftAlias, String rightAlias) {
+        if (rightAlias != null && !rightAlias.isEmpty()) {
+            java.util.Set<String> qualifiers = qualifiersOf(rawText);
+            if (!qualifiers.isEmpty()) {
+                boolean left = false;
+                boolean right = false;
+                for (String q : qualifiers) {
+                    if (leftAlias != null && !leftAlias.isEmpty() && matchesAlias(q, leftAlias)) {
+                        left = true;
+                    } else if (matchesAlias(q, rightAlias)) {
+                        right = true;
+                    }
+                }
+                if (right && !left) return 1;
+                if (left && !right) return 0;
+                if (!right) return 0;   // 限定符都不指向右表 → 属于左侧累积结果
+            }
+        }
+        return keySide(text, leftCols, rightCols);
+    }
+
+    /** 扫描原始表达式里所有 {@code 限定符.} 的限定符（跳过字符串字面量）。 */
+    private static java.util.Set<String> qualifiersOf(String rawExpr) {
         java.util.Set<String> qualifiers = new java.util.LinkedHashSet<>();
         char quote = 0;
         int i = 0;
@@ -4405,14 +5363,7 @@ public final class Planner {
             }
             i++;
         }
-        boolean left = false;
-        boolean right = false;
-        for (String q : qualifiers) {
-            if (matchesAlias(q, leftAlias)) left = true;
-            else if (matchesAlias(q, rightAlias)) right = true;
-        }
-        if (left == right) return null;   // 都没认出来 / 两侧都有
-        return left ? 0 : 1;
+        return qualifiers;
     }
 
     /** 限定符与别名匹配：直接相等，或别名是全限定名时末段相等（{@code hive.db.tbl} ↔ {@code tbl}）。 */
@@ -4524,8 +5475,10 @@ public final class Planner {
      * <b>限定引用</b> {@code alias.col} 改写为该关系对应的副本名，使限定引用真正落到自己那一侧。
      * 无别名的裸列引用不在此改写（保持原语义）。</p>
      *
-     * <p><b>保守口径</b>：关系链声明的列按序拼不出实际 join 输出列（派生 / 展平 / 裁剪过的形态）时
-     * 原样返回，绝不猜测 —— 宁可不修也不改错。</p>
+     * <p><b>定位口径</b>：关系声明列按 FROM/join 顺序在物理输出里顺序定位（跳过物理输出多出的
+     * 派生内部列；INNER 去重掉的同名右键自然找不到 → 无需副本）。声明列与物理输出不再要求
+     * 逐列相等 —— 语义分析会按引用收窄 {@code rel.columns()}，派生表扫描却输出完整投影，
+     * 旧口径会因此整条消歧被放弃、限定引用静默绑错侧。</p>
      */
     private OuterJoinRefRewrite aliasOuterJoinKeyRefs(PhysicalNode node, LogicalPlan.Select select) {
         List<String> outCols = node.outputColumns();
@@ -4547,19 +5500,36 @@ public final class Planner {
             if (rel == null) return new OuterJoinRefRewrite(select, node);
         }
 
-        // ② 校验：各关系声明列按序拼接 == 实际 join 输出列（大小写不敏感，按名逐一比对）
-        List<String> flat = new ArrayList<>();
-        for (LogicalPlan.ResolvedRelation rel : order) flat.addAll(rel.columns());
-        if (flat.size() != outCols.size()) return new OuterJoinRefRewrite(select, node);
-        for (int i = 0; i < flat.size(); i++) {
-            if (!normalize(flat.get(i)).equals(normalize(outCols.get(i)))) {
-                return new OuterJoinRefRewrite(select, node);
+        // ② 定位各关系声明列在物理输出中的出现次序。
+        //    ★不能要求「声明列按序拼接 == 物理输出」：SemanticAnalyzer 会按实际引用收窄
+        //    rel.columns()（如只用 u2.user_id 时 users 声明列只剩 [user_id]），派生表扫描却仍
+        //    输出完整 SELECT 投影（[q1_uid, q1_st, q1_val]）⇒ 旧口径直接放弃消歧，限定引用
+        //    u2.user_id 静默绑到左列（seed 20270597：c0 取成了 u0.user_id）。
+        //    改为按关系顺序在物理输出里<b>顺序</b>定位：物理输出可能多出声明列未包含的列
+        //    （派生内部计算列），跳过即可；INNER join 会把与左键同名的右键去重 → 该声明列
+        //    找不到，此时无需副本（两侧等值，语义等价），也跳过。
+        int pos = 0;
+        Map<String, Integer> physOcc = new HashMap<>();   // "alias\u0000col"(小写) → 物理出现序号（1 起）
+        for (LogicalPlan.ResolvedRelation rel : order) {
+            for (String col : rel.columns()) {
+                int found = -1;
+                for (int i = pos; i < outCols.size(); i++) {
+                    if (normalize(outCols.get(i)).equals(normalize(col))) { found = i; break; }
+                }
+                if (found < 0) continue;
+                pos = found + 1;
+                int occ = 0;
+                for (int i = 0; i <= found; i++) {
+                    if (normalize(outCols.get(i)).equals(normalize(col))) occ++;
+                }
+                physOcc.put(alias(rel) + "\u0000" + normalize(col), occ);
             }
         }
 
         // ③ 重复列名（INNER 已去重，出现重复即外连接保留的右键冲突列）
         Map<String, Integer> total = new HashMap<>();
         for (String c : outCols) total.merge(normalize(c), 1, Integer::sum);
+        if (total.values().stream().noneMatch(n -> n > 1)) return new OuterJoinRefRewrite(select, node);
 
         // ④ 重复出现的列（左右两侧同名）→ 每个出现次序各给一个副本名。
         //    ★左右两侧都要别名：物理层同名裸列解析并不一致（ExprEvaluator 取首个、
@@ -4570,14 +5540,13 @@ public final class Planner {
         List<ColumnAliasOperator.Alias> aliases = new ArrayList<>();
         Set<String> used = new HashSet<>();
         for (String c : outCols) used.add(normalize(c));
-        Map<String, Integer> seen = new HashMap<>();
-        for (int r = 0; r < order.size(); r++) {
-            LogicalPlan.ResolvedRelation rel = order.get(r);
+        for (LogicalPlan.ResolvedRelation rel : order) {
             String relKey = alias(rel);
             for (String col : rel.columns()) {
                 String key = normalize(col);
-                int occ = seen.merge(key, 1, Integer::sum);
                 if (total.getOrDefault(key, 0) <= 1) continue;
+                Integer occ = physOcc.get(relKey + "\u0000" + key);
+                if (occ == null) continue;   // 未在物理输出中（INNER 右键去重）→ 无需副本
                 String aliasName = JOIN_KEY_ALIAS_PREFIX + col + "_" + occ;
                 int dup = 2;
                 while (used.contains(normalize(aliasName))) {
@@ -6471,7 +7440,24 @@ public final class Planner {
      * 一致：内层聚合 / 窗口仍在 Worker 分布式执行，Master 只做最终归约）。</p>
      */
     private static boolean isBareJoin(DistributedJoinOperator djo) {
-        return djo.followUp() == null && djo.windowChain().isEmpty();
+        return djo.followUp() == null && djo.windowChain().isEmpty()
+                && !hasJoinKeyExpression(djo);
+    }
+
+    /**
+     * join 链是否含 <b>ON 表达式键</b>（Worker 侧物化的合成列）。
+     *
+     * <p>这类合成列随 join 输出尾随在页面末尾；「join → 聚合 / 窗口」的重建舞台各自维护一份
+     * 输出列拼法，尚未覆盖合成列 ⇒ 提取器一律返回 null，让上层阶段走 Master 兜底（内层 join 仍
+     * 分布式执行，结果正确）。裸 join（无后续阶段）不受影响。</p>
+     */
+    private static boolean hasJoinKeyExpression(DistributedJoinOperator djo) {
+        for (StageScheduler.JoinLink link : djo.links()) {
+            if (!link.leftComputed().isEmpty() || !link.rightComputed().isEmpty()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -8785,7 +9771,50 @@ public final class Planner {
      * </ul>
      */
     private PhysicalNode optimizeColumns(PhysicalNode root) {
-        return pruneRecursive(root, new LinkedHashSet<>(root.outputColumns()));
+        PhysicalNode pruned = pruneRecursive(root, new LinkedHashSet<>(root.outputColumns()));
+        reconcileJoinDeclaredFields(pruned);
+        return pruned;
+    }
+
+    /**
+     * 列裁剪后把 join 算子的<b>声明列</b>收窄到实际输入页列集。
+     *
+     * <p>计划期按关系的全列生成声明列，但 {@link #optimizeColumns} 会在层与层之间插入 Project
+     * 裁掉无用列。若声明列仍按全列宽，某分区用声明列兜底建出的输出 schema 会比其它分区（用实收页
+     * schema）多列 —— 下游按列下标取向量即 {@code IllegalArgumentException}（越界）。这里按剪枝后
+     * 上游节点的最终输出列收窄，保证声明 schema 与实收页 schema 逐列为同一列。</p>
+     */
+    private void reconcileJoinDeclaredFields(PhysicalNode node) {
+        for (PhysicalNode child : node.children()) {
+            reconcileJoinDeclaredFields(child);
+        }
+        Operator op = node.operator();
+        List<PhysicalNode> ch = node.children();
+        if (ch.size() != 2) return;
+        List<String> leftCols = new ArrayList<>(ch.get(0).outputColumns());
+        List<String> rightCols = new ArrayList<>(ch.get(1).outputColumns());
+        if (op instanceof HashJoinOperator hj) {
+            hj.narrowDeclaredFields(narrowByName(hj.getDeclaredLeftFields(), leftCols),
+                    narrowByName(hj.getDeclaredRightFields(), rightCols));
+        } else if (op instanceof SortMergeJoinOperator sm) {
+            sm.narrowDeclaredFields(narrowByName(sm.getDeclaredLeftFields(), leftCols),
+                    narrowByName(sm.getDeclaredRightFields(), rightCols));
+        }
+    }
+
+    /** 按列名从声明列目录取子集（保持 {@code names} 顺序）；缺任一列 → null（放弃声明，不猜）。 */
+    private static List<Field> narrowByName(List<Field> catalog, List<String> names) {
+        if (catalog == null) return null;
+        List<Field> out = new ArrayList<>(names.size());
+        for (String n : names) {
+            Field hit = null;
+            for (Field f : catalog) {
+                if (f.getName().equalsIgnoreCase(n)) { hit = f; break; }
+            }
+            if (hit == null) return null;
+            out.add(hit);
+        }
+        return out;
     }
 
     private PhysicalNode pruneRecursive(PhysicalNode node, Set<String> required) {
@@ -9113,6 +10142,24 @@ public final class Planner {
             // ON 单侧残差谓词引用的列必须保留（在 join 内求值，缺列即运行期「表达式列不存在」）
             leftNeed.addAll(((HashJoinOperator) op).onLeftFilterColumns());
             rightNeed.addAll(((HashJoinOperator) op).onRightFilterColumns());
+            return List.of(leftNeed, rightNeed);
+        }
+
+        if (op instanceof SortMergeJoinOperator sm) {
+            List<String> leftOut = children.get(0).outputColumns();
+            List<String> rightOut = children.get(1).outputColumns();
+            Set<String> leftNeed = new LinkedHashSet<>();
+            Set<String> rightNeed = new LinkedHashSet<>();
+            // 同 HashJoin：两侧同名列都要保留（输出按位置拼接，上层按出现序号取列）
+            for (String col : parentRequired) {
+                if (leftOut.contains(col)) leftNeed.add(col);
+                if (rightOut.contains(col)) rightNeed.add(col);
+            }
+            // ★ join key 列必须保留：旧实现走默认分支只透传 parentRequired，把右表 key 裁掉后
+            //   findFieldIndex 落空会静默按第 0 列比较 ⇒ 整批错行（seed 20270597：q1_val 被裁，
+            //   `u0.user_id = q1.q1_val` 变成 `user_id = q1_uid`）。两条路径都要补。
+            leftNeed.addAll(sm.getLeftKeyColumns());
+            rightNeed.addAll(sm.getRightKeyColumns());
             return List.of(leftNeed, rightNeed);
         }
 

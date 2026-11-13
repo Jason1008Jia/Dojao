@@ -77,7 +77,69 @@ public final class ExprTypeInference {
         if (node instanceof ExprNode.Cast cs) {
             return castType(cs);
         }
-        return null;   // 函数调用等：返回类型取决于实现 → 不可推断
+        if (node instanceof ExprNode.FuncCall fc) {
+            return funcCallType(fc, fields);
+        }
+        return null;   // 其余函数调用：返回类型取决于实现 → 不可推断
+    }
+
+    /**
+     * 少数「结果类型完全由参数类型决定」的内置函数 —— 只为 JOIN ON 表达式键的声明列服务。
+     *
+     * <p>JOIN ON 的等值键（如 {@code coalesce(if(dept_id='',null,dept_id), if(bu_id='',null,bu_id))}）
+     * 要在 Worker 侧物化成派生列，其 Arrow 类型必须与运行期产出完全一致，否则下游 join
+     * 按声明宽度解码会错值。只覆盖语义明确的几个；其余函数一律返回 {@code null}
+     * （调用方回退运行期口径 / Master 单机 join）。</p>
+     */
+    private static ArrowType funcCallType(ExprNode.FuncCall fc, Map<String, Field> fields) {
+        String name = fc.name() == null ? "" : fc.name().toLowerCase();
+        var args = fc.args();
+        return switch (name) {
+            case "coalesce", "nvl", "ifnull", "if_null", "greatest", "least" -> mergeAll(args, fields);
+            case "if" -> args.size() == 3 ? mergeArgs(args.get(1), args.get(2), fields) : null;
+            case "nullif" -> args.size() == 2 ? infer(args.get(0), fields) : null;
+            // 结果恒为字符串的内置标量函数（ScalarEvaluator 按 Java String 结果建 Utf8 向量）：
+            // CTAS scan-sink 需要据静态类型先建目标表，故在这里补全（其余函数仍返回 null → 回退）。
+            case "get_json_object", "json_extract", "parse_url",
+                 "concat", "concat_ws", "substr", "substring", "replace", "regexp_replace",
+                 "regexp_extract", "repeat", "reverse", "lpad", "rpad", "space", "chr",
+                 "soundex", "initcap", "printf", "translate", "elt", "hex",
+                 "md5", "sha1", "sha2", "uuid", "date_format", "from_unixtime" ->
+                    ArrowType.Utf8.INSTANCE;
+            default -> null;
+        };
+    }
+
+    /** 逐参数合并（NULL 字面量跳过）；任一非空参数推断不出 → null。 */
+    private static ArrowType mergeAll(java.util.List<ExprNode> args, Map<String, Field> fields) {
+        ArrowType acc = null;
+        boolean any = false;
+        for (ExprNode a : args) {
+            if (isNullLiteral(a)) continue;
+            ArrowType t = infer(a, fields);
+            if (t == null) return null;
+            acc = merge(acc, t);
+            any = true;
+        }
+        return any ? acc : null;
+    }
+
+    private static ArrowType mergeArgs(ExprNode a, ExprNode b, Map<String, Field> fields) {
+        ArrowType acc = null;
+        boolean any = false;
+        if (!isNullLiteral(a)) {
+            ArrowType t = infer(a, fields);
+            if (t == null) return null;
+            acc = merge(acc, t);
+            any = true;
+        }
+        if (!isNullLiteral(b)) {
+            ArrowType t = infer(b, fields);
+            if (t == null) return null;
+            acc = merge(acc, t);
+            any = true;
+        }
+        return any ? acc : null;
     }
 
     /** 是否是 NULL 字面量（{@code null} 表达式视同 NULL）。 */

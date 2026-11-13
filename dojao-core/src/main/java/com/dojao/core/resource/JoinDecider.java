@@ -380,6 +380,38 @@ public final class JoinDecider {
     }
 
     /**
+     * <b>只知道 build 侧（右表）体量</b>时的可行性命定 —— 用于多表链的末层：左表是上一层 join 的
+     * 中间结果，连接器没有它的统计（累计估算常为 {@link #UNKNOWN}）。
+     *
+     * <p>为什么不能因此退化成 {@code SORT_MERGE}：哈希 join 的可行性条件 {@code B ≤ M}
+     * <b>只约束 build 侧</b>，与 probe 侧多大、估算得出来与否无关（与 {@link #decide} 的第一条
+     * 判定「任一侧未知 → 排序归并」不同 —— 那条只在<b>两侧体量都要参与比较</b>时有意义）。
+     * 左表未知只让我们失去「广播是否更划算」这一层优化，不构成哈希不可行的证据。</p>
+     *
+     * <p>判定顺序：右表未知 → 排序归并；右表小且 join 类型可广播 → 广播（左表不必估，直接省掉
+     * 大中间结果的整次重分区）；右表装得进每分区预算 → 哈希；否则排序归并。</p>
+     */
+    public static Decision rightFeasible(long rightBytes, long unit, JoinType joinType) {
+        if (rightBytes == UNKNOWN) {
+            return new Decision(Algorithm.SORT_MERGE, BuildSide.RIGHT, Tier.LARGE, Tier.LARGE, UNKNOWN, rightBytes,
+                    unit, "build 侧体量未知 → 走最保守的可溢写排序归并");
+        }
+        Tier rightTier = tier(rightBytes, unit);
+        String who = joinType + ", 左=未知/右=" + rightBytes + "B, U=" + unit + "B";
+        if (rightTier == Tier.SMALL && broadcastSafe(joinType) && ResourceConfig.joinBroadcastEnabled()) {
+            return new Decision(Algorithm.BROADCAST, BuildSide.RIGHT, Tier.LARGE, rightTier, UNKNOWN, rightBytes,
+                    unit, "右表够小(≤U×smallRatio)：整份复制到每台 Worker，省掉左表（中间结果）的 shuffle（"
+                    + who + "）");
+        }
+        if (rightTier != Tier.LARGE) {
+            return new Decision(Algorithm.HASH, BuildSide.RIGHT, Tier.LARGE, rightTier, UNKNOWN, rightBytes,
+                    unit, "右表(build 侧)装得下每分区预算(≤U×largeRatio)，左表体量未知不构成阻碍（" + who + "）");
+        }
+        return new Decision(Algorithm.SORT_MERGE, BuildSide.RIGHT, Tier.LARGE, rightTier, UNKNOWN, rightBytes,
+                unit, "右表(build 侧)超出 U×largeRatio → 排序归并（" + who + "）");
+    }
+
+    /**
      * 该 join 类型能否安全走广播（build 侧整份复制到每台 Worker）。
      *
      * <p><b>判定依据 = 有没有「不属于任何 probe 行」的 build 行需要输出</b>：广播复制的是 build 侧
