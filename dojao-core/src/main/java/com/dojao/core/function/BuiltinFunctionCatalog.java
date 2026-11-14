@@ -27,7 +27,7 @@ import java.util.Map;
  * <p><b>维护约定</b>：改动上述任一来源（增删函数、改 switch 分支）时应同步本目录；
  * 由于来源即各实现本身（枚举遍历 / 集合读取），多数改动会自动反映，只有硬编码名字需手工对齐。
  * <b>不要</b>改用 {@code SemanticAnalyzer.AGGREGATE_FUNCTIONS} 之类的「语法白名单」——那里含大量
- * 尚未实现的名字（如 {@code COLLECT_LIST / VAR_POP}），补全会提示出跑不通的函数。</p>
+ * 尚未实现的名字（如 {@code VAR_POP / MEDIAN}），补全会提示出跑不通的函数。</p>
  *
  * @author jiaxin
  * @date 2026/9/29
@@ -63,7 +63,8 @@ public final class BuiltinFunctionCatalog {
     /** 内建聚合（与 FragmentExecutor.aggregateFor / AggregationSpec 的 switch 同源）。 */
     private static final List<String> AGGREGATES = List.of(
             "count", "count_distinct", "sum", "avg", "min", "max",
-            "count_if", "sum_if", "max_if", "min_if");
+            "count_if", "sum_if", "max_if", "min_if",
+            "collect_list", "collect_set", "array_agg");
 
     private BuiltinFunctionCatalog() {
     }

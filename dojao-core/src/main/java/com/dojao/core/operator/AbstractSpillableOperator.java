@@ -1093,6 +1093,25 @@ public abstract class AbstractSpillableOperator<S extends Slot>
                 v.setSafe(row, h);
             }
             case DurationVector v -> v.setSafe(row, durationUnits(v, val));
+            // ★COLLECT_LIST / COLLECT_SET 结果：一格 = 一组值。容器按需展开
+            //   （startNewValue/endValue），元素递归写回子向量（byte[]/Text/数值等）。
+            case org.apache.arrow.vector.complex.ListVector v -> {
+                int start = v.startNewValue(row);
+                FieldVector child = v.getDataVector();
+                int n = 0;
+                if (val instanceof Collection<?> c) {
+                    for (Object e : c) {
+                        setVectorValue(child, start + n, e);
+                        n++;
+                    }
+                } else if (val instanceof Object[] arr) {
+                    for (Object e : arr) {
+                        setVectorValue(child, start + n, e);
+                        n++;
+                    }
+                }
+                v.endValue(row, n);
+            }
             default -> vec.setNull(row);
         }
     }

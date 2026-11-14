@@ -12,10 +12,10 @@ import java.util.Set;
 /**
  * AI 对话的「@ 引用」上下文块。
  *
- * <p>前端在输入框里通过 {@code @} 选择 catalog / 函数（后续可扩展表等），随本轮请求以
- * {@code [{type,name,detail}]} 数组提交；这里把引用转成一段模型可读的上下文，拼进本轮提问
- * （与附件块同构，见 {@link FileParser#promptBlock}）。目的：用户已经明确了检索范围（某个 catalog
- * 或某个函数），模型不必再全量搜索元数据、也不容易用同名对象替代。</p>
+ * <p>前端在输入框里通过 {@code @} 选择数据对象（catalog / schema / 表）、通过 {@code #} 选择函数，
+ * 随本轮请求以 {@code [{type,name,detail}]} 数组提交；这里把引用转成一段模型可读的上下文，拼进
+ * 本轮提问（与附件块同构，见 {@link FileParser#promptBlock}）。目的：用户已经明确了检索范围
+ * （某个 catalog / schema / 表 / 函数），模型不必再全量搜索元数据、也不容易用同名对象替代。</p>
  *
  * <p>只做校验 / 去重 / 截断，<b>不访问元数据服务</b> —— 函数签名、catalog 的 schema 列表等说明
  * 由前端随请求带上（前端已从 {@code /api/functions}、{@code /api/metadata/...} 取到）。</p>
@@ -32,9 +32,9 @@ public final class AiMentions {
     /** 引用名最大长度。 */
     public static final int MAX_NAME_CHARS = 200;
 
-    private static final Set<String> TYPES = Set.of("catalog", "table", "function");
+    private static final Set<String> TYPES = Set.of("catalog", "schema", "table", "function");
 
-    /** 一条 @ 引用：{@code type} ∈ {catalog, table, function}。 */
+    /** 一条 @ 引用：{@code type} ∈ {catalog, schema, table, function}。 */
     public record Mention(String type, String name, String detail) {
     }
 
@@ -113,6 +113,7 @@ public final class AiMentions {
     private static String label(String type) {
         return switch (type) {
             case "catalog" -> "目录";
+            case "schema" -> "Schema";
             case "table" -> "表";
             case "function" -> "函数";
             default -> type;

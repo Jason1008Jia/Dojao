@@ -339,7 +339,8 @@ public final class SqlTextUtil {
      */
     private static final Set<String> AGG_FUNCS = Set.of(
             "COUNT", "SUM", "AVG", "MIN", "MAX",
-            "COUNT_IF", "SUM_IF", "MAX_IF", "MIN_IF");
+            "COUNT_IF", "SUM_IF", "MAX_IF", "MIN_IF",
+            "COLLECT_LIST", "COLLECT_SET", "ARRAY_AGG");
 
     /**
      * 扫描表达式文本里出现的<b>所有</b>聚合调用（含「整串就是一个聚合调用」），返回原文片段。

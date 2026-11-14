@@ -1,6 +1,7 @@
 package com.dojao.core.operator;
 
 import com.dojao.common.data.Page;
+import com.dojao.core.function.aggregate.CollectSupport;
 import com.dojao.core.function.aggregate.CountDistinctAggregateFunction;
 import com.dojao.core.function.aggregate.MinMaxSupport;
 import com.dojao.spi.function.AggregateFunction;
@@ -17,6 +18,7 @@ import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -75,6 +77,12 @@ public class AggregationHashTable extends RowHashTable implements Slot {
      * 只能报 NULL。数值列（Int/FloatingPoint）仍保持旧口径 DOUBLE，不改动既有数值结果。</p>
      */
     private ArrowType[] resolvedOutputTypes;
+
+    /**
+     * 各聚合结果列的完整 Field（首次输入时按输入列 Field 解析）。collect_list / collect_set 的
+     * {@code list<元素类型>} 需要子字段，{@link ArrowType} 表达不了，故单独保留 Field。
+     */
+    private Field[] resolvedOutputFields;
 
     // 批量聚合扩展：任一聚合实现 BatchAggregateFunction → 页内按 group 归组后批量累加。
     // 内置五函数不实现 → batchEnabled=false，走原逐行路径，性能零影响。
@@ -399,6 +407,7 @@ public class AggregationHashTable extends RowHashTable implements Slot {
         List<Field> fields = root.getSchema().getFields();
         inputColIndices = new int[specs.length];
         resolvedOutputTypes = new ArrowType[specs.length];
+        resolvedOutputFields = new Field[specs.length];
         for (int i = 0; i < specs.length; i++) {
             inputColIndices[i] = -1;
             if (inputColumns[i] != null) {
@@ -409,9 +418,10 @@ public class AggregationHashTable extends RowHashTable implements Slot {
                     }
                 }
             }
-            ArrowType inputType = inputColIndices[i] >= 0
-                    ? fields.get(inputColIndices[i]).getType() : null;
+            Field inputField = inputColIndices[i] >= 0 ? fields.get(inputColIndices[i]) : null;
+            ArrowType inputType = inputField == null ? null : inputField.getType();
             resolvedOutputTypes[i] = resultTypeFor(specs[i], inputType);
+            resolvedOutputFields[i] = specs[i].outputField(specs[i].outputColumn(), inputField);
         }
         indicesResolved = true;
     }
@@ -450,6 +460,38 @@ public class AggregationHashTable extends RowHashTable implements Slot {
         return specs[si].outputArrowType();
     }
 
+    /**
+     * 全局空输入兜底前预解析输出列类型：没有输入页时 {@link #ensureIndices} 不会跑，collect 的
+     * 子字段只能按静态兜底（Utf8）—— 与规划期声明的 {@code list<实际元素类型>} 不一致。
+     * 调用方（{@code HashAggregationOperator.emitEmptyInput}）有上游 schema，用它对齐一次。
+     */
+    public void primeEmptyInputFields(List<Field> fields) {
+        if (fields == null || fields.isEmpty()) return;
+        resolvedOutputTypes = new ArrowType[specs.length];
+        resolvedOutputFields = new Field[specs.length];
+        for (int i = 0; i < specs.length; i++) {
+            Field in = null;
+            if (inputColumns[i] != null) {
+                for (Field f : fields) {
+                    if (f.getName().equals(inputColumns[i])) { in = f; break; }
+                }
+            }
+            resolvedOutputTypes[i] = resultTypeFor(specs[i], in == null ? null : in.getType());
+            resolvedOutputFields[i] = specs[i].outputField(specs[i].outputColumn(), in);
+        }
+    }
+
+    /**
+     * 结果列 Field；输入尚未到达时按静态口径兜底（collect 的兜底元素类型为 Utf8）。
+     */
+    private Field outputField(int si) {
+        if (resolvedOutputFields != null && si < resolvedOutputFields.length
+                && resolvedOutputFields[si] != null) {
+            return resolvedOutputFields[si];
+        }
+        return specs[si].outputField(specs[si].outputColumn(), null);
+    }
+
     // ==================== 输出 ====================
 
     @SuppressWarnings({"rawtypes", "unchecked"})
@@ -464,8 +506,7 @@ public class AggregationHashTable extends RowHashTable implements Slot {
         }
 
         for (int si = 0; si < specs.length; si++) {
-            ArrowType at = outputType(si);
-            Field outField = new Field(specs[si].outputColumn(), FieldType.nullable(at), null);
+            Field outField = outputField(si);
             FieldVector outVec = createVector(outField, allocator);
             outVec.allocateNew();
             AggregateFunction<Object> aggregate = (AggregateFunction) aggregates[si];
@@ -499,8 +540,7 @@ public class AggregationHashTable extends RowHashTable implements Slot {
         List<Field> fields = new ArrayList<>(specs.length);
         List<FieldVector> vectors = new ArrayList<>(specs.length);
         for (int si = 0; si < specs.length; si++) {
-            Field outField = new Field(specs[si].outputColumn(),
-                    FieldType.nullable(outputType(si)), null);
+            Field outField = outputField(si);
             FieldVector outVec = createVector(outField, allocator);
             outVec.allocateNew();
             AggregateFunction<Object> aggregate = (AggregateFunction) aggregates[si];
@@ -539,8 +579,7 @@ public class AggregationHashTable extends RowHashTable implements Slot {
             }
 
             for (int si = 0; si < specs.length; si++) {
-                ArrowType at = outputType(si);
-                Field outField = new Field(specs[si].outputColumn(), FieldType.nullable(at), null);
+                Field outField = outputField(si);
                 FieldVector outVec = createVector(outField, allocator);
                 outVec.allocateNew();
                 AggregateFunction<Object> aggregate = (AggregateFunction) aggregates[si];
@@ -665,6 +704,24 @@ public class AggregationHashTable extends RowHashTable implements Slot {
                     }
                     vv.setValueCount(groupCount);
                     fields.add(f); vectors.add(vv);
+                }
+                case "collect_list", "collect_set" -> {
+                    // 状态是 Collection（ArrayList / LinkedHashSet）：整组序列化成一格 List 值。
+                    // 元素类型来自输入列（outputField 已解析子字段）；空组写 NULL（符合「空组 → NULL」语义）。
+                    Field template = outputField(si);
+                    Field f = new Field(outName + "_s0", template.getFieldType(), template.getChildren());
+                    FieldVector vec = createVector(f, allocator);
+                    vec.allocateNew();
+                    for (int g = 0; g < groupCount; g++) {
+                        Object state = groupStates.get(g)[si];
+                        if (state instanceof Collection<?> c && !c.isEmpty()) {
+                            setVectorValue(vec, g, c);
+                        } else {
+                            setVectorValue(vec, g, null);
+                        }
+                    }
+                    vec.setValueCount(groupCount);
+                    fields.add(f); vectors.add(vec);
                 }
                 default -> throw new UnsupportedOperationException(
                         "Spill not supported for aggregate: " + aggregate.functionName());
@@ -1054,6 +1111,12 @@ public class AggregationHashTable extends RowHashTable implements Slot {
                 VarCharVector vv = (VarCharVector) root.getVector(startCol);
                 yield CountDistinctAggregateFunction.decode(vv.isNull(row) ? null : vv.get(row));
             }
+            case "collect_list", "collect_set" -> {
+                // List 列一格 = 整组值；NULL（空组 / 全 NULL 组）→ 空状态。
+                Object val = root.getVector(startCol).getObject(row);
+                java.util.Collection<?> vals = val instanceof java.util.Collection<?> c ? c : null;
+                yield CollectSupport.fromValues(aggregates[specIdx].functionName(), vals);
+            }
             default -> throw new UnsupportedOperationException(
                     "Cannot read state for aggregate: " + aggregates[specIdx].functionName());
         };
@@ -1078,6 +1141,7 @@ public class AggregationHashTable extends RowHashTable implements Slot {
         spilled.indicesResolved = this.indicesResolved;
         spilled.inputColIndices = this.inputColIndices;
         spilled.resolvedOutputTypes = this.resolvedOutputTypes;
+        spilled.resolvedOutputFields = this.resolvedOutputFields;
         spilled.rowHashes = this.rowHashes;
         spilled.rehashCount = this.rehashCount;
         spilled.estimatedMem = this.estimatedMem;
@@ -1207,6 +1271,8 @@ public class AggregationHashTable extends RowHashTable implements Slot {
             // 其它 Set 实现（历史状态）沿用「条目 + 装箱对象」口径。
             else if (s instanceof com.dojao.core.function.aggregate.DistinctSet ds) mem += ds.estimatedBytes();
             else if (s instanceof Set<?> set) mem += 24L + (long) set.size() * 48L;
+            // COLLECT_LIST：ArrayList 状态按条目 + 装箱/引用计量（collect_set 走上面的 Set 分支）。
+            else if (s instanceof java.util.Collection<?> c) mem += 24L + (long) c.size() * 48L;
         }
         return mem;
     }

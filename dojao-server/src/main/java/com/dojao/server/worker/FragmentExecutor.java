@@ -31,6 +31,8 @@ import com.dojao.core.operator.WindowFunctionOperator;
 import com.dojao.core.operator.WindowFunctionType;
 import com.dojao.core.operator.WindowSortOperator;
 import com.dojao.core.function.aggregate.AvgAggregateFunction;
+import com.dojao.core.function.aggregate.CollectListAggregateFunction;
+import com.dojao.core.function.aggregate.CollectSetAggregateFunction;
 import com.dojao.core.function.aggregate.CountAggregateFunction;
 import com.dojao.core.function.aggregate.CountDistinctAggregateFunction;
 import com.dojao.core.function.aggregate.MaxAggregateFunction;
@@ -1189,6 +1191,8 @@ public final class FragmentExecutor {
             case "avg" -> AvgAggregateFunction.INSTANCE;
             case "min" -> MinAggregateFunction.INSTANCE;
             case "max" -> MaxAggregateFunction.INSTANCE;
+            case "collect_list" -> CollectListAggregateFunction.INSTANCE;
+            case "collect_set" -> CollectSetAggregateFunction.INSTANCE;
             default -> null;
         };
         if (builtin != null) return builtin;

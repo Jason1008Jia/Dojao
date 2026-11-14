@@ -1765,24 +1765,29 @@ function bindAiCodeCopy() {
     });
 }
 
-// ---------------- AI 输入框 @ 引用（catalog / 函数） ----------------
+// ---------------- AI 输入框引用：@ catalog / schema / 表， # 函数 ----------------
 //
-// 交互对齐 IDE 的 @ mention：光标前出现「@ + 词」即弹出候选面板，方向键选择、Enter/点击插入
-// @名字。插入的 token 留在正文里随本轮提问落库；发送时把候选的说明（函数签名 / catalog 的
-// schema 列表）作为 mentions 一并提交，服务端拼成「@ 引用」上下文块 —— 模型不必再全量搜索元数据。
+// 交互对齐 IDE 的 @ mention，但按对象类别分两个触发符：
+//   @ → 数据对象（catalog / schema / 表）：缩小「模型去哪里找数据」的检索范围；
+//   # → 函数：让模型识别某个函数的用法 / 签名。
+// 光标前出现「@词」或「#词」即弹出候选面板，方向键选择、Enter/点击插入 token。插入的 token
+// 留在正文里随本轮提问落库；发送时把候选说明作为 mentions 一并提交，服务端拼成「@ 引用」块。
 
-/** 惰性加载候选：catalog 列表 + 当前用户可见的函数目录（一次拉齐；失败则候选为空）。 */
+/** 惰性加载候选：catalog / schema / 表 + 函数目录（先拿 catalog、函数，schema/表后台补齐）。 */
 function aiLoadMentionData() {
     if (aiMentionData) return Promise.resolve(aiMentionData);
     if (aiMentionLoading) return aiMentionLoading;
+    // 先占位：catalog / 函数一回来就能弹出候选；schema / 表逐批加载，回来一批刷新一次面板。
+    var data = { catalogs: [], schemas: [], tables: [], functions: [] };
+    aiMentionData = data;
     aiMentionLoading = Promise.all([
         httpGet('/api/metadata/catalogs').catch(function () { return null; }),
         httpGet('/api/functions').catch(function () { return null; })
     ]).then(function (r) {
-        var cats = ((r[0] && r[0].catalogs) || []).map(function (c) {
+        data.catalogs = ((r[0] && r[0].catalogs) || []).map(function (c) {
             return { type: 'catalog', name: c, group: 'Catalog 目录', hint: '数据源目录' };
         });
-        var fns = ((r[1] && r[1].functions) || []).map(function (f) {
+        data.functions = ((r[1] && r[1].functions) || []).map(function (f) {
             var kind = f.kind === 'aggregate' ? '聚合函数'
                     : f.kind === 'window' ? '窗口函数'
                     : f.kind === 'scalar' ? '标量函数'
@@ -1790,23 +1795,65 @@ function aiLoadMentionData() {
             return { type: 'function', name: f.name, group: '函数',
                 hint: kind + (f.detail ? ' · ' + f.detail : '') };
         });
-        aiMentionData = { catalogs: cats, functions: fns };
-        aiMentionLoading = null;
-        return aiMentionData;
+        aiMentionRefresh();
+        return aiLoadNamespaces(data, data.catalogs).then(function () {
+            aiMentionLoading = null;
+            aiMentionRefresh();
+            return data;
+        });
     }, function () {
         aiMentionLoading = null;
-        aiMentionData = { catalogs: [], functions: [] };
-        return aiMentionData;
+        aiMentionRefresh();
+        return data;
     });
     return aiMentionLoading;
 }
 
-/** 光标前是否正处于一个 @ 词中；是则返回 {start, query}（start = '@' 的下标）。 */
+/** 加载每个 catalog 的 schema、每个 schema 的表（候选名字写成 catalog.schema[.table]）。 */
+function aiLoadNamespaces(data, catalogs) {
+    var jobs = catalogs.map(function (cat) {
+        var c = cat.name;
+        return httpGet('/api/metadata/catalogs/' + encodeURIComponent(c) + '/schemas')
+            .catch(function () { return null; })
+            .then(function (d) {
+                var schemas = (d && d.schemas) || [];
+                var tableJobs = schemas.map(function (s) {
+                    data.schemas.push({ type: 'schema', name: c + '.' + s, group: 'Schema',
+                        hint: c + ' 下的 schema' });
+                    return httpGet('/api/metadata/catalogs/' + encodeURIComponent(c)
+                            + '/schemas/' + encodeURIComponent(s) + '/tables')
+                        .catch(function () { return null; })
+                        .then(function (td) {
+                            ((td && td.tables) || []).forEach(function (t) {
+                                if (data.tables.length >= 800) return;   // 候选上限，避免超大元数据拖慢面板
+                                data.tables.push({ type: 'table', name: c + '.' + s + '.' + t,
+                                    group: '表', hint: c + '.' + s });
+                            });
+                            aiMentionRefresh();
+                        });
+                });
+                aiMentionRefresh();
+                return Promise.all(tableJobs);
+            });
+    });
+    return Promise.all(jobs);
+}
+
+/** 候选数据有增量（schema / 表陆续加载完）时，若面板还开着就按当前输入重算。 */
+function aiMentionRefresh() {
+    if (aiMentionState) aiMentionUpdate();
+}
+
+/**
+ * 光标前是否正处于一个引用词中；是则返回 {start, query, trigger}。
+ * trigger ∈ {'@', '#'}；start = 触发符下标。
+ */
 function aiMentionAt(text, caret) {
     var before = (text || '').slice(0, caret);
-    var m = /(^|[\s(（【，,、；;：:])@([^\s@]*)$/.exec(before);
+    var m = /(^|[\s(（【，,、；;：:])[@#]([^\s@#]*)$/.exec(before);
     if (!m) return null;
-    return { start: caret - m[2].length - 1, query: m[2] };
+    var start = caret - m[2].length - 1;
+    return { start: start, query: m[2], trigger: before.charAt(start) };
 }
 
 /** 输入 / 光标移动后刷新候选面板（候选数据未就绪则等它加载完）。 */
@@ -1820,7 +1867,7 @@ function aiMentionUpdate() {
         var cur = document.getElementById('ai-input');
         if (!cur) { aiMentionClose(); return; }
         var now = aiMentionAt(cur.value, cur.selectionStart);
-        if (!now) { aiMentionClose(); return; }
+        if (!now || now.trigger !== hit.trigger) { aiMentionClose(); return; }
         var q = now.query.toLowerCase();
         var pick = function (list) {
             var hits = list.filter(function (it) {
@@ -1835,8 +1882,14 @@ function aiMentionUpdate() {
             });
             return hits;
         };
-        var items = pick(data.catalogs).slice(0, 8).concat(pick(data.functions).slice(0, 14));
-        aiMentionState = { start: now.start, query: now.query, items: items, index: 0 };
+        // @ = 数据对象（catalog → schema → 表）；# = 函数。
+        var items = now.trigger === '#'
+                ? pick(data.functions).slice(0, 20)
+                : pick(data.catalogs).slice(0, 8)
+                    .concat(pick(data.schemas).slice(0, 10))
+                    .concat(pick(data.tables).slice(0, 20));
+        aiMentionState = { start: now.start, query: now.query, trigger: now.trigger,
+            items: items, index: 0 };
         aiMentionRender();
     });
 }
@@ -1851,8 +1904,11 @@ function aiMentionRender() {
     if (!st.items.length) {
         var empty = document.createElement('div');
         empty.className = 'ai-mention-empty';
-        empty.textContent = '没有匹配的 catalog / 函数';
+        empty.textContent = st.trigger === '#'
+                ? '没有匹配的函数'
+                : (aiMentionLoading ? '正在加载 catalog / schema / 表…' : '没有匹配的 catalog / schema / 表');
         pop.appendChild(empty);
+        aiMentionPlace(pop);
         pop.hidden = false;
         return;
     }
@@ -1870,7 +1926,7 @@ function aiMentionRender() {
         row.setAttribute('role', 'option');
         var name = document.createElement('span');
         name.className = 'ai-mention-name';
-        name.textContent = '@' + it.name;
+        name.textContent = st.trigger + it.name;
         var hint = document.createElement('span');
         hint.className = 'ai-mention-hint';
         hint.textContent = it.hint || '';
@@ -1885,8 +1941,28 @@ function aiMentionRender() {
         });
         pop.appendChild(row);
     });
+    aiMentionPlace(pop);
     pop.hidden = false;
     aiMentionHighlight();
+}
+
+/**
+ * 把候选面板放到底部输入框上方。
+ *
+ * <p>面板挂在 {@code document.body} 上并用 {@code position:fixed} —— {@code .ai-composer}
+ * 有 {@code overflow:hidden}（为了让滚动条槽与对话区等宽），面板留在里面时向上展开会被裁掉；
+ * 挂到 body 后不受任何祖先的 overflow / stacking context 影响，永远浮在流式回答之上。</p>
+ */
+function aiMentionPlace(pop) {
+    var input = document.getElementById('ai-input');
+    var wrap = input && input.closest ? input.closest('.ai-input-wrap') : null;
+    if (!pop || !wrap) return;
+    var r = wrap.getBoundingClientRect();
+    pop.style.left = r.left + 'px';
+    pop.style.width = r.width + 'px';
+    pop.style.bottom = (window.innerHeight - r.top + 6) + 'px';
+    // 输入框太靠上时收窄面板高度，避免顶出视口。
+    pop.style.maxHeight = Math.max(140, Math.min(340, r.top - 12)) + 'px';
 }
 
 /** 只更新高亮行（不重建 DOM），并把它滚进可视区。 */
@@ -1918,7 +1994,7 @@ function aiMentionPick(idx) {
     var item = st.items[idx == null ? st.index : idx];
     if (!item) { aiMentionClose(); return; }
     var caret = input.selectionStart;
-    var token = '@' + item.name;
+    var token = st.trigger + item.name;
     var before = input.value.slice(0, st.start);
     var after = input.value.slice(caret);
     input.value = before + token + ' ' + after;
@@ -1952,15 +2028,15 @@ function aiMentionLoadCatalogSchemas(name) {
         .catch(function () { /* 取不到 schema 不影响引用本身 */ });
 }
 
-/** 从正文提取 @ 引用（只认候选目录里存在的名字），返回发送给服务端的 mentions 数组。 */
+/** 从正文提取引用（只认候选目录里存在的名字），返回发送给服务端的 mentions 数组。 */
 function aiCollectMentions(text) {
     var out = [];
     if (!text || !aiMentionData) return out;
     var seen = {};
-    var re = /@([A-Za-z0-9_.\-\u4e00-\u9fa5]+)/g;
+    var re = /([@#])([A-Za-z0-9_.\-\u4e00-\u9fa5]+)/g;
     var m;
     while ((m = re.exec(text)) !== null) {
-        var it = aiFindMentionCandidate(m[1]);
+        var it = aiFindMentionCandidate(m[2], m[1]);
         if (!it) continue;
         var key = it.type + ':' + it.name;
         if (seen[key]) continue;
@@ -1971,25 +2047,35 @@ function aiCollectMentions(text) {
     return out;
 }
 
-/** 按名字（大小写不敏感）在候选目录里查（catalog 优先，其次函数）。 */
-function aiFindMentionCandidate(name) {
+/**
+ * 按名字（大小写不敏感）在候选目录里查。
+ * {@code #} 只查函数；{@code @} 依次查 catalog → schema → 表（函数兜底，兼容手打 @函数名）。
+ */
+function aiFindMentionCandidate(name, trigger) {
     var d = aiMentionData;
     if (!d || !name) return null;
     var lower = name.toLowerCase();
-    var i;
-    for (i = 0; i < d.catalogs.length; i++) {
-        if (d.catalogs[i].name.toLowerCase() === lower) return d.catalogs[i];
-    }
-    for (i = 0; i < d.functions.length; i++) {
-        if (d.functions[i].name.toLowerCase() === lower) return d.functions[i];
+    var lists = trigger === '#' ? [d.functions]
+            : [d.catalogs, d.schemas, d.tables, d.functions];
+    for (var li = 0; li < lists.length; li++) {
+        var list = lists[li];
+        for (var i = 0; i < list.length; i++) {
+            if (list[i].name.toLowerCase() === lower) return list[i];
+        }
     }
     return null;
 }
 
-/** 绑定 @ 引用：输入 / 光标移动刷新候选；点空白处关闭。 */
+/** 绑定引用候选：输入 / 光标移动刷新候选；点空白处关闭。 */
 function bindAiMentions() {
     var input = document.getElementById('ai-input');
     if (!input) return;
+    // 候选面板搬到 body 下：.ai-composer 的 overflow:hidden 会裁掉向上展开的弹层。
+    var pop = document.getElementById('ai-mention-pop');
+    if (pop && pop.parentNode !== document.body) document.body.appendChild(pop);
+    window.addEventListener('resize', function () {
+        if (aiMentionState) aiMentionPlace(document.getElementById('ai-mention-pop'));
+    });
     input.addEventListener('input', function () { aiMentionUpdate(); });
     input.addEventListener('keyup', function (e) {
         if (e.key === 'ArrowLeft' || e.key === 'ArrowRight'

@@ -1563,11 +1563,12 @@ textarea.sql-editor::-moz-selection { background: rgba(37, 99, 235, 0.26); color
 }
 /* 聚焦只把已有那圈边框染成主题色，不叠加 3px 光环（内侧曲线，用户要求去掉） */
 .ai-input-wrap:focus-within { border-color: var(--accent); }
-/* @ 引用候选弹层：定位基准 = 输入框外框（绝对定位不占 flex 行）。 */
-.ai-input-wrap { position: relative; }
+/* @ / # 引用候选弹层：挂在 body 上（position:fixed，坐标由 aiMentionPlace 计算）——
+   .ai-composer 有 overflow:hidden（等宽滚动条槽），面板留在里面会被裁掉；挂 body 后
+   不受任何祖先 overflow / stacking context 影响，永远浮在流式回答之上。 */
 .ai-mention-pop {
-  position: absolute; left: 0; right: 0; bottom: calc(100% + 6px);
-  z-index: 30; max-height: 340px; overflow-y: auto;
+  position: fixed; left: 0; bottom: 0; width: 240px;
+  z-index: 360; max-height: 340px; overflow-y: auto;
   padding: 6px;
   background: var(--bg2); border: 1px solid var(--line); border-radius: var(--radius-sm);
   box-shadow: 0 12px 34px rgba(15, 23, 42, 0.18);

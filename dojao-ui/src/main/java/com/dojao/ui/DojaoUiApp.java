@@ -1472,7 +1472,7 @@ public final class DojaoUiApp {
         if (streamId == null || streamId.isBlank()) {
             streamId = UUID.randomUUID().toString();
         }
-        // @ 引用（catalog / 函数）：转成检索范围说明拼进本轮提问；随轮次落库，追问仍可见。
+        // @ / # 引用（catalog / schema / 表 / 函数）：转成检索范围说明拼进本轮提问；随轮次落库，追问仍可见。
         final List<AiMentions.Mention> mentions = AiMentions.fromJson(mentionsNode);
         final String mentionBlock = AiMentions.promptBlock(mentions);
         final JsonNode mentionsForStore = mentions.isEmpty() ? null : AiMentions.toJson(mentions);

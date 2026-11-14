@@ -305,6 +305,9 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
         }
         AggregationHashTable ht = new AggregationHashTable(allocator, List.of(), List.of(), aggregations);
         try {
+            // 没有输入页 ⇒ 输出列类型不能靠页 schema 解析（collect 的 List 子字段会退化成 Utf8）；
+            // 用算子已知的上游 schema 对齐一次，保证空输入行的 schema 与规划期声明一致。
+            ht.primeEmptyInputFields(inputSchema == null ? null : inputSchema.getFields());
             VectorSchemaRoot batch = ht.buildGlobalEmptyRow();
             if (havingConfig != null) {
                 batch = filterHaving(batch);
@@ -583,6 +586,14 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                                 long[] longs = (long[]) state;
                                 setVectorValue(outVectors.get(outCol), outRows, longs[0]);
                             }
+                            case "collect_list", "collect_set" -> {
+                                // 状态 = Collection：整组写成一格 List（空组 → NULL，与唯一输出语义一致）
+                                if (state instanceof Collection<?> c && !c.isEmpty()) {
+                                    setVectorValue(outVectors.get(outCol), outRows, c);
+                                } else {
+                                    setVectorValue(outVectors.get(outCol), outRows, null);
+                                }
+                            }
                             default -> {
                                 // sum / min / max：Object[]{原始状态值}
                                 Object[] objState = (Object[]) state;
@@ -635,6 +646,26 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
         int stateCol = keyColumns.size();
         for (int si = 0; si < aggregations.size(); si++) {
             AggregationSpec spec = aggregations.get(si);
+            if (spec.isCollectArray()) {
+                // COLLECT_LIST / COLLECT_SET：结果列是 list<元素类型>。溢写路径取状态列的子字段，
+                // 未溢写（纯内存）取输入列字段 —— 都必须在 Field 层级带上子字段，ArrowType.List 不够。
+                Field child = null;
+                Field spilled = (!distinctSpecFlag[si] && spillFields != null
+                        && stateCol < spillFields.size()) ? spillFields.get(stateCol) : null;
+                if (spilled != null && !spilled.getChildren().isEmpty()) {
+                    child = spilled.getChildren().get(0);
+                } else {
+                    Field in = spec.inputColumn() == null
+                            ? null : inputSchema.findField(spec.inputColumn());
+                    if (in != null) child = new Field("item", in.getFieldType(), in.getChildren());
+                }
+                FieldType ft = spilled != null ? spilled.getFieldType()
+                        : FieldType.nullable(new ArrowType.List());
+                outFields.add(new Field(spec.outputColumn(), ft,
+                        child != null ? List.of(child) : null));
+                stateCol += stateColCount[si];
+                continue;
+            }
             ArrowType type = spec.outputArrowType();
             if (!distinctSpecFlag[si] && (isMinMax(spec) || isSumAvg(spec))) {
                 if (spillFields != null && stateCol < spillFields.size()) {
@@ -1620,6 +1651,13 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                         (org.apache.arrow.vector.VarCharVector) root.getVector(startCol);
                 yield com.dojao.core.function.aggregate.CountDistinctAggregateFunction
                         .decode(vv.isNull(row) ? null : vv.get(row));
+            }
+            case "collect_list", "collect_set" -> {
+                // List 列一格 = 整组值；NULL（空组 / 全 NULL 组）→ 空状态。
+                Object val = root.getVector(startCol).getObject(row);
+                java.util.Collection<?> vals = val instanceof java.util.Collection<?> c ? c : null;
+                yield com.dojao.core.function.aggregate.CollectSupport
+                        .fromValues(spec.aggregate().functionName(), vals);
             }
             default -> throw new UnsupportedOperationException(
                     "Cannot read spilt state for aggregate: " + spec.aggregate().functionName());

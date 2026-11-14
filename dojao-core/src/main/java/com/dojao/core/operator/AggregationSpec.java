@@ -5,6 +5,8 @@ import com.dojao.spi.function.AggregateFunction;
 import com.dojao.spi.function.CollectAggregateFunction;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 
 import java.util.List;
 
@@ -46,6 +48,7 @@ public record AggregationSpec(
     /** 内建聚合函数对应的 Arrow 输出类型 */
     private static final ArrowType INT64 = new ArrowType.Int(64, true);
     private static final ArrowType FLOAT64 = new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE);
+    private static final ArrowType LIST = new ArrowType.List();
 
     /** 获取该聚合的输出 Arrow 类型 */
     public ArrowType outputArrowType() {
@@ -54,8 +57,38 @@ public record AggregationSpec(
         return switch (name) {
             case "sum", "avg", "min", "max" -> FLOAT64;
             case "count", "count_distinct", "sum_int64" -> INT64;
+            // collect_list / collect_set：元素类型来自输入列，ArrowType 本身不含子字段，
+            // 声明完整 schema 请用 outputField(...)
+            case "collect_list", "collect_set" -> LIST;
             default -> FLOAT64; // 自定义聚合默认 double
         };
+    }
+
+    /** 是否 collect_list / collect_set（输出嵌套 List，字段需带子字段）。 */
+    public boolean isCollectArray() {
+        if (aggregate == null) return false;
+        String name = aggregate.functionName();
+        return "collect_list".equals(name) || "collect_set".equals(name);
+    }
+
+    /**
+     * 聚合结果列 Field（带子字段的类型声明）。
+     *
+     * <p>{@link ArrowType} 无法表达 {@code list<元素类型>} —— {@code ArrowType.List} 本身不含子字段，
+     * 直接 {@code new Field(name, type, null)} 建不出可写的 ListVector。所有“声明输出 schema”的地方
+     * （单机 buildOutput / 分布式 CTAS 声明 / DTO 重建）都必须走本方法。</p>
+     *
+     * @param inputField 聚合输入列的 Field（元素类型来源）；{@code null} 时（输入尚未到达）回退
+     *                   {@code list<Utf8>}，仅用于空输入兜底
+     */
+    public Field outputField(String name, Field inputField) {
+        if (isCollectArray()) {
+            Field child = inputField != null
+                    ? new Field("item", inputField.getFieldType(), inputField.getChildren())
+                    : new Field("item", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+            return new Field(name, FieldType.nullable(LIST), List.of(child));
+        }
+        return new Field(name, FieldType.nullable(outputArrowType(inputField)), null);
     }
 
     /**
@@ -134,6 +167,16 @@ public record AggregationSpec(
      */
     public static AggregationSpec sumInt64(String inputColumn, String outputColumn) {
         return new AggregationSpec(inputColumn, outputColumn, SumInt64AggregateFunction.INSTANCE);
+    }
+
+    /** COLLECT_LIST / ARRAY_AGG：收集为 {@code list<输入类型>}（NULL 跳过，空组 → NULL）。 */
+    public static AggregationSpec collectList(String inputColumn, String outputColumn) {
+        return new AggregationSpec(inputColumn, outputColumn, CollectListAggregateFunction.INSTANCE);
+    }
+
+    /** COLLECT_SET：去重收集为 {@code list<输入类型>}（NULL 跳过，空组 → NULL）。 */
+    public static AggregationSpec collectSet(String inputColumn, String outputColumn) {
+        return new AggregationSpec(inputColumn, outputColumn, CollectSetAggregateFunction.INSTANCE);
     }
 
     /** 注册自定义聚合函数（增量型） */

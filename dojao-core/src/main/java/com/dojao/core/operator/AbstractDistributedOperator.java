@@ -358,7 +358,9 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
     }
 
     private static Field aggregationOutputField(AggregationSpec a, Field inputField) {
-        return new Field(a.outputColumn(), FieldType.nullable(a.outputArrowType(inputField)), null);
+        // 走 AggregationSpec.outputField：collect_list/collect_set 的 List 子字段必须带上，
+        // 单纯 new Field(name, list, null) 建不出可写的 ListVector。
+        return a.outputField(a.outputColumn(), inputField);
     }
 
     /**
@@ -507,6 +509,11 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
                 return new ArrowType.Int(64, true);
             }
         }
+        if (aggregateName != null && (aggregateName.equalsIgnoreCase("collect_list")
+                || aggregateName.equalsIgnoreCase("collect_set")
+                || aggregateName.equalsIgnoreCase("array_agg"))) {
+            return new ArrowType.List();
+        }
         boolean bigint = aggregateName != null
                 && (aggregateName.equalsIgnoreCase("count")
                         || aggregateName.equalsIgnoreCase("count_distinct"));
@@ -524,6 +531,15 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
     protected static Field dtoAggregationField(String outputColumn, String aggregateName,
                                                List<Field> wire, String inputColumn) {
         Field input = (wire == null || inputColumn == null) ? null : fieldOf(wire, inputColumn);
+        if (aggregateName != null && (aggregateName.equalsIgnoreCase("collect_list")
+                || aggregateName.equalsIgnoreCase("collect_set")
+                || aggregateName.equalsIgnoreCase("array_agg"))) {
+            // 嵌套输出必须带子字段（元素类型来自输入列）
+            Field child = input != null
+                    ? new Field("item", input.getFieldType(), input.getChildren())
+                    : new Field("item", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+            return new Field(outputColumn, FieldType.nullable(new ArrowType.List()), List.of(child));
+        }
         return new Field(outputColumn, FieldType.nullable(dtoAggregateType(aggregateName, input)), null);
     }
 

@@ -3021,6 +3021,12 @@ public final class Planner {
             // MIN/MAX：与输入严格同型（数值保持 INT/FLOAT 原宽度，不再漂成 DOUBLE）
             case "min", "max", "min_if", "max_if" ->
                     argType == null ? null : new Field(col, FieldType.nullable(argType), null);
+            // COLLECT_LIST / COLLECT_SET / ARRAY_AGG：list<输入类型>（子字段必须带上，ArrowType.List 不够）
+            case "collect_list", "collect_set", "array_agg" -> {
+                if (arg == null) yield null;
+                Field child = new Field("item", arg.getFieldType(), arg.getChildren());
+                yield new Field(col, FieldType.nullable(new ArrowType.List()), List.of(child));
+            }
             default -> null;
         };
     }
@@ -6597,6 +6603,16 @@ public final class Planner {
             case "AVG" -> AggregationSpec.avg(inputCol, outName);
             case "MIN" -> AggregationSpec.min(inputCol, outName);
             case "MAX" -> AggregationSpec.max(inputCol, outName);
+            // COLLECT_LIST / ARRAY_AGG / COLLECT_SET：内建数组聚合（结果列 list<输入类型>）。
+            // 只看单列 / 单表达式参数；DISTINCT 由 COLLECT_SET 承担，上面已拒绝 collect_list(DISTINCT)。
+            case "COLLECT_LIST", "ARRAY_AGG", "COLLECT_SET" -> {
+                if (a.star()) {
+                    throw unsupported(fn + " 需要显式列参数，不支持 *");
+                }
+                yield "COLLECT_SET".equals(fn)
+                        ? AggregationSpec.collectSet(inputCol, outName)
+                        : AggregationSpec.collectList(inputCol, outName);
+            }
             default -> {
                 // 先查 collect-evaluate 型（CollectAggregateRegistry，框架攒值），再查增量型
                 CollectAggregateFunction collectFn = CollectAggregateRegistry.getGlobal(fn);
@@ -8954,6 +8970,8 @@ public final class Planner {
             case "avg" -> AggregationSpec.avg(in, out);
             case "min" -> AggregationSpec.min(in, out);
             case "max" -> AggregationSpec.max(in, out);
+            case "collect_list" -> AggregationSpec.collectList(in, out);
+            case "collect_set" -> AggregationSpec.collectSet(in, out);
             default -> {
                 AggregateFunction<?> custom = AggregateFunctionRegistry.getGlobal(dto.aggregateName());
                 if (custom == null) {
