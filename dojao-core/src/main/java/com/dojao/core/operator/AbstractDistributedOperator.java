@@ -467,45 +467,44 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
         return out;
     }
 
-    /** 窗口函数结果列 Field（复刻 WindowFunctionOperator.buildOutputSchema；LAG/LEAD 镜像输入列）。 */
+    /**
+     * 窗口函数结果列 Field —— 复刻 {@code WindowFunctionOperator.buildOutputSchema}：
+     * MIN/MAX 与输入同型、SUM(整型) → BIGINT、SUM/AVG(DECIMAL) → 放宽 DECIMAL、LAG/LEAD 镜像输入列。
+     */
     protected static Field windowFunctionField(WindowFunctionSpec spec,
                                                Function<String, Field> inputFieldOf) {
-        FieldType ft = switch (spec.type()) {
-            case ROW_NUMBER, RANK, DENSE_RANK, COUNT ->
-                    FieldType.nullable(new ArrowType.Int(64, true));
-            case SUM, AVG, MIN, MAX, AGGREGATE ->
-                    FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE));
-            case LAG, LEAD -> {
-                Field src = spec.inputColumn() == null ? null : inputFieldOf.apply(spec.inputColumn());
-                yield src != null
-                        ? FieldType.nullable(src.getType())
-                        : FieldType.nullable(ArrowType.Utf8.INSTANCE);
-            }
-        };
-        return new Field(spec.outputColumn(), ft, null);
+        Field src = spec.inputColumn() == null ? null : inputFieldOf.apply(spec.inputColumn());
+        return new Field(spec.outputColumn(), FieldType.nullable(spec.outputArrowType(src)), null);
     }
 
-    /** 传输 DTO（只带聚合名）的输出类型：count / count_distinct → BIGINT，其余 → DOUBLE（与内置一致）。 */
+    /** 传输 DTO（只带聚合名）的输出类型：count / count_distinct → BIGINT，其余 → DOUBLE（输入未知时的保守口径）。 */
     protected static ArrowType dtoAggregateType(String aggregateName) {
         return dtoAggregateType(aggregateName, null);
     }
 
     /**
-     * 传输 DTO 的输出类型 —— MIN/MAX 按输入列类型（时间戳 / 日期 / 字符串 / 布尔 / Decimal），
-     * count / count_distinct → BIGINT，其余 → DOUBLE。
+     * 传输 DTO 的输出类型 —— 与 {@link AggregationSpec#outputArrowType(Field)} / {@code resultTypeFor} 同口径：
+     * <ul>
+     *   <li>MIN/MAX 与输入列<b>严格同型</b>（时间戳 / 日期 / 字符串 / 布尔 / Decimal / 二进制，
+     *       以及数值：{@code max(int_col)} → INT、{@code min(float_col)} → FLOAT，不再漂成 DOUBLE）；</li>
+     *   <li>SUM/AVG(DECIMAL) → 放宽精度的 DECIMAL；SUM(整型) → BIGINT；</li>
+     *   <li>count / count_distinct → BIGINT，其余 → DOUBLE。</li>
+     * </ul>
      */
     protected static ArrowType dtoAggregateType(String aggregateName, Field inputField) {
         if (inputField != null && aggregateName != null) {
             ArrowType t = inputField.getType();
             if (aggregateName.equalsIgnoreCase("min") || aggregateName.equalsIgnoreCase("max")) {
-                if (!(t instanceof ArrowType.Int) && !(t instanceof ArrowType.FloatingPoint)) {
-                    return t;
-                }
+                return t;
             }
             // DECIMAL 的 SUM/AVG 输出 DECIMAL（精度放宽），保证跨 Worker 部分聚合仍精确
             if ((aggregateName.equalsIgnoreCase("sum") || aggregateName.equalsIgnoreCase("avg"))
                     && t instanceof ArrowType.Decimal d) {
                 return AggregationSpec.widenDecimal(d);
+            }
+            // SUM(整型) → BIGINT（整数累加，结果不带小数点；避免 32 位溢出）
+            if (aggregateName.equalsIgnoreCase("sum") && t instanceof ArrowType.Int) {
+                return new ArrowType.Int(64, true);
             }
         }
         boolean bigint = aggregateName != null

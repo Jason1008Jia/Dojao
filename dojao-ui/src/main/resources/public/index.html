@@ -497,8 +497,11 @@
             </svg>
             <span class="ai-send-stop" aria-hidden="true"></span>
           </button>
+          <!-- @ 引用候选：输入 @ 时在输入框上方弹出 catalog / 函数列表（见 bindAiMentions）。
+               绝对定位于 .ai-input-wrap 之上，不参与其 flex 行布局。 -->
+          <div class="ai-mention-pop" id="ai-mention-pop" role="listbox" hidden></div>
         </div>
-        <div class="ai-hint" id="ai-hint">Enter 发送 · Ctrl+Enter 换行 · 点左侧回形针或直接把文件拖到这里添加参考文件</div>
+        <div class="ai-hint" id="ai-hint">Enter 发送 · Ctrl+Enter 换行 · 输入 @ 引用 catalog / 函数 · 点左侧回形针或拖入文件添加参考文件</div>
       </div>
       <!-- 拖拽落区提示层：从桌面/资源管理器拖入文件时覆盖整个对话主区。
            pointer-events:none —— 拖拽事件仍由 #ai-main 的捕获监听处理，提示层不打断拖拽。 -->

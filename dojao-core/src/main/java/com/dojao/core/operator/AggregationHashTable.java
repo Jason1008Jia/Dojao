@@ -419,17 +419,14 @@ public class AggregationHashTable extends RowHashTable implements Slot {
     /**
      * 聚合结果列的 Arrow 类型。
      *
-     * <p>MIN/MAX 与输入同型（日期 → 日期、字符串 → 字符串、布尔 → 布尔、Decimal → Decimal），
-     * 只有数值列（Int / FloatingPoint）保持历史口径 DOUBLE。其余聚合沿用
-     * {@link AggregationSpec#outputArrowType()}。</p>
+     * <p><b>MIN/MAX 与输入严格同型</b>（日期 → 日期、字符串 → 字符串、布尔 → 布尔、Decimal → Decimal，
+     * 数值也保留原宽度：{@code max(int_col)} → INT、{@code min(float_col)} → FLOAT —— 不再漂成 DOUBLE）。
+     * 其余聚合沿用 {@link AggregationSpec#outputArrowType()}。</p>
      */
     static ArrowType resultTypeFor(AggregationSpec spec, ArrowType inputType) {
         if (inputType != null && spec.aggregate() != null) {
             String fn = spec.aggregate().functionName();
             if ("min".equals(fn) || "max".equals(fn)) {
-                if (inputType instanceof ArrowType.Int || inputType instanceof ArrowType.FloatingPoint) {
-                    return FLOAT64;
-                }
                 return inputType;
             }
             // DECIMAL 的 SUM/AVG 输出同族 DECIMAL（精度放宽），避免结果退化为浮点。
@@ -627,8 +624,8 @@ public class AggregationHashTable extends RowHashTable implements Slot {
                     fields.add(f); vectors.add(vec);
                 }
                 case "min", "max" -> {
-                    // 状态列类型 = 结果列类型：数值列是 DOUBLE（旧口径），其余与输入列同型
-                    // （时间戳 / 日期 / 字符串 / 布尔 / Decimal / 二进制）。溢写回读时按此类型还原。
+                    // 状态列类型 = 结果列类型：与输入列严格同型（数值保持 INT/FLOAT 原宽度；
+                    // 时间戳 / 日期 / 字符串 / 布尔 / Decimal / 二进制）。溢写回读时按此类型还原。
                     Field f = new Field(outName + "_s0", FieldType.nullable(outputType(si)), null);
                     FieldVector vec = createVector(f, allocator);
                     vec.allocateNew();

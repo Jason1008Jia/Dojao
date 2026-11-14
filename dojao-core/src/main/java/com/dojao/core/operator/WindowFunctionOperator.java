@@ -3,6 +3,7 @@ package com.dojao.core.operator;
 import com.dojao.common.data.Page;
 import com.dojao.common.memory.NodeMemory;
 import com.dojao.core.config.ResourceConfig;
+import com.dojao.core.function.aggregate.MinMaxSupport;
 import com.dojao.spi.function.AggregateFunction;
 import com.dojao.spi.function.AggregateFunctionRegistry;
 import com.dojao.spi.util.NestedTypeSupport;
@@ -20,6 +21,8 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.TransferPair;
 
 import java.io.IOException;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -108,25 +111,43 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
     private long rankValue;
     private long rankSameCount;
     private long denseRankValue;
-    /** 每个函数的运行累加值 */
+    /** 数值聚合输入类型 —— 决定累加器与输出列类型（与单机聚合同口径）。 */
+    private enum AggKind { INTEGRAL, FLOATING, DECIMAL, OTHER }
+
+    /** 每个函数的数值输入类型（schema 解析后填充；非 SUM/AVG 不使用）。 */
+    private final AggKind[] aggKinds;
+
+    /** 每个函数的运行累加值 —— 浮点 / 整型 / DECIMAL 各自独立，MIN/MAX 存规范化极值。 */
     private final double[] runningSums;
+    private final long[] runningLongSums;
+    private final BigDecimal[] runningDecSums;
+    /** MIN/MAX 的运行极值（规范化值：Long / Double / BigDecimal / String / LocalDateTime…）。 */
+    private final Object[] runningMinMax;
     private final long[] runningCounts;
 
     // ---- ROWS 帧状态（仅内置聚合 SUM/AVG/COUNT/MIN/MAX 且显式 ROWS 帧时非 null；null = 运行帧） ----
     /** 每个函数的 ROWS 帧；null = 运行/默认帧（走上面的运行聚合路径） */
     private final WindowFrame[] frames;
-    /** 每个帧函数的环形缓冲（容量 = startBack + 1）；非帧函数为 null */
+    /** 浮点 SUM/AVG 的环形缓冲（容量 = startBack + 1）；非帧函数 / 其他类型为 null */
     private double[][] frameRing;
+    /** 整型 SUM/AVG 的环形缓冲（保证 int64 精确，不经 double）。 */
+    private long[][] frameLongRing;
+    /** DECIMAL SUM/AVG 的环形缓冲（BigDecimal 精确累加）。 */
+    private BigDecimal[][] frameDecRing;
+    /** MIN/MAX 的环形缓冲（规范化值，支持字符串 / 日期 / 布尔等非数值比较）。 */
+    private Object[][] frameObjRing;
     /** 环形缓冲槽位是否为「非 NULL 值」 */
     private boolean[][] frameRingValid;
     /** 分区内已推入环形缓冲的行数（用于环形索引与「帧内可用行数」判断） */
     private final int[] frameFilled;
-    /** 帧内有效值之和（SUM/AVG 增量维护，避免每行重扫整个帧） */
+    /** 帧内有效值之和（浮点 / 整型 / DECIMAL 分开增量维护，避免每行重扫整个帧） */
     private final double[] frameAccSum;
+    private final long[] frameAccLong;
+    private final BigDecimal[] frameAccDec;
     /** 帧内有效值个数（AVG 增量维护） */
     private final long[] frameAccCnt;
-    /** MIN/MAX 单调队列的值（容量 = startBack + 1，环形数组） */
-    private final double[][] mmVal;
+    /** MIN/MAX 单调队列的值（规范化 Object，容量 = startBack + 1，环形数组） */
+    private final Object[][] mmVal;
     /** MIN/MAX 单调队列的<b>分区内绝对行号</b>（用于淘汰滑出帧的队头） */
     private final int[][] mmIdx;
     private final int[] mmHead;
@@ -259,7 +280,11 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
         for (int i = 0; i < functions.size(); i++) {
             funcIndices.computeIfAbsent(functions.get(i).type(), k -> new ArrayList<>()).add(i);
         }
+        this.aggKinds = new AggKind[functions.size()];
         this.runningSums = new double[functions.size()];
+        this.runningLongSums = new long[functions.size()];
+        this.runningDecSums = new BigDecimal[functions.size()];
+        this.runningMinMax = new Object[functions.size()];
         this.runningCounts = new long[functions.size()];
         // 为每个 LAG 函数分配环形缓冲区
         this.lagRings = new Object[functions.size()][];
@@ -282,14 +307,20 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
             }
         }
         this.maxLeadOffset = maxLead;
-        // 为每个显式 ROWS 帧的内置聚合函数分配环形缓冲（容量 = startBack + 1）
+        // 为每个显式 ROWS 帧的内置聚合函数登记帧；环形缓冲在 initSchema 按输入类型分配
+        // （整型 → long[]、DECIMAL → BigDecimal[]、MIN/MAX → Object[]，浮点才用 double[]）。
         this.frames = new WindowFrame[functions.size()];
         this.frameRing = new double[functions.size()][];
+        this.frameLongRing = new long[functions.size()][];
+        this.frameDecRing = new BigDecimal[functions.size()][];
+        this.frameObjRing = new Object[functions.size()][];
         this.frameRingValid = new boolean[functions.size()][];
         this.frameFilled = new int[functions.size()];
         this.frameAccSum = new double[functions.size()];
+        this.frameAccLong = new long[functions.size()];
+        this.frameAccDec = new BigDecimal[functions.size()];
         this.frameAccCnt = new long[functions.size()];
-        this.mmVal = new double[functions.size()][];
+        this.mmVal = new Object[functions.size()][];
         this.mmIdx = new int[functions.size()][];
         this.mmHead = new int[functions.size()];
         this.mmSize = new int[functions.size()];
@@ -297,13 +328,6 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
             WindowFunctionSpec spec = functions.get(i);
             if (spec.frame() != null && isFrameAggregate(spec.type())) {
                 this.frames[i] = spec.frame();
-                int cap = spec.frame().startBack() + 1;
-                this.frameRing[i] = new double[cap];
-                this.frameRingValid[i] = new boolean[cap];
-                if (spec.type() == WindowFunctionType.MIN || spec.type() == WindowFunctionType.MAX) {
-                    this.mmVal[i] = new double[cap];
-                    this.mmIdx[i] = new int[cap];
-                }
             }
         }
         // 初始化聚合实例和状态
@@ -786,35 +810,43 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
             case SUM -> {
                 Long ov = valueOverrides.get(WindowFunctionType.SUM);
                 if (ov != null) {
-                    ((Float8Vector) outVec).setSafe(row, ov.doubleValue());
+                    writeVectorValue(outVec, row, ov);
                 } else if (frames[fi] != null) {
                     FieldVector in = colIdx >= 0 ? input.getVector(colIdx) : null;
                     advanceFrame(fi, WindowFunctionType.SUM, in, row);
                     if (frameAccCnt[fi] == 0) outVec.setNull(row);
-                    else ((Float8Vector) outVec).setSafe(row, frameAccSum[fi]);
+                    else writeFrameSum(fi, outVec, row);
                 } else {
-                    double val = colIdx >= 0 ? toDouble(input.getVector(colIdx), row) : 0.0;
-                    runningSums[fi] += val;
-                    ((Float8Vector) outVec).setSafe(row, runningSums[fi]);
+                    FieldVector in = colIdx >= 0 ? input.getVector(colIdx) : null;
+                    Object v = readNumeric(in, row, aggKinds[fi]);
+                    if (v != null) {
+                        accumulateRunning(fi, v);
+                        runningCounts[fi]++;
+                    }
+                    if (runningCounts[fi] == 0) outVec.setNull(row);
+                    else writeRunningSum(fi, outVec, row);
                 }
             }
             case AVG -> {
                 Long ov = valueOverrides.get(WindowFunctionType.AVG);
                 if (ov != null) {
-                    ((Float8Vector) outVec).setSafe(row, ov.doubleValue());
+                    writeVectorValue(outVec, row, ov);
                 } else if (frames[fi] != null) {
                     FieldVector in = colIdx >= 0 ? input.getVector(colIdx) : null;
                     advanceFrame(fi, WindowFunctionType.AVG, in, row);
                     long cnt = frameAccCnt[fi];
                     if (cnt == 0) outVec.setNull(row);
-                    else ((Float8Vector) outVec).setSafe(row, frameAccSum[fi] / cnt);
+                    else writeFrameAvg(fi, outVec, row, cnt);
                 } else {
-                    double val = colIdx >= 0 ? toDouble(input.getVector(colIdx), row) : 0.0;
-                    runningSums[fi] += val;
-                    runningCounts[fi]++;
-                    double avg = runningCounts[fi] > 0
-                            ? runningSums[fi] / runningCounts[fi] : 0.0;
-                    ((Float8Vector) outVec).setSafe(row, avg);
+                    FieldVector in = colIdx >= 0 ? input.getVector(colIdx) : null;
+                    Object v = readNumeric(in, row, aggKinds[fi]);
+                    if (v != null) {
+                        accumulateRunning(fi, v);
+                        runningCounts[fi]++;
+                    }
+                    long cnt = runningCounts[fi];
+                    if (cnt == 0) outVec.setNull(row);
+                    else writeRunningAvg(fi, outVec, row, cnt);
                 }
             }
             case COUNT -> {
@@ -832,42 +864,33 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
                     ((BigIntVector) outVec).setSafe(row, runningCounts[fi]);
                 }
             }
-            case MIN -> {
-                Long ov = valueOverrides.get(WindowFunctionType.MIN);
+            case MIN, MAX -> {
+                WindowFunctionType wt = spec.type();
+                Long ov = valueOverrides.get(wt);
                 if (ov != null) {
-                    ((Float8Vector) outVec).setSafe(row, ov.doubleValue());
+                    writeVectorValue(outVec, row, ov);
                 } else if (frames[fi] != null) {
                     FieldVector in = colIdx >= 0 ? input.getVector(colIdx) : null;
-                    advanceFrame(fi, WindowFunctionType.MIN, in, row);
-                    int head = mmHead[fi];
+                    advanceFrame(fi, wt, in, row);
                     if (mmSize[fi] == 0) outVec.setNull(row);
-                    else ((Float8Vector) outVec).setSafe(row, mmVal[fi][head]);
+                    else writeVectorValue(outVec, row, mmVal[fi][mmHead[fi]]);
                 } else {
-                    double val = colIdx >= 0 ? toDouble(input.getVector(colIdx), row) : 0.0;
-                    double currentMin = runningSums[fi];
-                    if (rowNumber == 0 || val < currentMin) {
-                        runningSums[fi] = val;
-                    }
-                    ((Float8Vector) outVec).setSafe(row, runningSums[fi]);
-                }
-            }
-            case MAX -> {
-                Long ov = valueOverrides.get(WindowFunctionType.MAX);
-                if (ov != null) {
-                    ((Float8Vector) outVec).setSafe(row, ov.doubleValue());
-                } else if (frames[fi] != null) {
                     FieldVector in = colIdx >= 0 ? input.getVector(colIdx) : null;
-                    advanceFrame(fi, WindowFunctionType.MAX, in, row);
-                    int head = mmHead[fi];
-                    if (mmSize[fi] == 0) outVec.setNull(row);
-                    else ((Float8Vector) outVec).setSafe(row, mmVal[fi][head]);
-                } else {
-                    double val = colIdx >= 0 ? toDouble(input.getVector(colIdx), row) : 0.0;
-                    double currentMax = runningSums[fi];
-                    if (rowNumber == 0 || val > currentMax) {
-                        runningSums[fi] = val;
+                    Object v = readNormalized(in, row);
+                    if (v != null) {
+                        Object cur = runningMinMax[fi];
+                        if (cur == null) {
+                            runningMinMax[fi] = v;
+                        } else {
+                            int cmp = MinMaxSupport.compare(v, cur);
+                            if (wt == WindowFunctionType.MIN ? cmp < 0 : cmp > 0) {
+                                runningMinMax[fi] = v;
+                            }
+                        }
                     }
-                    ((Float8Vector) outVec).setSafe(row, runningSums[fi]);
+                    Object cur = runningMinMax[fi];
+                    if (cur == null) outVec.setNull(row);
+                    else writeVectorValue(outVec, row, cur);
                 }
             }
             case LAG -> {
@@ -971,7 +994,6 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
     private void advanceFrame(int fi, WindowFunctionType type, FieldVector in, int row) {
         WindowFrame f = frames[fi];
         int cap = f.startBack() + 1;
-        double[] ring = frameRing[fi];
         boolean[] valid = frameRingValid[fi];
         int t = frameFilled[fi];                 // 本行在分区内的绝对行号
 
@@ -981,7 +1003,7 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
         if (leaving >= 0 && (type == WindowFunctionType.SUM || type == WindowFunctionType.AVG)) {
             int pos = (int) (leaving % cap);
             if (valid[pos]) {
-                frameAccSum[fi] -= ring[pos];
+                frameSub(fi, pos);
                 frameAccCnt[fi]--;
             }
         }
@@ -990,12 +1012,15 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
             evictMinMax(fi, (long) t - f.startBack());
         }
 
-        // 3) 推入本行采样。
+        // 3) 推入本行采样（按输入类型存进各自的环形缓冲）。
         boolean has = in != null && !in.isNull(row);
-        double val = has ? toDouble(in, row) : 0.0;
         int pos = t % cap;
-        ring[pos] = val;
         valid[pos] = has;
+        switch (type) {
+            case SUM, AVG, COUNT -> storeFrameValue(fi, pos, in, row, has);
+            case MIN, MAX -> frameObjRing[fi][pos] = has ? readNormalized(in, row) : null;
+            default -> { }
+        }
 
         // 4) 进入帧的行（t - endBack）：写入本行后，该行（含 endBack=0 时的本行）仍在环中。
         long entering = (long) t - f.endBack();
@@ -1004,10 +1029,10 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
             if (valid[epos]) {
                 switch (type) {
                     case SUM, AVG -> {
-                        frameAccSum[fi] += ring[epos];
+                        frameAdd(fi, epos);
                         frameAccCnt[fi]++;
                     }
-                    case MIN, MAX -> pushMinMax(fi, (int) entering, ring[epos]);
+                    case MIN, MAX -> pushMinMax(fi, (int) entering, frameObjRing[fi][epos]);
                     default -> { }
                 }
             }
@@ -1022,36 +1047,87 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
         frameFilled[fi] = t + 1;
     }
 
+    /** 把本行采样写入对应数值族的环形缓冲（COUNT 不需要值，但仍推进占位槽）。 */
+    private void storeFrameValue(int fi, int pos, FieldVector in, int row, boolean has) {
+        if (!has) return;
+        switch (aggKinds[fi]) {
+            case INTEGRAL -> frameLongRing[fi][pos] = (Long) readNumeric(in, row, AggKind.INTEGRAL);
+            case DECIMAL -> frameDecRing[fi][pos] = (BigDecimal) readNumeric(in, row, AggKind.DECIMAL);
+            case FLOATING -> frameRing[fi][pos] = (Double) readNumeric(in, row, AggKind.FLOATING);
+            default -> { }
+        }
+    }
+
+    /** 帧内进入一行：按数值族累加到对应累加器。 */
+    private void frameAdd(int fi, int pos) {
+        switch (aggKinds[fi]) {
+            case INTEGRAL -> frameAccLong[fi] += frameLongRing[fi][pos];
+            case DECIMAL -> {
+                BigDecimal v = frameDecRing[fi][pos];
+                BigDecimal cur = frameAccDec[fi];
+                frameAccDec[fi] = cur == null ? v : cur.add(v);
+            }
+            default -> frameAccSum[fi] += frameRing[fi][pos];
+        }
+    }
+
+    /** 帧内离开一行：按数值族从对应累加器扣除。 */
+    private void frameSub(int fi, int pos) {
+        switch (aggKinds[fi]) {
+            case INTEGRAL -> frameAccLong[fi] -= frameLongRing[fi][pos];
+            case DECIMAL -> {
+                BigDecimal v = frameDecRing[fi][pos];
+                if (v != null && frameAccDec[fi] != null) frameAccDec[fi] = frameAccDec[fi].subtract(v);
+            }
+            default -> frameAccSum[fi] -= frameRing[fi][pos];
+        }
+    }
+
     /** 整帧重算 SUM/AVG 的累加量（仅用于消除浮点漂移；帧宽扫描，执行频率 1/65536 行）。 */
     private void recomputeFrameAgg(int fi, int t) {
         WindowFrame f = frames[fi];
         int cap = f.startBack() + 1;
-        double[] ring = frameRing[fi];
         boolean[] valid = frameRingValid[fi];
         int lo = Math.max(0, t - f.startBack());
         int hi = t - f.endBack();
         double sum = 0;
+        long lsum = 0;
+        BigDecimal dsum = null;
         long cnt = 0;
         for (int r = lo; r <= hi; r++) {
             int p = r % cap;
-            if (valid[p]) { sum += ring[p]; cnt++; }
+            if (!valid[p]) continue;
+            cnt++;
+            switch (aggKinds[fi]) {
+                case INTEGRAL -> lsum += frameLongRing[fi][p];
+                case DECIMAL -> {
+                    BigDecimal v = frameDecRing[fi][p];
+                    dsum = dsum == null ? v : dsum.add(v);
+                }
+                default -> sum += frameRing[fi][p];
+            }
         }
-        frameAccSum[fi] = sum;
+        switch (aggKinds[fi]) {
+            case INTEGRAL -> frameAccLong[fi] = lsum;
+            case DECIMAL -> frameAccDec[fi] = dsum;
+            default -> frameAccSum[fi] = sum;
+        }
         frameAccCnt[fi] = cnt;
     }
 
     /** MIN/MAX 单调队列：弹出队尾不再可能成为极值的旧值，再压入 {@code (absIdx, v)}。 */
-    private void pushMinMax(int fi, int absIdx, double v) {
+    private void pushMinMax(int fi, int absIdx, Object v) {
+        if (v == null) return;
         int cap = frames[fi].startBack() + 1;
-        double[] vals = mmVal[fi];
+        Object[] vals = mmVal[fi];
         int[] idxs = mmIdx[fi];
         int head = mmHead[fi];
         int size = mmSize[fi];
         boolean isMin = functions.get(fi).type() == WindowFunctionType.MIN;
         while (size > 0) {
             int back = (head + size - 1) % cap;
-            double bv = vals[back];
-            if (isMin ? bv >= v : bv <= v) size--;   // 旧值更差或并列 ⇒ 永远不会再被选中
+            int cmp = MinMaxSupport.compare(v, vals[back]);
+            if (isMin ? cmp <= 0 : cmp >= 0) size--;   // 旧值更差或并列 ⇒ 永远不会再被选中
             else break;
         }
         int pos = (head + size) % cap;
@@ -1073,6 +1149,96 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
         }
         mmHead[fi] = head;
         mmSize[fi] = size;
+    }
+
+    /** 读数值列的规范化值：整型 → Long、DECIMAL → BigDecimal、浮点 → Double；NULL/非数值 → null。 */
+    private static Object readNumeric(FieldVector vec, int row, AggKind kind) {
+        if (vec == null || vec.isNull(row)) return null;
+        switch (kind) {
+            case INTEGRAL -> {
+                if (vec instanceof BigIntVector v) return v.get(row);
+                if (vec instanceof IntVector v) return (long) v.get(row);
+                if (vec instanceof SmallIntVector v) return (long) v.get(row);
+                if (vec instanceof TinyIntVector v) return (long) v.get(row);
+                Object o = vec.getObject(row);
+                return o instanceof Number n ? n.longValue() : null;
+            }
+            case DECIMAL -> {
+                Object o = vec.getObject(row);
+                return o instanceof BigDecimal b ? b
+                        : o == null ? null : new BigDecimal(o.toString());
+            }
+            case FLOATING -> {
+                if (vec instanceof Float8Vector v) return v.get(row);
+                if (vec instanceof Float4Vector v) return (double) v.get(row);
+                return toDouble(vec, row);
+            }
+            default -> {
+                return null;   // 非数值输入不进 SUM/AVG（规划期已拒绝）
+            }
+        }
+    }
+
+    /** 读任意列并规范化为可比较值（MIN/MAX 用；支持字符串 / 日期 / 布尔 / DECIMAL…）。 */
+    private static Object readNormalized(FieldVector vec, int row) {
+        if (vec == null || vec.isNull(row)) return null;
+        return MinMaxSupport.normalize(vec.getObject(row));
+    }
+
+    /** 运行聚合累加一行（按数值族选对应累加器）。 */
+    private void accumulateRunning(int fi, Object v) {
+        switch (aggKinds[fi]) {
+            case INTEGRAL -> runningLongSums[fi] += ((Number) v).longValue();
+            case DECIMAL -> {
+                BigDecimal b = (BigDecimal) v;
+                BigDecimal cur = runningDecSums[fi];
+                runningDecSums[fi] = cur == null ? b : cur.add(b);
+            }
+            default -> runningSums[fi] += ((Number) v).doubleValue();
+        }
+    }
+
+    private void writeRunningSum(int fi, FieldVector outVec, int row) {
+        switch (aggKinds[fi]) {
+            case INTEGRAL -> writeVectorValue(outVec, row, runningLongSums[fi]);
+            case DECIMAL -> writeVectorValue(outVec, row, runningDecSums[fi]);
+            default -> writeVectorValue(outVec, row, runningSums[fi]);
+        }
+    }
+
+    private void writeFrameSum(int fi, FieldVector outVec, int row) {
+        switch (aggKinds[fi]) {
+            case INTEGRAL -> writeVectorValue(outVec, row, frameAccLong[fi]);
+            case DECIMAL -> writeVectorValue(outVec, row, frameAccDec[fi]);
+            default -> writeVectorValue(outVec, row, frameAccSum[fi]);
+        }
+    }
+
+    private void writeRunningAvg(int fi, FieldVector outVec, int row, long cnt) {
+        if (aggKinds[fi] == AggKind.DECIMAL) {
+            writeVectorValue(outVec, row, decimalAvg(runningDecSums[fi], cnt));
+        } else {
+            double sum = aggKinds[fi] == AggKind.INTEGRAL
+                    ? (double) runningLongSums[fi] : runningSums[fi];
+            writeVectorValue(outVec, row, sum / cnt);
+        }
+    }
+
+    private void writeFrameAvg(int fi, FieldVector outVec, int row, long cnt) {
+        if (aggKinds[fi] == AggKind.DECIMAL) {
+            writeVectorValue(outVec, row, decimalAvg(frameAccDec[fi], cnt));
+        } else {
+            double sum = aggKinds[fi] == AggKind.INTEGRAL
+                    ? (double) frameAccLong[fi] : frameAccSum[fi];
+            writeVectorValue(outVec, row, sum / cnt);
+        }
+    }
+
+    /** DECIMAL 平均值：与单机 / 分布式 AVG 同口径（scale = max(和.scale, 2)，HALF_UP）。 */
+    private static BigDecimal decimalAvg(BigDecimal sum, long cnt) {
+        if (sum == null) return null;
+        int scale = Math.max(sum.scale(), 2);
+        return sum.divide(BigDecimal.valueOf(cnt), scale, RoundingMode.HALF_UP);
     }
 
     private static double toDouble(FieldVector vector, int index) {
@@ -1127,12 +1293,17 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
         rankSameCount = 0;
         denseRankValue = 0;
         Arrays.fill(runningSums, 0.0);
+        Arrays.fill(runningLongSums, 0L);
+        Arrays.fill(runningDecSums, null);
+        Arrays.fill(runningMinMax, null);
         Arrays.fill(runningCounts, 0);
         // 重置 LAG 环形缓冲区
         Arrays.fill(lagRingSize, 0);
         // 重置 ROWS 帧环形缓冲与滑动聚合状态（槽位内容由 frameFilled 门控，无需清空）
         Arrays.fill(frameFilled, 0);
         Arrays.fill(frameAccSum, 0.0);
+        Arrays.fill(frameAccLong, 0L);
+        Arrays.fill(frameAccDec, null);
         Arrays.fill(frameAccCnt, 0);
         Arrays.fill(mmHead, 0);
         Arrays.fill(mmSize, 0);
@@ -1458,6 +1629,9 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
         private final long[] segStarts;
         private final long totalRows;
         private final double[] totals;
+        private final long[] totalLong;
+        private final BigDecimal[] totalDec;
+        private final Object[] totalMinMax;
         private final long[] totalCounts;
         private final Object[] totalObjects;
         private final boolean[] totalSeen;
@@ -1477,6 +1651,9 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
             }
             this.totalRows = segStarts[segments.size()];
             this.totals = new double[functions.size()];
+            this.totalLong = new long[functions.size()];
+            this.totalDec = new BigDecimal[functions.size()];
+            this.totalMinMax = new Object[functions.size()];
             this.totalCounts = new long[functions.size()];
             this.totalObjects = new Object[functions.size()];
             this.totalSeen = new boolean[functions.size()];
@@ -1541,30 +1718,26 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
                                     ? columnNameToIndex.getOrDefault(spec.inputColumn(), -1) : -1;
                             FieldVector vec = colIdx >= 0 ? root.getVector(colIdx) : null;
                             switch (spec.type()) {
-                                case SUM -> {
-                                    if (vec != null) totals[fi] += toDouble(vec, r);
-                                }
-                                case AVG -> {
-                                    if (vec != null) totals[fi] += toDouble(vec, r);
-                                    totalCounts[fi]++;
-                                }
-                                case COUNT -> totalCounts[fi]++;
-                                case MIN -> {
-                                    double v = vec != null ? toDouble(vec, r) : 0.0;
-                                    if (!totalSeen[fi]) {
-                                        totals[fi] = v;
-                                        totalSeen[fi] = true;
-                                    } else {
-                                        totals[fi] = Math.min(totals[fi], v);
+                                case SUM, AVG -> {
+                                    Object v = readNumeric(vec, r, aggKinds[fi]);
+                                    if (v != null) {
+                                        accumulateTotal(fi, v);
+                                        totalCounts[fi]++;
                                     }
                                 }
-                                case MAX -> {
-                                    double v = vec != null ? toDouble(vec, r) : 0.0;
-                                    if (!totalSeen[fi]) {
-                                        totals[fi] = v;
+                                case COUNT -> totalCounts[fi]++;
+                                case MIN, MAX -> {
+                                    Object v = readNormalized(vec, r);
+                                    if (v != null) {
+                                        Object cur = totalMinMax[fi];
+                                        if (cur == null) totalMinMax[fi] = v;
+                                        else {
+                                            int cmp = MinMaxSupport.compare(v, cur);
+                                            if (spec.type() == WindowFunctionType.MIN ? cmp < 0 : cmp > 0) {
+                                                totalMinMax[fi] = v;
+                                            }
+                                        }
                                         totalSeen[fi] = true;
-                                    } else {
-                                        totals[fi] = Math.max(totals[fi], v);
                                     }
                                 }
                                 case AGGREGATE -> {
@@ -1681,12 +1854,44 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
             leadChainTotal = cum;
         }
 
+        /** 整分区聚合累加一行（按数值族选对应累加器）。 */
+        private void accumulateTotal(int fi, Object v) {
+            switch (aggKinds[fi]) {
+                case INTEGRAL -> totalLong[fi] += ((Number) v).longValue();
+                case DECIMAL -> {
+                    BigDecimal b = (BigDecimal) v;
+                    BigDecimal cur = totalDec[fi];
+                    totalDec[fi] = cur == null ? b : cur.add(b);
+                }
+                default -> totals[fi] += ((Number) v).doubleValue();
+            }
+        }
+
         private void writeTotal(int fi, WindowFunctionSpec spec, FieldVector outVec, int row) {
             Long ov = valueOverrides.get(spec.type());
             switch (spec.type()) {
-                case SUM, AVG, MIN, MAX -> {
-                    double v = ov != null ? ov.doubleValue() : totals[fi];
-                    ((Float8Vector) outVec).setSafe(row, v);
+                case SUM -> {
+                    if (ov != null) writeVectorValue(outVec, row, ov);
+                    else if (totalCounts[fi] == 0) outVec.setNull(row);
+                    else if (aggKinds[fi] == AggKind.INTEGRAL) writeVectorValue(outVec, row, totalLong[fi]);
+                    else if (aggKinds[fi] == AggKind.DECIMAL) writeVectorValue(outVec, row, totalDec[fi]);
+                    else writeVectorValue(outVec, row, totals[fi]);
+                }
+                case AVG -> {
+                    if (ov != null) writeVectorValue(outVec, row, ov);
+                    else if (totalCounts[fi] == 0) outVec.setNull(row);
+                    else if (aggKinds[fi] == AggKind.DECIMAL) {
+                        writeVectorValue(outVec, row, decimalAvg(totalDec[fi], totalCounts[fi]));
+                    } else {
+                        double sum = aggKinds[fi] == AggKind.INTEGRAL
+                                ? (double) totalLong[fi] : totals[fi];
+                        writeVectorValue(outVec, row, sum / totalCounts[fi]);
+                    }
+                }
+                case MIN, MAX -> {
+                    if (ov != null) writeVectorValue(outVec, row, ov);
+                    else if (totalMinMax[fi] == null) outVec.setNull(row);
+                    else writeVectorValue(outVec, row, totalMinMax[fi]);
                 }
                 case COUNT -> {
                     long v = ov != null ? ov : totalCounts[fi];
@@ -1741,36 +1946,60 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
 
     /**
      * 构建输出 schema：输入列 + 窗口函数结果列。
+     *
+     * <p>★结果列类型按<b>输入列类型</b>推导（{@link WindowFunctionSpec#outputArrowType(Field)}）：
+     * MIN/MAX 与输入严格同型（int 不出小数点）、SUM(整型) → BIGINT、SUM/AVG(DECIMAL) → 放宽 DECIMAL，
+     * 与单机 / 分布式聚合口径一致。同时解析每个函数的累加器类型并分配帧缓冲。</p>
      */
     private void buildOutputSchema() {
         outputFields = new ArrayList<>(inputSchema.getFields());
-        for (WindowFunctionSpec spec : functions) {
-            Field field = switch (spec.type()) {
-                case ROW_NUMBER, RANK, DENSE_RANK, COUNT -> new Field(spec.outputColumn(),
-                        FieldType.nullable(new ArrowType.Int(64, true)), null);
-                case SUM, AVG, MIN, MAX -> new Field(spec.outputColumn(),
-                        FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)),
-                        null);
-                case LAG, LEAD -> {
-                    // 输出类型与输入列类型一致
-                    Integer idx = columnNameToIndex.get(spec.inputColumn());
-                    if (idx != null) {
-                        Field inputField = inputSchema.getFields().get(idx);
-                        yield new Field(spec.outputColumn(),
-                                FieldType.nullable(inputField.getType()), null);
+        for (int i = 0; i < functions.size(); i++) {
+            WindowFunctionSpec spec = functions.get(i);
+            Field in = inputFieldOf(spec);
+            aggKinds[i] = kindOf(in);
+            outputFields.add(new Field(spec.outputColumn(),
+                    FieldType.nullable(spec.outputArrowType(in)), null));
+        }
+        allocateFrameBuffers();
+    }
+
+    /** 按列名取输入 Field（解析不到 → null，调用方走保守口径）。 */
+    private Field inputFieldOf(WindowFunctionSpec spec) {
+        if (spec.inputColumn() == null || columnNameToIndex == null) return null;
+        Integer idx = columnNameToIndex.get(spec.inputColumn());
+        return idx == null ? null : inputSchema.getFields().get(idx);
+    }
+
+    private static AggKind kindOf(Field in) {
+        if (in == null) return AggKind.FLOATING;
+        ArrowType t = in.getType();
+        if (t instanceof ArrowType.Int) return AggKind.INTEGRAL;
+        if (t instanceof ArrowType.Decimal) return AggKind.DECIMAL;
+        if (t instanceof ArrowType.FloatingPoint) return AggKind.FLOATING;
+        return AggKind.OTHER;
+    }
+
+    /** 按输入类型为显式 ROWS 帧分配环形缓冲（MIN/MAX 用 Object[]，其余按数值族分开）。 */
+    private void allocateFrameBuffers() {
+        for (int i = 0; i < functions.size(); i++) {
+            if (frames[i] == null) continue;
+            int cap = frames[i].startBack() + 1;
+            frameRingValid[i] = new boolean[cap];
+            switch (functions.get(i).type()) {
+                case MIN, MAX -> {
+                    frameObjRing[i] = new Object[cap];
+                    mmVal[i] = new Object[cap];
+                    mmIdx[i] = new int[cap];
+                }
+                case SUM, AVG -> {
+                    switch (aggKinds[i]) {
+                        case INTEGRAL -> frameLongRing[i] = new long[cap];
+                        case DECIMAL -> frameDecRing[i] = new BigDecimal[cap];
+                        default -> frameRing[i] = new double[cap];
                     }
-                    yield new Field(spec.outputColumn(),
-                            FieldType.nullable(new ArrowType.Utf8()), null);
                 }
-                case AGGREGATE -> {
-                    // 自定义聚合窗口输出默认 double：中位数等返回 Double，若镜像 DECIMAL 输入列类型，
-                    // 输出是 DecimalVector，而 writeVectorValue 无 Decimal 分支 → 落入 default → 全 NULL。
-                    // 与 AggregationSpec.outputArrowType 的"自定义聚合默认 double"保持一致。
-                    yield new Field(spec.outputColumn(),
-                            FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)), null);
-                }
-            };
-            outputFields.add(field);
+                default -> frameRing[i] = new double[cap];   // COUNT：只用于占位推进行号
+            }
         }
     }
 

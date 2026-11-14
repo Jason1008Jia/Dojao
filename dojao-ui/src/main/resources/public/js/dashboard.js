@@ -1035,6 +1035,15 @@ var AI_ATTACH_MAX_BYTES = 10 * 1024 * 1024;
 /** 记住「当前正在聊的会话 id」的 localStorage 键：刷新页面后据此回到原会话。 */
 var AI_SESSION_KEY = 'dojao.ai.session';
 
+/** @ 引用候选数据（catalog + 函数目录），首次输入 @ 时惰性加载并缓存。 */
+var aiMentionData = null;
+/** 候选数据加载中的 Promise（并发触发时复用同一次请求）。 */
+var aiMentionLoading = null;
+/** 当前弹出的候选面板状态：{start, query, items:[{type,name,hint,group}], index}；null = 未弹出。 */
+var aiMentionState = null;
+/** 选中过的 catalog 的 schema 摘要（type:name → 说明），随 @ 引用一起发给模型，缩小检索范围。 */
+var aiMentionExtra = {};
+
 /** 读取上次所在会话 id（无 / 不可用 → null）。 */
 function aiStoredSessionId() {
     try { return window.localStorage ? window.localStorage.getItem(AI_SESSION_KEY) : null; }
@@ -1364,6 +1373,15 @@ function sendAiMessage(text) {
     aiStopPendingPoll();
     ensureAiSession().then(function (sessionId) {
         if (!sessionId) return;
+        // @ 引用候选可能还没加载（用户手打 @名字、没弹过候选面板）——先补齐再解析 mentions。
+        aiLoadMentionData().then(function () {
+            aiSendNow(replyEl, sessionId, message, attachments);
+        });
+    });
+}
+
+/** 一轮推理的实际发起（会话就绪、@ 引用候选已加载）：落用户气泡 → POST 流式接口。 */
+function aiSendNow(replyEl, sessionId, message, attachments) {
         aiBusy = true;
         aiSetSendBusy(true);
         aiHeroStick = true;
@@ -1382,6 +1400,7 @@ function sendAiMessage(text) {
             signal: aiAbort ? aiAbort.signal : undefined,
             body: JSON.stringify({ sessionId: sessionId, streamId: aiStream.streamId,
                 message: message, skillId: aiSkillId || null,
+                mentions: aiCollectMentions(message),
                 attachments: attachments.map(aiAttachmentPayload) })
         }).then(function (resp) {
             if (!resp.ok) {
@@ -1422,7 +1441,6 @@ function sendAiMessage(text) {
             aiSetSendBusy(false);
             aiRenderError(replyEl, err && err.message ? err.message : String(err));
         });
-    });
 }
 
 /** 切换发送键形态：空闲 = 圆形小飞机；推理中 = 红色方框（停止）。
@@ -1747,9 +1765,252 @@ function bindAiCodeCopy() {
     });
 }
 
+// ---------------- AI 输入框 @ 引用（catalog / 函数） ----------------
+//
+// 交互对齐 IDE 的 @ mention：光标前出现「@ + 词」即弹出候选面板，方向键选择、Enter/点击插入
+// @名字。插入的 token 留在正文里随本轮提问落库；发送时把候选的说明（函数签名 / catalog 的
+// schema 列表）作为 mentions 一并提交，服务端拼成「@ 引用」上下文块 —— 模型不必再全量搜索元数据。
+
+/** 惰性加载候选：catalog 列表 + 当前用户可见的函数目录（一次拉齐；失败则候选为空）。 */
+function aiLoadMentionData() {
+    if (aiMentionData) return Promise.resolve(aiMentionData);
+    if (aiMentionLoading) return aiMentionLoading;
+    aiMentionLoading = Promise.all([
+        httpGet('/api/metadata/catalogs').catch(function () { return null; }),
+        httpGet('/api/functions').catch(function () { return null; })
+    ]).then(function (r) {
+        var cats = ((r[0] && r[0].catalogs) || []).map(function (c) {
+            return { type: 'catalog', name: c, group: 'Catalog 目录', hint: '数据源目录' };
+        });
+        var fns = ((r[1] && r[1].functions) || []).map(function (f) {
+            var kind = f.kind === 'aggregate' ? '聚合函数'
+                    : f.kind === 'window' ? '窗口函数'
+                    : f.kind === 'scalar' ? '标量函数'
+                    : f.source === 'custom' ? '自定义函数' : '函数';
+            return { type: 'function', name: f.name, group: '函数',
+                hint: kind + (f.detail ? ' · ' + f.detail : '') };
+        });
+        aiMentionData = { catalogs: cats, functions: fns };
+        aiMentionLoading = null;
+        return aiMentionData;
+    }, function () {
+        aiMentionLoading = null;
+        aiMentionData = { catalogs: [], functions: [] };
+        return aiMentionData;
+    });
+    return aiMentionLoading;
+}
+
+/** 光标前是否正处于一个 @ 词中；是则返回 {start, query}（start = '@' 的下标）。 */
+function aiMentionAt(text, caret) {
+    var before = (text || '').slice(0, caret);
+    var m = /(^|[\s(（【，,、；;：:])@([^\s@]*)$/.exec(before);
+    if (!m) return null;
+    return { start: caret - m[2].length - 1, query: m[2] };
+}
+
+/** 输入 / 光标移动后刷新候选面板（候选数据未就绪则等它加载完）。 */
+function aiMentionUpdate() {
+    var input = document.getElementById('ai-input');
+    if (!input || aiBusy) { aiMentionClose(); return; }
+    var hit = aiMentionAt(input.value, input.selectionStart);
+    if (!hit) { aiMentionClose(); return; }
+    aiLoadMentionData().then(function (data) {
+        // 加载期间文本 / 光标可能已变：按最新状态重算，避免按旧位置插入。
+        var cur = document.getElementById('ai-input');
+        if (!cur) { aiMentionClose(); return; }
+        var now = aiMentionAt(cur.value, cur.selectionStart);
+        if (!now) { aiMentionClose(); return; }
+        var q = now.query.toLowerCase();
+        var pick = function (list) {
+            var hits = list.filter(function (it) {
+                return !q || it.name.toLowerCase().indexOf(q) >= 0
+                        || (it.hint || '').toLowerCase().indexOf(q) >= 0;
+            });
+            // 前缀命中排前面（@su → sum / sum_if 先于其它含 sum 的名字）。
+            hits.sort(function (a, b) {
+                var ap = q && a.name.toLowerCase().indexOf(q) === 0 ? 0 : 1;
+                var bp = q && b.name.toLowerCase().indexOf(q) === 0 ? 0 : 1;
+                return ap !== bp ? ap - bp : a.name.localeCompare(b.name);
+            });
+            return hits;
+        };
+        var items = pick(data.catalogs).slice(0, 8).concat(pick(data.functions).slice(0, 14));
+        aiMentionState = { start: now.start, query: now.query, items: items, index: 0 };
+        aiMentionRender();
+    });
+}
+
+/** 重绘候选面板（分组：Catalog / 函数）。全部用 textContent 组装，避免元数据里的名字被当 HTML。 */
+function aiMentionRender() {
+    var pop = document.getElementById('ai-mention-pop');
+    if (!pop) return;
+    var st = aiMentionState;
+    pop.textContent = '';
+    if (!st) { pop.hidden = true; return; }
+    if (!st.items.length) {
+        var empty = document.createElement('div');
+        empty.className = 'ai-mention-empty';
+        empty.textContent = '没有匹配的 catalog / 函数';
+        pop.appendChild(empty);
+        pop.hidden = false;
+        return;
+    }
+    var lastGroup = '';
+    st.items.forEach(function (it, idx) {
+        if (it.group !== lastGroup) {
+            lastGroup = it.group;
+            var g = document.createElement('div');
+            g.className = 'ai-mention-group';
+            g.textContent = it.group;
+            pop.appendChild(g);
+        }
+        var row = document.createElement('div');
+        row.className = 'ai-mention-item' + (idx === st.index ? ' active' : '');
+        row.setAttribute('role', 'option');
+        var name = document.createElement('span');
+        name.className = 'ai-mention-name';
+        name.textContent = '@' + it.name;
+        var hint = document.createElement('span');
+        hint.className = 'ai-mention-hint';
+        hint.textContent = it.hint || '';
+        row.appendChild(name);
+        row.appendChild(hint);
+        // mousedown 而非 click：抢在输入框 blur 之前完成插入。
+        row.addEventListener('mousedown', function (e) { e.preventDefault(); aiMentionPick(idx); });
+        row.addEventListener('mouseenter', function () {
+            if (!aiMentionState) return;
+            aiMentionState.index = idx;
+            aiMentionHighlight();
+        });
+        pop.appendChild(row);
+    });
+    pop.hidden = false;
+    aiMentionHighlight();
+}
+
+/** 只更新高亮行（不重建 DOM），并把它滚进可视区。 */
+function aiMentionHighlight() {
+    var pop = document.getElementById('ai-mention-pop');
+    var st = aiMentionState;
+    if (!pop || !st) return;
+    var rows = pop.querySelectorAll('.ai-mention-item');
+    for (var i = 0; i < rows.length; i++) {
+        rows[i].classList.toggle('active', i === st.index);
+    }
+    var active = rows[st.index];
+    if (active && active.scrollIntoView) active.scrollIntoView({ block: 'nearest' });
+}
+
+/** 上下移动选中项（循环）。 */
+function aiMentionMove(delta) {
+    var st = aiMentionState;
+    if (!st || !st.items.length) return;
+    st.index = (st.index + delta + st.items.length) % st.items.length;
+    aiMentionHighlight();
+}
+
+/** 选中一项：把「@当前词」替换为「@名字 」，光标落在其后。 */
+function aiMentionPick(idx) {
+    var st = aiMentionState;
+    var input = document.getElementById('ai-input');
+    if (!st || !input) { aiMentionClose(); return; }
+    var item = st.items[idx == null ? st.index : idx];
+    if (!item) { aiMentionClose(); return; }
+    var caret = input.selectionStart;
+    var token = '@' + item.name;
+    var before = input.value.slice(0, st.start);
+    var after = input.value.slice(caret);
+    input.value = before + token + ' ' + after;
+    var pos = (before + token + ' ').length;
+    input.setSelectionRange(pos, pos);
+    input.focus();
+    aiMentionClose();
+    if (aiInputGrow) aiInputGrow();
+    if (item.type === 'catalog') aiMentionLoadCatalogSchemas(item.name);
+}
+
+/** 关闭候选面板。 */
+function aiMentionClose() {
+    aiMentionState = null;
+    var pop = document.getElementById('ai-mention-pop');
+    if (pop) { pop.hidden = true; pop.textContent = ''; }
+}
+
+/** 选中 catalog 后补拉 schema 列表（一次轻量请求），作为该引用的检索范围说明。 */
+function aiMentionLoadCatalogSchemas(name) {
+    var key = 'catalog:' + name;
+    if (aiMentionExtra[key]) return;
+    httpGet('/api/metadata/catalogs/' + encodeURIComponent(name) + '/schemas')
+        .then(function (d) {
+            var schemas = (d && d.schemas) || [];
+            if (schemas.length) {
+                aiMentionExtra[key] = '包含 schema：' + schemas.slice(0, 30).join(', ')
+                        + (schemas.length > 30 ? ' 等 ' + schemas.length + ' 个' : '');
+            }
+        })
+        .catch(function () { /* 取不到 schema 不影响引用本身 */ });
+}
+
+/** 从正文提取 @ 引用（只认候选目录里存在的名字），返回发送给服务端的 mentions 数组。 */
+function aiCollectMentions(text) {
+    var out = [];
+    if (!text || !aiMentionData) return out;
+    var seen = {};
+    var re = /@([A-Za-z0-9_.\-\u4e00-\u9fa5]+)/g;
+    var m;
+    while ((m = re.exec(text)) !== null) {
+        var it = aiFindMentionCandidate(m[1]);
+        if (!it) continue;
+        var key = it.type + ':' + it.name;
+        if (seen[key]) continue;
+        seen[key] = true;
+        out.push({ type: it.type, name: it.name,
+            detail: aiMentionExtra[key] || it.hint || '' });
+    }
+    return out;
+}
+
+/** 按名字（大小写不敏感）在候选目录里查（catalog 优先，其次函数）。 */
+function aiFindMentionCandidate(name) {
+    var d = aiMentionData;
+    if (!d || !name) return null;
+    var lower = name.toLowerCase();
+    var i;
+    for (i = 0; i < d.catalogs.length; i++) {
+        if (d.catalogs[i].name.toLowerCase() === lower) return d.catalogs[i];
+    }
+    for (i = 0; i < d.functions.length; i++) {
+        if (d.functions[i].name.toLowerCase() === lower) return d.functions[i];
+    }
+    return null;
+}
+
+/** 绑定 @ 引用：输入 / 光标移动刷新候选；点空白处关闭。 */
+function bindAiMentions() {
+    var input = document.getElementById('ai-input');
+    if (!input) return;
+    input.addEventListener('input', function () { aiMentionUpdate(); });
+    input.addEventListener('keyup', function (e) {
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowRight'
+                || e.key === 'Home' || e.key === 'End') {
+            aiMentionUpdate();
+        }
+    });
+    input.addEventListener('blur', function () {
+        // 延迟关闭：让候选项的 mousedown 先完成插入。
+        setTimeout(aiMentionClose, 120);
+    });
+    document.addEventListener('mousedown', function (e) {
+        var pop = document.getElementById('ai-mention-pop');
+        if (pop && !pop.contains(e.target) && e.target !== input) aiMentionClose();
+    });
+}
+
 /** 绑定 AI 页交互：发送按钮 + Enter 发送 / Ctrl+Enter 换行 + 新对话 + 对话区滚动吸附。 */
 function bindAiChat() {
     bindAiCodeCopy();
+    bindAiMentions();
     var sendBtn = document.getElementById('ai-send');
     var input = document.getElementById('ai-input');
     if (sendBtn) {
@@ -1766,6 +2027,19 @@ function bindAiChat() {
     }
     if (input) {
         input.addEventListener('keydown', function (e) {
+            // @ 候选面板打开时接管方向键 / Esc / Enter：Enter 选中候选，不发送消息。
+            if (aiMentionState) {
+                if (e.key === 'ArrowDown') { e.preventDefault(); aiMentionMove(1); return; }
+                if (e.key === 'ArrowUp') { e.preventDefault(); aiMentionMove(-1); return; }
+                if (e.key === 'Escape') { e.preventDefault(); aiMentionClose(); return; }
+                if (aiMentionState.items.length
+                        && (e.key === 'Enter' || e.key === 'Tab')
+                        && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey && !e.isComposing) {
+                    e.preventDefault();
+                    aiMentionPick(aiMentionState.index);
+                    return;
+                }
+            }
             // Enter 直接发送；Ctrl/Shift/Alt/⌘ + Enter 一律留给默认行为（换行）。
             // isComposing：中文输入法组字中的回车是「选词确认」，绝不能当发送。
             if (e.key === 'Enter' && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey && !e.isComposing) {
@@ -2087,6 +2361,7 @@ function newAiChat() {
     aiStoreSession(null);
     aiStream = null;
     aiPendingConfirm = null;
+    aiMentionClose();
     aiClearAttachments();
     aiDisposeCharts();
     var replyEl = document.getElementById('ai-reply');

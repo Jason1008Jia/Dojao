@@ -568,7 +568,7 @@ public class DistributedJoinOperator extends AbstractDistributedOperator
                 yield out;
             }
             case FragmentSpec.AggregateStep a -> {
-                // 同 key 聚合输出 = 分组键（join 列）+ 各聚合别名（count→BIGINT、其余→DOUBLE）
+                // 同 key 聚合输出 = 分组键（join 列）+ 各聚合别名（MIN/MAX 与输入同型、SUM(整型)→BIGINT、count→BIGINT、其余→DOUBLE）
                 List<Field> out = new ArrayList<>(fieldsByNames(wire, a.keyColumns()));
                 for (FragmentSpec.AggregationDto dto : a.aggregations()) {
                     out.add(dtoAggregationField(dto.outputColumn(), dto.aggregateName(),

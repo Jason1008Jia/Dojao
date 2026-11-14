@@ -140,7 +140,7 @@ public final class PartialAggregationMergeOperator extends AbstractMeasurableOpe
         Object partial = switch (name) {
             // COUNT partial = 该分区计数（BIGINT），合并即相加
             case "count" -> raw == null ? null : new long[]{((Number) raw).longValue()};
-            // SUM partial = 该分区小计（DOUBLE / DECIMAL），用函数自身的精确加法合并
+            // SUM partial = 该分区小计（BIGINT / DOUBLE / DECIMAL），用函数自身的精确加法合并
             case "sum" -> raw == null ? null : new Object[]{raw};
             // MIN/MAX partial = 该分区极值（与输入同型），规范化后按函数口径比较
             case "min", "max" -> {

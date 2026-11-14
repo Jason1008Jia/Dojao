@@ -474,26 +474,21 @@ public final class StageScheduler {
         return out.isEmpty() ? null : out;
     }
 
-    /** 单个窗口函数结果列的 Arrow 声明类型 —— 与 {@code WindowFunctionOperator.buildOutputSchema} 同源。 */
+    /**
+     * 单个窗口函数结果列的 Arrow 声明类型 —— 与 {@code WindowFunctionOperator.buildOutputSchema} 同源：
+     * MIN/MAX 与输入同型、SUM(整型) → BIGINT、SUM/AVG(DECIMAL) → 放宽 DECIMAL。
+     */
     private static Field windowResultField(WindowFunctionSpec spec, List<Field> inputFields) {
-        return switch (spec.type()) {
-            case ROW_NUMBER, RANK, DENSE_RANK, COUNT ->
-                    new Field(spec.outputColumn(), FieldType.nullable(new ArrowType.Int(64, true)), null);
-            case SUM, AVG, MIN, MAX, AGGREGATE ->
-                    new Field(spec.outputColumn(), FieldType.nullable(
-                            new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)), null);
-            case LAG, LEAD -> {
-                Field input = null;
-                for (Field f : inputFields) {
-                    if (f.getName().equalsIgnoreCase(spec.inputColumn())) {
-                        input = f;
-                        break;
-                    }
+        Field input = null;
+        if (spec.inputColumn() != null) {
+            for (Field f : inputFields) {
+                if (f.getName().equalsIgnoreCase(spec.inputColumn())) {
+                    input = f;
+                    break;
                 }
-                yield new Field(spec.outputColumn(),
-                        FieldType.nullable(input != null ? input.getType() : new ArrowType.Utf8()), null);
             }
-        };
+        }
+        return new Field(spec.outputColumn(), FieldType.nullable(spec.outputArrowType(input)), null);
     }
 
     /**

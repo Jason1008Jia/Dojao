@@ -13,6 +13,7 @@ import com.dojao.ui.ai.AiAgentService;
 import com.dojao.ui.ai.AiConfigStore;
 import com.dojao.ui.ai.AiExportFormats;
 import com.dojao.ui.ai.AiFileStore;
+import com.dojao.ui.ai.AiMentions;
 import com.dojao.ui.ai.AiSessionStore;
 import com.dojao.ui.ai.FileParser;
 import com.dojao.ui.ai.AiTurns;
@@ -1418,7 +1419,7 @@ public final class DojaoUiApp {
      * {@code {"type":"file","file":{id,name,format,size,url}}}（可下载文件）/
      * 终态 {@code {"type":"done"}} 或 {@code {"type":"error","message":..}}。
      *
-     * <p>请求体 {@code {"sessionId":..,"streamId":..,"message":..,"attachments":[…]}}：会话历史由服务端
+     * <p>请求体 {@code {"sessionId":..,"streamId":..,"message":..,"mentions":[…],"attachments":[…]}}：会话历史由服务端
      * 按 sessionId 读出（取最近 {@link #HISTORY_TURNS} 轮）拼进模型上下文；{@code attachments} 为前端经
      * {@code /api/ai/files/parse} 解析好的参考文件（形状见 {@link FileParser#toJson}），会以统一的
      * 「参考文件」块拼进本轮提问并随轮次落库（后续追问仍可引用）。本轮完成后服务端把该轮问答落库。</p>
@@ -1439,6 +1440,7 @@ public final class DojaoUiApp {
         String streamId;
         String skillId;
         JsonNode attachmentsNode;
+        JsonNode mentionsNode;
         try {
             Map body = json.readValue(ctx.body(), Map.class);
             message = body == null ? null : str(body.get("message"));
@@ -1446,6 +1448,7 @@ public final class DojaoUiApp {
             streamId = body == null ? null : str(body.get("streamId"));
             skillId = body == null ? null : str(body.get("skillId"));
             attachmentsNode = body == null ? null : json.valueToTree(body.get("attachments"));
+            mentionsNode = body == null ? null : json.valueToTree(body.get("mentions"));
         } catch (Exception e) {
             ctx.status(400).json(Map.of("error", "bad request: " + e.getMessage()));
             return;
@@ -1469,9 +1472,14 @@ public final class DojaoUiApp {
         if (streamId == null || streamId.isBlank()) {
             streamId = UUID.randomUUID().toString();
         }
+        // @ 引用（catalog / 函数）：转成检索范围说明拼进本轮提问；随轮次落库，追问仍可见。
+        final List<AiMentions.Mention> mentions = AiMentions.fromJson(mentionsNode);
+        final String mentionBlock = AiMentions.promptBlock(mentions);
+        final JsonNode mentionsForStore = mentions.isEmpty() ? null : AiMentions.toJson(mentions);
         // 附件文本以统一的「参考文件」块拼进本轮提问（历史轮次走 buildHistory 的同一格式）。
         final String rawMessage = message == null ? "" : message;
         final String modelMessage = (rawMessage.isBlank() ? "请根据下面的参考文件回答问题。" : rawMessage)
+                + mentionBlock
                 + FileParser.promptBlock(attachments);
         final JsonNode attachmentsForStore = attachments.isEmpty() ? null : FileParser.toJson(attachments);
 
@@ -1497,7 +1505,8 @@ public final class DojaoUiApp {
 
         // ★ 写前落库：先把本次「用户提问」作为一条 pending 轮次落进会话。这样即便用户中途刷新页面 /
         //   断线，提问也不会丢；答案生成结束后再由 finalizeTurn 回填到同一条轮次。
-        final String turnId = beginTurn(owner, sessionId, rawMessage, skillName, attachmentsForStore);
+        final String turnId = beginTurn(owner, sessionId, rawMessage, skillName, attachmentsForStore,
+                mentionsForStore);
 
         // 该流对应的 DDL 确认队列：execute_ddl 工具阻塞等它，POST /api/ai/confirm 投递用户决策。
         final String sid = streamId;
@@ -1692,9 +1701,11 @@ public final class DojaoUiApp {
                 String u = t.path("user").asText("");
                 String a = t.path("assistant").asText("");
                 String block = attachmentBlocks.getOrDefault(i, "");
+                // @ 引用（catalog / 函数）也随原轮次喂回：追问时模型仍知道用户圈定的检索范围。
+                String mentions = AiMentions.promptBlock(AiMentions.fromJson(t.path("mentions")));
                 if (!u.isBlank() || !block.isEmpty()) {
                     // 附件随原轮次的提问一起喂回模型：追问「这份文件里…」时模型才不会「忘记」内容。
-                    out.add(UserMessage.userMessage(u + block));
+                    out.add(UserMessage.userMessage(u + mentions + block));
                 }
                 // 生成中的轮次可能已写入「半成品回答」，不能当完整答案喂回模型。
                 if (!a.isBlank() && !t.path("pending").asBoolean(false)) {
@@ -1747,10 +1758,11 @@ public final class DojaoUiApp {
      * {@link #finalizeTurn} 按 {@code turnId} 回填到同一条轮次。首轮据提问生成标题。
      *
      * @param attachments 本轮附件的 JSON 数组（{@code [{name,format,chars,truncated,text}]}），可为 null
+     * @param mentions    本轮 @ 引用的 JSON 数组（{@code [{type,name,detail}]}），可为 null
      * @return 本次轮次的 {@code turnId}（回填时据此定位）；会话不存在等异常路径返回 {@code null}
      */
     private String beginTurn(String owner, String sessionId, String userMsg, String skillName,
-                             JsonNode attachments) {
+                             JsonNode attachments, JsonNode mentions) {
         String turnId = UUID.randomUUID().toString();
         try {
             AiSessionStore.SessionFull cur = aiSessionStore.get(owner, sessionId);
@@ -1758,7 +1770,8 @@ public final class DojaoUiApp {
                 return null;
             }
             boolean firstTurn = AiTurns.isEmpty(cur.turnsJson());
-            String turnsJson = AiTurns.appendPending(cur.turnsJson(), turnId, userMsg, skillName, attachments);
+            String turnsJson = AiTurns.appendPending(cur.turnsJson(), turnId, userMsg, skillName,
+                    attachments, mentions);
 
             String title = cur.title();
             if (firstTurn || title == null || title.isBlank() || AiSessionStore.DEFAULT_TITLE.equals(title)) {

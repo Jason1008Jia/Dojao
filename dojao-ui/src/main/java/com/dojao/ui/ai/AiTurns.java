@@ -62,6 +62,20 @@ public final class AiTurns {
      */
     public static String appendPending(String turnsJson, String turnId, String userMsg, String skillName,
                                       JsonNode attachments) {
+        return appendPending(turnsJson, turnId, userMsg, skillName, attachments, null);
+    }
+
+    /**
+     * 追加一条 pending 轮次，并记录本轮携带的<b>附件</b>与<b>@ 引用</b>。
+     *
+     * <p>随轮次落库的原因同附件：刷新后仍能看到「引用了哪些对象」，且后续追问时
+     * {@code buildHistory} 能把 @ 引用说明一起喂回模型（不然模型会「忘记」检索范围）。</p>
+     *
+     * @param attachments 附件 JSON 数组（{@code [{name,format,chars,truncated,text}]}），可为 null
+     * @param mentions    @ 引用数组（{@code [{type,name,detail}]}，见 {@link AiMentions}），可为 null
+     */
+    public static String appendPending(String turnsJson, String turnId, String userMsg, String skillName,
+                                      JsonNode attachments, JsonNode mentions) {
         ArrayNode turns = parse(turnsJson);
         ObjectNode turn = JSON.createObjectNode();
         turn.put("turnId", turnId);
@@ -76,6 +90,9 @@ public final class AiTurns {
         turn.putArray("files");
         if (attachments != null && attachments.isArray() && !attachments.isEmpty()) {
             turn.set("attachments", attachments);
+        }
+        if (mentions != null && mentions.isArray() && !mentions.isEmpty()) {
+            turn.set("mentions", mentions);
         }
         turns.add(turn);
         return write(turns);

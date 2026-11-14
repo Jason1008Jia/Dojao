@@ -1563,6 +1563,35 @@ textarea.sql-editor::-moz-selection { background: rgba(37, 99, 235, 0.26); color
 }
 /* 聚焦只把已有那圈边框染成主题色，不叠加 3px 光环（内侧曲线，用户要求去掉） */
 .ai-input-wrap:focus-within { border-color: var(--accent); }
+/* @ 引用候选弹层：定位基准 = 输入框外框（绝对定位不占 flex 行）。 */
+.ai-input-wrap { position: relative; }
+.ai-mention-pop {
+  position: absolute; left: 0; right: 0; bottom: calc(100% + 6px);
+  z-index: 30; max-height: 340px; overflow-y: auto;
+  padding: 6px;
+  background: var(--bg2); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  box-shadow: 0 12px 34px rgba(15, 23, 42, 0.18);
+}
+.ai-mention-pop[hidden] { display: none; }
+.ai-mention-group {
+  padding: 6px 8px 4px; font-size: 11.5px; font-weight: 600;
+  color: var(--text-faint); letter-spacing: .02em;
+}
+.ai-mention-item {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 6px 8px; border-radius: 6px; cursor: pointer;
+}
+.ai-mention-item:hover { background: rgba(37, 99, 235, 0.08); }
+.ai-mention-item.active { background: rgba(37, 99, 235, 0.14); }
+.ai-mention-name {
+  flex-shrink: 0; font-size: 13.5px; font-weight: 600; color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.ai-mention-hint {
+  min-width: 0; font-size: 12px; color: var(--text-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ai-mention-empty { padding: 10px 8px; font-size: 12.5px; color: var(--text-faint); }
 
 /* 附件（参考文件）：回形针按钮在输入框左侧；已选附件在输入框上方一条可换行的胶囊条。
    垂直位置对齐「首行文字中线」而不是输入框底部 —— 输入框初始约两行高（rows=2 / 自动撑高），

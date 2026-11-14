@@ -623,8 +623,9 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
     /**
      * Phase 2 输出列：分组键 + 各聚合结果列。
      *
-     * <p>MIN/MAX 跟随输入类型（时间戳 / 日期 / 字符串 / 布尔 / Decimal）；SUM/AVG 的 DECIMAL 状态列
-     * 是 Decimal —— 都以溢写文件对应状态列的真实类型为准，否则输出会退化成 DOUBLE 丢精度。</p>
+     * <p>MIN/MAX 与输入严格同型（数值保持 INT/FLOAT 原宽度；时间戳 / 日期 / 字符串 / 布尔 / Decimal）；
+     * SUM/AVG 的 DECIMAL 状态列是 Decimal —— 都以溢写文件对应状态列的真实类型为准，
+     * 否则输出会退化成 DOUBLE 丢精度 / 给整数带上小数点。</p>
      *
      * @param spillFields   溢写状态行的字段布局（键列 + 状态列），可为 {@code null}（无溢写文件）
      * @param stateColCount 每个聚合在标量溢写流里占的列数（count_distinct 为 0）

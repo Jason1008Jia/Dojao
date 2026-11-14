@@ -1068,9 +1068,8 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
             if (in == DojaoType.DECIMAL) return DojaoType.DECIMAL;
             return (integral || floating) ? DojaoType.DOUBLE : null;
         }
-        // min / max：数值（含 decimal）→ DOUBLE（decimal 保 DECIMAL），其余同参数类型
-        if (in == DojaoType.DECIMAL) return DojaoType.DECIMAL;
-        if (integral || floating) return DojaoType.DOUBLE;
+        // min / max：与参数严格同型（数值保持原类型，不再统一成 DOUBLE —— int 列不该带小数点）
+        if (integral || floating || in == DojaoType.DECIMAL) return in;
         return switch (in) {
             case STRING, DATE, DATETIME, TIMESTAMP, TIMESTAMP_TZ, BOOLEAN -> in;
             default -> null;

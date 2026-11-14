@@ -2982,8 +2982,8 @@ public final class Planner {
      * <p>★这里必须与 {@link AggregationSpec#outputArrowType(org.apache.arrow.vector.types.pojo.Field)}
      * / {@code AggregationHashTable.resultTypeFor} 同口径 —— 声明列用于空分区输出 schema，类型错了
      * 会在 `assemble` 里把实际 BIGINT 数据按 DOUBLE 解释（{@code sum(int)} 变成 {@code 1.5E-323}）。
-     * 具体：{@code sum(整型)} → BIGINT、{@code sum/avg(DECIMAL)} → 放宽 DECIMAL、{@code min/max(整型/浮点)}
-     * → DOUBLE、{@code min/max(其他)} → 入参类型。</p>
+     * 具体：{@code sum(整型)} → BIGINT、{@code sum/avg(DECIMAL)} → 放宽 DECIMAL、
+     * {@code min/max} → <b>入参类型原样</b>（数值保持 INT/FLOAT 原宽度，不再漂成 DOUBLE）。</p>
      *
      * <p>条件聚合按改写后的普通聚合定类型：{@code count_if} → BIGINT、{@code sum_if} → 跟随 value
      * 参数（第一个逗号参数）类型、{@code min_if/max_if} → value 参数类型。</p>
@@ -3018,13 +3018,9 @@ public final class Planner {
             // AVG：DECIMAL → 放宽 DECIMAL；其余 → DOUBLE
             case "avg" -> new Field(col, FieldType.nullable(
                     argType instanceof ArrowType.Decimal d ? AggregationSpec.widenDecimal(d) : fp), null);
-            // MIN/MAX：数值（整型/浮点）→ DOUBLE；其他类型与输入同型
-            case "min", "max", "min_if", "max_if" -> {
-                if (argType == null) yield null;
-                ArrowType t = argType instanceof ArrowType.Int || argType instanceof ArrowType.FloatingPoint
-                        ? fp : argType;
-                yield new Field(col, FieldType.nullable(t), null);
-            }
+            // MIN/MAX：与输入严格同型（数值保持 INT/FLOAT 原宽度，不再漂成 DOUBLE）
+            case "min", "max", "min_if", "max_if" ->
+                    argType == null ? null : new Field(col, FieldType.nullable(argType), null);
             default -> null;
         };
     }

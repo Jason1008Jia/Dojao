@@ -61,9 +61,10 @@ public record AggregationSpec(
     /**
      * 按<b>输入列类型</b>推导输出类型：
      * <ul>
-     *   <li>MIN/MAX 与输入同型（时间戳 / 日期 / 字符串 / 布尔 / Decimal / 二进制）；
-     *       数值列（Int / FloatingPoint）保持历史口径 DOUBLE；</li>
-     *   <li><b>SUM(整型) → BIGINT</b>（{@link #outputArrowType()} 静态口径仍是 DOUBLE —— 输入未知时
+     *   <li><b>MIN/MAX 与输入严格同型</b>（时间戳 / 日期 / 字符串 / 布尔 / Decimal / 二进制，
+     *       以及数值：{@code max(int_col)} → INT、{@code min(float_col)} → FLOAT —— 不再漂成 DOUBLE）；</li>
+     *   <li><b>SUM(整型) → BIGINT</b>（整数累加，结果仍是整数；INT32 相加可能溢出 32 位，按 SQL 惯例
+     *       扩到 64 位）（{@link #outputArrowType()} 静态口径仍是 DOUBLE —— 输入未知时
      *       无法判断，只能保守）；SUM(DECIMAL)/AVG(DECIMAL) → 同族 DECIMAL（精度放宽）；</li>
      *   <li>其余聚合走 {@link #outputArrowType()}。输入字段未知（null）时回退静态口径。</li>
      * </ul>
@@ -75,9 +76,7 @@ public record AggregationSpec(
             String name = aggregate.functionName();
             ArrowType t = inputField.getType();
             if ("min".equals(name) || "max".equals(name)) {
-                if (!(t instanceof ArrowType.Int) && !(t instanceof ArrowType.FloatingPoint)) {
-                    return t;
-                }
+                return t;
             }
             // ★SUM/AVG(DECIMAL) 必须输出 DECIMAL（不能退回 DOUBLE），否则累加结果带浮点尾差。
             //   精度按「整数位 + 10」放宽（MySQL 口径），scale 保持不变 ⇒ 精确到分。

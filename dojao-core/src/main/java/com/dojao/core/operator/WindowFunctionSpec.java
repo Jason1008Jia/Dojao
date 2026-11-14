@@ -1,5 +1,9 @@
 package com.dojao.core.operator;
 
+import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+
 /**
  * 窗口函数规格 —— 描述一个窗口函数表达式：类型 + 输入列 + 输出列名 + 偏移量。
  *
@@ -44,6 +48,34 @@ public record WindowFunctionSpec(
     public WindowFunctionSpec withFrame(WindowFrame f) {
         return new WindowFunctionSpec(type, inputColumn, outputColumn, offset, defaultValue, functionName, f);
     }
+
+    /**
+     * 窗口结果列的 Arrow 类型 —— 按<b>输入列类型</b>推导，与单机 / 分布式聚合口径一致：
+     * <ul>
+     *   <li>MIN/MAX → 与输入严格同型（{@code max(int_col)} → INT，不再漂成 DOUBLE）；</li>
+     *   <li>SUM(整型) → BIGINT、SUM/AVG(DECIMAL) → 放宽精度的 DECIMAL，其余 SUM/AVG → DOUBLE；</li>
+     *   <li>COUNT / ROW_NUMBER / RANK / DENSE_RANK → BIGINT；LAG/LEAD → 输入列类型；自定义聚合一 → DOUBLE。</li>
+     * </ul>
+     * 输入列未知（{@code null}）时走保守口径（DOUBLE，LAG/LEAD 用 VARCHAR）。
+     */
+    public ArrowType outputArrowType(Field inputField) {
+        ArrowType t = inputField == null ? null : inputField.getType();
+        return switch (type) {
+            case ROW_NUMBER, RANK, DENSE_RANK, COUNT -> new ArrowType.Int(64, true);
+            case SUM -> {
+                if (t instanceof ArrowType.Int) yield new ArrowType.Int(64, true);
+                if (t instanceof ArrowType.Decimal d) yield AggregationSpec.widenDecimal(d);
+                yield DOUBLE;
+            }
+            case AVG -> t instanceof ArrowType.Decimal d ? AggregationSpec.widenDecimal(d) : DOUBLE;
+            case MIN, MAX -> t != null ? t : DOUBLE;
+            case LAG, LEAD -> t != null ? t : ArrowType.Utf8.INSTANCE;
+            case AGGREGATE -> DOUBLE;
+        };
+    }
+
+    private static final ArrowType DOUBLE =
+            new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE);
 
     // ==================== 工厂方法 ====================
 
