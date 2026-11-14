@@ -5,6 +5,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Java](https://img.shields.io/badge/Java-21-red.svg)](https://jdk.java.net/21/)
 [![Python](https://img.shields.io/badge/Python-3.11+-green.svg)](https://www.python.org/)
+[![Arrow Flight](https://img.shields.io/badge/Arrow%20Flight-15.0.0-orange.svg)](https://arrow.apache.org/docs/format/Flight.html)
 
 ---
 
