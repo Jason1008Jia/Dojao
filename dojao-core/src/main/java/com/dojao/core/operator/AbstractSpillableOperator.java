@@ -93,7 +93,17 @@ public abstract class AbstractSpillableOperator<S extends Slot>
 
     protected Operator upstream;
     protected final long memoryLimit;
-    protected final long slotBytesThreshold;
+    /**
+     * 单分区单槽溢写阈值（见 {@link #computeSlotBytesThreshold()}）。<b>可变</b>：FragmentExecutor
+     * 在 {@link #doOpen()} 前按本片段真正会收到数据的 shuffle 桶数 {@link #setBudgetPartitions(int)} 重算 ——
+     * 只持有 1 个桶的片段不该按布局分区数（如 24）摊薄预算。
+     */
+    protected volatile long slotBytesThreshold;
+    /**
+     * 摊薄阈值所用的桶数（默认 = 布局分区数 {@link #numPartitions}）。真实分发时由调度层按
+     * {@code ExchangeInStep.owned()} 设为该片段实际拥有的桶数，最低 1。
+     */
+    protected volatile int budgetPartitions;
     protected final BufferAllocator allocator;
     protected final int numPartitions;
 
@@ -172,11 +182,18 @@ public abstract class AbstractSpillableOperator<S extends Slot>
     protected final Set<Path> spillDirsUsed = ConcurrentHashMap.newKeySet();
 
     /**
-     * 溢写字节转发回调（可空）。包装算子（{@link SortMergeJoinOperator} 汇总两侧
-     * {@link JoinSortOperator}）据此把子算子的溢写量计入自己的 {@link OperatorStats} ——
-     * 否则监控注册的是包装算子，它的 {@code spilledBytes} 恒 0，而真正的溢写全在子算子里。
+     * 溢写统计转发回调（可空）。包装算子（{@link SortMergeJoinOperator} 汇总两侧
+     * {@link JoinSortOperator}）据此把子算子的溢写字节 / 文件数 / 触发次数计入自己的
+     * {@link OperatorStats} —— 否则监控注册的是包装算子，它的计数恒 0，而真正的溢写全在子算子里。
      */
-    private volatile LongConsumer spillBytesListener;
+    private volatile SpillStatsListener spillStatsListener;
+
+    /** 子算子 → 包装算子的溢写事件转发（默认方法保证只需实现关心的那一个）。 */
+    public interface SpillStatsListener {
+        void onSpillBytes(long bytes);
+        default void onSpillFile() {}
+        default void onSpillTrigger() {}
+    }
 
     /** 累积超内存预算时的溢写策略（默认 {@link #SPILL} 沿用旧行为）。 */
     public enum SpillPolicy {SPILL, WARN, ERROR}
@@ -192,12 +209,15 @@ public abstract class AbstractSpillableOperator<S extends Slot>
         super(operatorName, operatorType, stages);
         this.upstream = upstream;
         this.memoryLimit = memoryLimit;
-        // 单槽阈值 = 算子预算 × 溢写比例 ÷ 分区数：本算子同时持有 numPartitions 个分区，每个分区各 3 个槽
-        // —— 预算得<b>摊到各分区</b>，否则 P 个分区各按「整个算子预算」累积，总占用 = P × 3槽 × 阈值，
-        // 会先撞「按单分区派生的」分配器硬上限（query.direct.limit），此时任一单槽都还没到阈值 ⇒
-        // 触发的是 Arrow OOM 而非溢写（表现：row_number() over(partition by …) 直接把 Worker 撑挂）。
-        this.slotBytesThreshold =
-                (long) (memoryLimit * ResourceConfig.spillRatio() / Math.max(1, numPartitions));
+        // 单槽阈值 = 算子预算 × 溢写比例 ÷ 桶数（下限见 computeSlotBytesThreshold）：
+        // 本算子同时持有 numPartitions 个分区，每个分区各 3 个槽 —— 预算得<b>摊到各分区</b>，
+        // 否则 P 个分区各按「整个算子预算」累积，总占用 = P × 3槽 × 阈值，会先撞「按单分区派生的」
+        // 分配器硬上限（query.direct.limit），此时任一单槽都还没到阈值 ⇒ 触发的是 Arrow OOM 而非溢写
+        // （表现：row_number() over(partition by …) 直接把 Worker 撑挂）。
+        // 真实桶数在分发时由 setBudgetPartitions 修正（只拥有 1 个桶的片段按 1 摊薄）。
+        this.numPartitions = numPartitions;
+        this.budgetPartitions = Math.max(1, numPartitions);
+        this.slotBytesThreshold = computeSlotBytesThreshold();
         // 实例序号：溢写目录名要按实例唯一（同 JVM 内多个同类算子并发时，目录重名会互相覆盖/误删）。
         // 子分配器的 Arrow 名字由 NodeMemory 内部按序自增，无需外部保证唯一。
         long instanceSeq = INSTANCE_SEQUENCE.incrementAndGet();
@@ -206,7 +226,6 @@ public abstract class AbstractSpillableOperator<S extends Slot>
         // （查询失败）而非无限增长被内核 OOM-killer 杀进程。类别按算子类型归组（监控可见）。见 NodeMemory。
         this.allocator = NodeMemory.shared()
                 .newOperatorAllocator(getStats().getOperatorType(), ResourceConfig.queryDirectLimit());
-        this.numPartitions = numPartitions;
         @SuppressWarnings("unchecked")
         PartitionState<S>[] pa = (PartitionState<S>[]) new PartitionState[numPartitions];
         this.partitions = pa;
@@ -226,6 +245,58 @@ public abstract class AbstractSpillableOperator<S extends Slot>
 
     /** 更新上游算子引用（列裁剪优化使用，须在 {@link #doOpen()} 前调用）。 */
     public void setUpstream(Operator upstream) { this.upstream = upstream; }
+
+    /**
+     * 按本片段<b>实际拥有的 shuffle 桶数</b>重算单槽阈值（须在 {@link #doOpen()} 前调用）。
+     *
+     * <p>为什么需要：布局分区数（如 {@code query.master.parallelism = 24}）是全局分桶数，
+     * 而每个可溢写片段往往只分到其中一部分桶（{@code ExchangeInStep.owned()}）。旧实现按布局
+     * 分区数摊薄，只拥 1 个桶的片段也按 24 除 ⇒ 阈值被白白缩小 24 倍。这里按真实桶数摊薄，
+     * 只拥 1 个桶的片段拿到完整算子的 {@code memoryLimit × spillRatio}。</p>
+     *
+     * @param owned 实际拥有（会收到数据）的桶数；≤0 视为不修正
+     */
+    public void setBudgetPartitions(int owned) {
+        if (owned <= 0) return;
+        this.budgetPartitions = Math.min(owned, Math.max(1, numPartitions));
+        this.slotBytesThreshold = computeSlotBytesThreshold();
+    }
+
+    /** 当前单槽阈值（监控/日志可读）。 */
+    public long slotBytesThreshold() { return slotBytesThreshold; }
+
+    /**
+     * 单分区单槽溢写阈值：{@code memoryLimit × spillRatio ÷ 桶数}，再抬到
+     * {@code query.spill.minPartitionBytes} 下限（下限只抬高，不会压低已更大的 base）。
+     *
+     * <p>抬高下限时必须约束峰值。算子的设计峰值 = {@code 桶数 × 3槽 × 阈值}，硬上限是
+     * {@code query.direct.limit}（算子分配器上限，撞上即 Arrow OOM —— 此时任一槽都还没到阈值，
+     * 溢写根本不会触发）。两个封顶各管一件事：</p>
+     * <ul>
+     *   <li><b>峰值封顶</b>：严格边界是 {@code T ≤ direct.limit ÷ (3 × 桶数)}；实现再乘
+     *       {@code spillRatio}（与 base 同一安全系数）⇒ 峰值最多用掉硬上限的 80%。</li>
+     *   <li><b>单槽封顶</b>：一个槽的阈值不得超过算子可用预算 {@code memoryLimit × spillRatio}。
+     *       这一条与峰值无关，只防「单槽比整个算子还能用」的荒谬值。</li>
+     * </ul>
+     *
+     * <p>base 在设计上已满足峰值约束（推导默认配置保证 {@code 3 × memoryLimit × spillRatio ≤ direct.limit}），
+     * 所以最终峰值 ≤ {@code max(原设计峰值, 0.8 × direct.limit)}。若手工把 direct.limit 配得
+     * 比 {@code 2.4 × slot.memory} 还小，base 本身就会先撞 OOM，下限封顶无能为力。</p>
+     */
+    private long computeSlotBytesThreshold() {
+        int parts = Math.max(1, budgetPartitions);
+        double ratio = ResourceConfig.spillRatio();
+        long threshold = (long) (memoryLimit * ratio / parts);
+        long floor = ResourceConfig.spillMinPartitionBytes();
+        if (floor > 0) {
+            long cap = (long) (ResourceConfig.queryDirectLimit() * ratio
+                    / ((long) SLOT_COUNT * parts));
+            floor = Math.min(floor, cap);
+            floor = Math.min(floor, Math.max(1L, (long) (memoryLimit * ratio)));
+            threshold = Math.max(threshold, floor);
+        }
+        return Math.max(1L, threshold);
+    }
 
     // ==================== 归并进度（MergeProgress） ====================
 
@@ -325,6 +396,9 @@ public abstract class AbstractSpillableOperator<S extends Slot>
                 .append("，上限 ").append(SpillDirs.describeUsageLimit()).append("）")
                 .append(", spillBytes=").append(formatBytes(getStats().getSpilledBytes()))
                 .append(", spillFiles=").append(spillFileCount())
+                .append(", spillTriggers=").append(getStats().getSpillTriggers())
+                .append(", arrow=").append(formatBytes(allocator.getAllocatedMemory()))
+                .append('/').append(formatBytes(allocator.getLimit()))
                 .append(", 根因=").append(rootCauseSummary(t))
                 .append("。").append(failureHint(t));
         return sb.toString();
@@ -737,6 +811,7 @@ public abstract class AbstractSpillableOperator<S extends Slot>
                         + "无 LIMIT 的全量排序，建议加 LIMIT 或缩小数据量，或设 query.sort.topSpillPolicy=error "
                         + "直接拒绝%n", getClass().getSimpleName(), formatBytes(slotBytesThreshold));
             }
+            noteSpillTrigger();
             pa.submitSpill(spillExecutor, this, pid);
             pa.awaitIdleSlot();
             pa.checkSpillFailure();
@@ -832,12 +907,18 @@ public abstract class AbstractSpillableOperator<S extends Slot>
     protected record BatchWrite(int batchIndex, long bytes) { }
 
     /**
-     * 设置溢写字节转发回调（{@code null} = 清除）。
+     * 设置溢写字节转发回调（{@code null} = 清除）。仅转发字节；需要文件数 / 触发次数时用
+     * {@link #setSpillStatsListener(SpillStatsListener)}。
      *
      * @see #accountSpilledBytes(long)
      */
     public void setSpillBytesListener(LongConsumer listener) {
-        this.spillBytesListener = listener;
+        this.spillStatsListener = listener == null ? null : listener::accept;
+    }
+
+    /** 设置完整溢写统计转发回调（字节 + 文件数 + 触发次数；{@code null} = 清除）。 */
+    public void setSpillStatsListener(SpillStatsListener listener) {
+        this.spillStatsListener = listener;
     }
 
     /**
@@ -850,8 +931,22 @@ public abstract class AbstractSpillableOperator<S extends Slot>
     protected final void accountSpilledBytes(long bytes) {
         if (bytes <= 0) return;
         addSpilledBytes(bytes);
-        LongConsumer l = spillBytesListener;
-        if (l != null) l.accept(bytes);
+        SpillStatsListener l = spillStatsListener;
+        if (l != null) l.onSpillBytes(bytes);
+    }
+
+    /** 记一个溢写文件（本算子 + 转发给包装算子）。 */
+    protected final void noteSpillFile() {
+        getStats().recordSpillFile();
+        SpillStatsListener l = spillStatsListener;
+        if (l != null) l.onSpillFile();
+    }
+
+    /** 记一次溢写触发（本算子 + 转发给包装算子）。 */
+    protected final void noteSpillTrigger() {
+        getStats().recordSpillTrigger();
+        SpillStatsListener l = spillStatsListener;
+        if (l != null) l.onSpillTrigger();
     }
 
     /**
@@ -867,6 +962,7 @@ public abstract class AbstractSpillableOperator<S extends Slot>
         if (pa == null || file == null) return;
         try {
             long bytes = Files.size(file);
+            noteSpillFile();
             // 并发归并线程共享该字段：同步累加（与 writeBatchToArrow 同口径）。
             synchronized (pa) { pa.dataFileSize += bytes; }
             accountSpilledBytes(bytes);
@@ -883,6 +979,7 @@ public abstract class AbstractSpillableOperator<S extends Slot>
         pa.batchFiles.add(batchFile);
         if (pa.dataFilePath == null) pa.dataFilePath = batchFile;
         long bytes = writeArrowFile(batchFile, root);
+        noteSpillFile();
         // 并发溢写线程共享该字段：原子累加，避免一次写入丢失（Phase 2 的 Spilled 汇总口径）。
         synchronized (pa) { pa.dataFileSize += bytes; }
         return new BatchWrite(batchIndex, bytes);
@@ -896,7 +993,7 @@ public abstract class AbstractSpillableOperator<S extends Slot>
      */
     public static long writeArrowFile(Path file, VectorSchemaRoot root) throws IOException {
         try (FileChannel ch = FileChannel.open(file, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
-             ArrowFileWriter w = new ArrowFileWriter(root, null, ch)) {
+             ArrowFileWriter w = SpillCompression.writer(root, ch)) {
             w.writeBatch();
         }
         return Files.size(file);
@@ -911,7 +1008,7 @@ public abstract class AbstractSpillableOperator<S extends Slot>
         List<FieldVector> copied = new ArrayList<>();
         boolean ok = false;
         try {
-            reader = new ArrowFileReader(ch, allocator);
+            reader = SpillCompression.reader(ch, allocator);
             List<ArrowBlock> blocks = reader.getRecordBlocks();
             if (blocks.isEmpty()) return null;
             reader.loadRecordBatch(blocks.getFirst());

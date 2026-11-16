@@ -347,6 +347,12 @@
                 <artifactId>flight-core</artifactId>
                 <version>${arrow.version}</version>
             </dependency>
+            <!-- 溢写 Arrow IPC 文件压缩（LZ4 frame；com.dojao.core.operator.SpillCompression） -->
+            <dependency>
+                <groupId>org.apache.arrow</groupId>
+                <artifactId>arrow-compression</artifactId>
+                <version>${arrow.version}</version>
+            </dependency>
 
             <!-- - JDBC 驱动 - -->
             <dependency>

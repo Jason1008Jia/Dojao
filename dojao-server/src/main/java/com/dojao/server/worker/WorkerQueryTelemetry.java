@@ -94,11 +94,13 @@ public final class WorkerQueryTelemetry implements AutoCloseable {
      * （窗口排序 / 聚合 / 排序归并 join）恰恰是溢写主力，故必须能<b>单独</b>登记而不碰行数通道。</p>
      */
     private record Sampler(LongSupplier rows, LongSupplier bytesIn, LongSupplier bytesOut,
-                           LongSupplier spilled, BooleanSupplier done) {
+                           LongSupplier spilled, LongSupplier spillFiles, LongSupplier spillTriggers,
+                           BooleanSupplier done) {
     }
 
     /** 一拍的采样值；各通道 {@code -1} = 该通道本拍不可读（Master 不覆盖该表）。 */
-    private record Sample(long rows, long bytesIn, long bytesOut, long spilled) {
+    private record Sample(long rows, long bytesIn, long bytesOut, long spilled,
+                          long spillFiles, long spillTriggers) {
 
         /** 整条不可读（无任何有效通道）→ 本拍跳过。 */
         boolean empty() {
@@ -135,6 +137,8 @@ public final class WorkerQueryTelemetry implements AutoCloseable {
                 .compute(taskId, (k, prev) -> new Sampler(
                         rowsSupplier, bytesInSupplier, bytesOutSupplier,
                         prev == null ? null : prev.spilled(),
+                        prev == null ? null : prev.spillFiles(),
+                        prev == null ? null : prev.spillTriggers(),
                         doneSupplier != null ? doneSupplier : (prev == null ? null : prev.done())));
     }
 
@@ -152,14 +156,32 @@ public final class WorkerQueryTelemetry implements AutoCloseable {
      * 再次调用是<b>累加</b>而非覆盖 —— 否则后登记的会把先登记的溢写量抹掉，监控上只剩半个数。</p>
      */
     public void trackSpill(String queryId, String taskId, LongSupplier spilledSupplier) {
+        trackSpill(queryId, taskId, spilledSupplier, null, null);
+    }
+
+    /**
+     * 登记纯溢写采样器（带文件数 / 触发次数）：平均文件大小 = 溢写字节 / 文件数，调参依据。
+     *
+     * <p>文件数 / 触发次数按<b>累加</b>合并（同片段多个溢写算子各报各的），与溢写字节同口径；
+     * 任一算子未提供对应 supplier 时该通道保持原值（不覆盖）。</p>
+     */
+    public void trackSpill(String queryId, String taskId, LongSupplier spilledSupplier,
+                           LongSupplier spillFilesSupplier, LongSupplier spillTriggersSupplier) {
         if (queryId == null || taskId == null || spilledSupplier == null) {
             return;
         }
         byQuery.computeIfAbsent(queryId, k -> new ConcurrentHashMap<>())
-                .compute(taskId, (k, prev) -> prev == null
-                        ? new Sampler(null, null, null, spilledSupplier, null)
-                        : new Sampler(prev.rows(), prev.bytesIn(), prev.bytesOut(),
-                                sumSuppliers(prev.spilled(), spilledSupplier), prev.done()));
+                .compute(taskId, (k, prev) -> {
+                    if (prev == null) {
+                        return new Sampler(null, null, null, spilledSupplier,
+                                spillFilesSupplier, spillTriggersSupplier, null);
+                    }
+                    return new Sampler(prev.rows(), prev.bytesIn(), prev.bytesOut(),
+                            sumSuppliers(prev.spilled(), spilledSupplier),
+                            sumSuppliers(prev.spillFiles(), spillFilesSupplier),
+                            sumSuppliers(prev.spillTriggers(), spillTriggersSupplier),
+                            prev.done());
+                });
     }
 
     /** 两路溢写采样器相加（任一为 null 取另一路；两路都不可读 → -1）。 */
@@ -317,6 +339,8 @@ public final class WorkerQueryTelemetry implements AutoCloseable {
                             .setBytesIn(Math.max(-1L, s.bytesIn()))
                             .setBytesOut(Math.max(-1L, s.bytesOut()))
                             .setSpilledBytes(s.spilled())
+                            .setSpillFiles(Math.max(-1L, s.spillFiles()))
+                            .setSpillTriggers(Math.max(-1L, s.spillTriggers()))
                             .setDone(doneSet.containsKey(taskId) || doneSampled.contains(taskId)));
                     fragCount.incrementAndGet();
                 });
@@ -377,7 +401,9 @@ public final class WorkerQueryTelemetry implements AutoCloseable {
                 s.rows() == null ? -1L : safeRows(s.rows()),
                 safeRows(s.bytesIn()),
                 safeRows(s.bytesOut()),
-                s.spilled() == null ? -1L : safeRows(s.spilled()));
+                s.spilled() == null ? -1L : safeRows(s.spilled()),
+                s.spillFiles() == null ? -1L : safeRows(s.spillFiles()),
+                s.spillTriggers() == null ? -1L : safeRows(s.spillTriggers()));
     }
 
     private static boolean safeDone(BooleanSupplier supplier) {

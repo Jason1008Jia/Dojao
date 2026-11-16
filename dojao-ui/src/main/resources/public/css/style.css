@@ -1578,6 +1578,23 @@ textarea.sql-editor::-moz-selection { background: rgba(37, 99, 235, 0.26); color
   padding: 6px 8px 4px; font-size: 11.5px; font-weight: 600;
   color: var(--text-faint); letter-spacing: .02em;
 }
+/* @ 引用逐层展开：面包屑（当前路径 + 「点空白处只引用当前层」提示）与返回上一层。 */
+.ai-mention-crumb {
+  display: flex; justify-content: space-between; gap: 10px;
+  padding: 4px 8px 6px; margin-bottom: 2px;
+  border-bottom: 1px solid var(--line);
+  font-size: 11.5px; color: var(--text-faint);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.ai-mention-crumb > span:first-child { flex-shrink: 0; color: var(--text); font-weight: 600; }
+.ai-mention-crumb > span:last-child {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ai-mention-back {
+  padding: 5px 8px; border-radius: 6px; cursor: pointer;
+  font-size: 12.5px; color: var(--text-faint);
+}
+.ai-mention-back:hover { background: rgba(37, 99, 235, 0.08); color: var(--text); }
 .ai-mention-item {
   display: flex; align-items: baseline; gap: 8px;
   padding: 6px 8px; border-radius: 6px; cursor: pointer;

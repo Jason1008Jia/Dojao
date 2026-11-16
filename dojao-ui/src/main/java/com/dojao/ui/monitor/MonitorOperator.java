@@ -28,6 +28,10 @@ public record MonitorOperator(
         long currentMemBytes,
         long peakMemBytes,
         long spilledBytes,
+        /** 累计溢写文件数（含归并重写）；平均文件大小 = spilledBytes / spillFiles。 */
+        long spillFiles,
+        /** 累计溢写触发次数（分区缓冲槽满 → 提交一次溢写）。 */
+        long spillTriggers,
         long cpuMs,
         long elapsedMs,
         long instantRowsPerSec,

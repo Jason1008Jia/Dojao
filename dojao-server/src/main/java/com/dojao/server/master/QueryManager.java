@@ -144,6 +144,13 @@ public final class QueryManager {
      * 因此一直为空。这里靠遥测通道补上；{@link #snapshot()} 按算子归并各片段之和。</p>
      */
     private final ConcurrentHashMap<String, Long> liveFragmentSpilled = new ConcurrentHashMap<>();
+    /**
+     * Worker 遥测溢写文件数 / 触发次数覆盖表（与 {@link #liveFragmentSpilled} 同源同键）：
+     * 平均文件大小 = 溢写字节 / 文件数；触发次数 = 三槽流水线「槽满 → 提交溢写」的次数。
+     * 两者与溢写字节同帧上报，调参（阈值 / 并行度 / 分区数）靠这组数判断。
+     */
+    private final ConcurrentHashMap<String, Long> liveFragmentSpillFiles = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> liveFragmentSpillTriggers = new ConcurrentHashMap<>();
 
     /**
      * Worker 遥测已确认收尾的任务 id（含片段<b>内部分区子任务</b> {@code <fragmentId>#p<k>}）。
@@ -239,6 +246,33 @@ public final class QueryManager {
             this.state = QueryState.FINISHED;
             this.endTimeNanos = System.nanoTime();
             log.info("Query {} finished, wall={}ms", queryId, wallMs());
+            logSpillSummary();
+        }
+    }
+
+    /**
+     * 查询结束时打印一行溢写汇总 —— 调参的最小依据集：溢写字节 / 读入字节（溢写放大比）、
+     * 文件数、平均文件大小、触发次数。没有这组数，「阈值是不是太低」只能靠猜。
+     */
+    private void logSpillSummary() {
+        try {
+            long bytes = 0L, files = 0L, triggers = 0L, input = 0L;
+            for (OperatorSnapshot o : snapshot().operators()) {
+                bytes += o.spilledBytes();
+                files += o.spillFiles();
+                triggers += o.spillTriggers();
+                input += o.inputBytes();
+            }
+            if (bytes <= 0L && files <= 0L && triggers <= 0L) {
+                return;
+            }
+            long avgFile = files > 0 ? bytes / files : 0L;
+            log.info("Query {} 溢写汇总: spill={}MB input={}MB 放大比={} files={} 平均文件={}KB triggers={}",
+                    queryId, bytes >> 20, input >> 20,
+                    input > 0 ? String.format("%.2f", (double) bytes / input) : "-",
+                    files, avgFile >> 10, triggers);
+        } catch (Throwable t) {
+            log.debug("溢写汇总统计失败: {}", String.valueOf(t.getMessage()));
         }
     }
 
@@ -325,6 +359,12 @@ public final class QueryManager {
      */
     public void acceptFragmentTelemetry(String taskId, long rows, long bytesIn, long bytesOut,
                                         long spilledBytes, boolean done) {
+        acceptFragmentTelemetry(taskId, rows, bytesIn, bytesOut, spilledBytes, -1L, -1L, done);
+    }
+
+    public void acceptFragmentTelemetry(String taskId, long rows, long bytesIn, long bytesOut,
+                                        long spilledBytes, long spillFiles, long spillTriggers,
+                                        boolean done) {
         if (taskId == null) {
             return;
         }
@@ -335,6 +375,12 @@ public final class QueryManager {
         if (spilledBytes >= 0L) {
             Long prevSpilled = liveFragmentSpilled.put(taskId, spilledBytes);
             spillAdvanced = prevSpilled == null || prevSpilled.longValue() != spilledBytes;
+        }
+        if (spillFiles >= 0L) {
+            liveFragmentSpillFiles.put(taskId, spillFiles);
+        }
+        if (spillTriggers >= 0L) {
+            liveFragmentSpillTriggers.put(taskId, spillTriggers);
         }
         // 扫描存活心跳（P1）：独立 Scan 叶子没有「数据面回 Master」的页，其片段 tick 只表达
         // 「任务还活着」—— 命中即刷新看门狗的接触时刻后直接返回，<b>不写</b> 行数 / 字节表：
@@ -440,6 +486,8 @@ public final class QueryManager {
                     st.getPeakMemoryBytes(),
                     // 溢写 = 本算子（单机 / Master 本地）自报 + 分布式 Worker 侧遥测之和
                     st.getSpilledBytes() + workerSpilled(op),
+                    st.getSpillFiles() + workerSpillSum(op, liveFragmentSpillFiles),
+                    st.getSpillTriggers() + workerSpillSum(op, liveFragmentSpillTriggers),
                     elapsedMs,
                     instant,
                     avg,
@@ -493,6 +541,8 @@ public final class QueryManager {
                     liveFragmentBytesIn.getOrDefault(t.taskId(), 0L),
                     liveFragmentBytesOut.getOrDefault(t.taskId(), 0L),
                     liveFragmentSpilled.getOrDefault(t.taskId(), 0L),
+                    liveFragmentSpillFiles.getOrDefault(t.taskId(), 0L),
+                    liveFragmentSpillTriggers.getOrDefault(t.taskId(), 0L),
                     t.dispatchNanos(), t.finishNanos(), t.failure(),
                     src, expectedFor(src)));
         }
@@ -507,6 +557,11 @@ public final class QueryManager {
      * 与行数 / 字节同键（片段 id，见 {@link FragmentExecutor} 的 {@code trackSpill}）。</p>
      */
     private long workerSpilled(Operator op) {
+        return workerSpillSum(op, liveFragmentSpilled);
+    }
+
+    /** 本算子各 Worker 片段在指定溢写统计表上的合计（字节 / 文件数 / 触发次数同构）。 */
+    private long workerSpillSum(Operator op, ConcurrentHashMap<String, Long> table) {
         List<DistributedTask> tasks;
         if (op instanceof AbstractDistributedOperator ado) {
             tasks = ado.fragmentTasks();
@@ -517,7 +572,7 @@ public final class QueryManager {
         }
         long sum = 0L;
         for (DistributedTask t : tasks) {
-            Long s = liveFragmentSpilled.get(t.taskId());
+            Long s = table.get(t.taskId());
             if (s != null) {
                 sum += s;
             }
@@ -582,6 +637,8 @@ public final class QueryManager {
                     liveFragmentBytesOut.getOrDefault(id, 0L),
                     // 溢写是算子对象级（非分区级）：挂在 0 号分区上，阶段框按任务求和仍得真实值
                     k == 0 ? liveFragmentSpilled.getOrDefault(base, 0L) : 0L,
+                    k == 0 ? liveFragmentSpillFiles.getOrDefault(base, 0L) : 0L,
+                    k == 0 ? liveFragmentSpillTriggers.getOrDefault(base, 0L) : 0L,
                     t.dispatchNanos(), finishNanos, t.failure(), t.source(),
                     expectedFor(t.source())));
         }

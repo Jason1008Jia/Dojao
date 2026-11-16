@@ -178,6 +178,23 @@ public sealed interface FragmentSpec
 
     /** 接收端：本 Worker 拥有的桶（owned[pid]=true 才收数据；非归属桶立即结束、零内存）。 */
     record ExchangeInStep(String exchangeId, int numPartitions, int numSenders, boolean[] owned) {
+        /**
+         * 本片段实际会收到数据的桶数（{@code owned} 为 null 时退回布局分区数）。
+         *
+         * <p>可溢写算子据此摊薄单槽阈值：布局分区数（如 24）是全局分桶数，而每个片段往往只分到
+         * 其中一部分桶 —— 只拥 1 个桶的片段不该按 24 除预算（否则阈值被白白缩小 24 倍，
+         * 表现就是「资源够却拼命溢写」）。</p>
+         */
+        public int ownedCount() {
+            if (owned == null) {
+                return Math.max(1, numPartitions);
+            }
+            int n = 0;
+            for (boolean o : owned) {
+                if (o) n++;
+            }
+            return Math.max(1, n);
+        }
     }
 
     /**

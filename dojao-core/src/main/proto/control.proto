@@ -610,6 +610,10 @@ message QueryFragmentTelemetryMsg {
                              // 终端 Consumer（窗口排序 / 聚合 / 排序归并 join）也会溢写 → 必须单独一条
                              // 通道上报，否则监控上「溢写总量」恒为空。帧内独立有效：纯溢写帧
                              // rows_emitted = -1，Master 只覆盖溢写表、不动行数/字节表（无双计）。
+  int64 spill_files = 7;     // 该段累计写出的溢写文件数（含归并重写）；-1 = 无读数。
+                             // 与 spilled_bytes 同帧：平均文件大小 = spilled_bytes / spill_files。
+  int64 spill_triggers = 8;  // 该段累计溢写触发次数（分区缓冲槽满 → 提交一次溢写）；-1 = 无读数。
+                             // 与 spill_files 分开：归并重写会写文件但不触发。
 }
 
 message QueryTelemetryGroup {

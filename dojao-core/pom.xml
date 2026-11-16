@@ -70,6 +70,11 @@
             <groupId>org.apache.arrow</groupId>
             <artifactId>flight-core</artifactId>
         </dependency>
+        <!-- 溢写 Arrow IPC 文件 LZ4 frame 压缩（SpillCompression） -->
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-compression</artifactId>
+        </dependency>
 
         <!-- Guava -->
         <dependency>

@@ -372,6 +372,8 @@ public final class UiQueryMonitor implements QueryMonitor {
             }
             // 上游各段已归属的溢写：终端段 = 算子总溢写 - 上游各段，保证「各段相加 = 总量」且不双计
             long upstreamSpilled = 0L;
+            long upstreamSpillFiles = 0L;
+            long upstreamSpillTriggers = 0L;
             for (int j = 0; j < gs.size(); j++) {
                 Group g = gs.get(j);
                 List<Integer> children = new ArrayList<>(childLocal.get(j).size());
@@ -384,6 +386,8 @@ public final class UiQueryMonitor implements QueryMonitor {
                             o.elapsedMs(), o.cpuMs(),
                             o.currentMemBytes(), o.peakMemBytes(),
                             Math.max(0L, o.spilledBytes() - upstreamSpilled),
+                            Math.max(0L, o.spillFiles() - upstreamSpillFiles),
+                            Math.max(0L, o.spillTriggers() - upstreamSpillTriggers),
                             o.avgRowsPerSec(), o.instantBytesPerSec(), o.avgBytesPerSec(),
                             o.failureMessage()));
                 } else {
@@ -391,7 +395,11 @@ public final class UiQueryMonitor implements QueryMonitor {
                     long upBytesIn = sumTaskBytesIn(g.tasks);
                     long upBytesOut = sumTaskBytesOut(g.tasks);
                     long upSpilled = sumTaskSpilled(g.tasks);
+                    long upSpillFiles = sumTaskSpillFiles(g.tasks);
+                    long upSpillTriggers = sumTaskSpillTriggers(g.tasks);
                     upstreamSpilled += upSpilled;
+                    upstreamSpillFiles += upSpillFiles;
+                    upstreamSpillTriggers += upSpillTriggers;
                     long upElapsed = maxTaskElapsedMs(g.tasks, now);
                     String suffix = g.producer
                             ? "#scan:" + (g.source == null ? "" : g.source)
@@ -400,6 +408,7 @@ public final class UiQueryMonitor implements QueryMonitor {
                             gidx[j], children, now,
                             0L, upRows, upBytesIn, upBytesOut,
                             upElapsed, 0L, 0L, 0L, upSpilled,
+                            upSpillFiles, upSpillTriggers,
                             avgRate(upRows, upElapsed), 0L, avgRate(upBytesOut, upElapsed),
                             firstTaskFailure(g.tasks)));
                 }
@@ -499,6 +508,7 @@ public final class UiQueryMonitor implements QueryMonitor {
                 idx, o.operatorId(), o.operatorType(), o.state().name(),
                 o.parallelism(), o.rowsIn(), o.rowsOut(), o.inputBytes(), o.outputBytes(),
                 o.currentMemBytes(), o.peakMemBytes(), o.spilledBytes(),
+                o.spillFiles(), o.spillTriggers(),
                 o.cpuMs(), o.elapsedMs(), o.instantRowsPerSec(), o.avgRowsPerSec(),
                 o.instantBytesPerSec(), o.avgBytesPerSec(),
                 o.failureMessage(), children, toMonitorTasks(o.tasks(), now));
@@ -511,6 +521,7 @@ public final class UiQueryMonitor implements QueryMonitor {
                                              long rowsIn, long rowsOut, long inputBytes, long outputBytes,
                                              long elapsedMs, long cpuMs,
                                              long currentMemBytes, long peakMemBytes, long spilledBytes,
+                                             long spillFiles, long spillTriggers,
                                              long avgRowsPerSec, long instantBytesPerSec, long avgBytesPerSec,
                                              String failureMessage) {
         String state = stageState(tasks, o.state());
@@ -520,7 +531,7 @@ public final class UiQueryMonitor implements QueryMonitor {
         return new MonitorOperator(
                 idx, opId, kind, state,
                 Math.max(1, tasks.size()), rowsIn, rowsOut, inputBytes, outputBytes,
-                currentMemBytes, peakMemBytes, spilledBytes,
+                currentMemBytes, peakMemBytes, spilledBytes, spillFiles, spillTriggers,
                 cpuMs, elapsedMs, 0L, avgRowsPerSec, instantBytesPerSec, avgBytesPerSec,
                 failureMessage, children, toMonitorTasks(tasks, now));
     }
@@ -578,6 +589,18 @@ public final class UiQueryMonitor implements QueryMonitor {
     private static long sumTaskSpilled(List<OperatorSnapshot.Task> tasks) {
         long sum = 0L;
         for (OperatorSnapshot.Task t : tasks) sum += t.spilledBytes();
+        return sum;
+    }
+
+    private static long sumTaskSpillFiles(List<OperatorSnapshot.Task> tasks) {
+        long sum = 0L;
+        for (OperatorSnapshot.Task t : tasks) sum += t.spillFiles();
+        return sum;
+    }
+
+    private static long sumTaskSpillTriggers(List<OperatorSnapshot.Task> tasks) {
+        long sum = 0L;
+        for (OperatorSnapshot.Task t : tasks) sum += t.spillTriggers();
         return sum;
     }
 

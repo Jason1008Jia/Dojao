@@ -85,6 +85,12 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
     private final JoinType joinType;
     private final long memoryLimit;
     private final BufferAllocator allocator;
+    /**
+     * 本片段两侧各自实际拥有的 shuffle 桶数（{@code ExchangeInStep.owned()} 的计数）。0 = 未设置，
+     * 对应排序算子按布局分区数摊薄。见 {@link #setBudgetPartitions(int, int)}。
+     */
+    private volatile int leftBudgetPartitions;
+    private volatile int rightBudgetPartitions;
 
     /**
      * 右（build）侧<b>声明列</b>（Master 规划期下发的 {@code JoinStep.declaredRightFields}）。
@@ -256,12 +262,31 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
     protected void doOpen() throws Exception {
         this.leftSort = new JoinSortOperator(leftUpstream, leftKeyColumns, memoryLimit, numPartitions);
         this.rightSort = new JoinSortOperator(rightUpstream, rightKeyColumns, memoryLimit, numPartitions);
-        // ★真正溢写的是两侧 JoinSortOperator：把溢写量转发到本算子统计。监控注册的是这个包装
-        //   算子，不转发的话它的 spilledBytes 恒 0 —— 排序归并 join 无论落了多少 GB 都显示「无溢写」。
-        leftSort.setSpillBytesListener(this::addSpilledBytes);
-        rightSort.setSpillBytesListener(this::addSpilledBytes);
+        // 按本片段实际拥有的桶数摊薄单槽阈值（与聚合 / 窗口同口径），须在 open 前设置。
+        if (leftBudgetPartitions > 0) leftSort.setBudgetPartitions(leftBudgetPartitions);
+        if (rightBudgetPartitions > 0) rightSort.setBudgetPartitions(rightBudgetPartitions);
+        // ★真正溢写的是两侧 JoinSortOperator：把溢写统计（字节 / 文件数 / 触发次数）转发到本算子
+        //   统计。监控注册的是这个包装算子，不转发的话它的计数恒 0 —— 排序归并 join 无论落了多少
+        //   GB 都显示「无溢写」。
+        AbstractSpillableOperator.SpillStatsListener forward =
+                new AbstractSpillableOperator.SpillStatsListener() {
+                    @Override public void onSpillBytes(long bytes) { addSpilledBytes(bytes); }
+                    @Override public void onSpillFile() { getStats().recordSpillFile(); }
+                    @Override public void onSpillTrigger() { getStats().recordSpillTrigger(); }
+                };
+        leftSort.setSpillStatsListener(forward);
+        rightSort.setSpillStatsListener(forward);
         leftSort.open();   // JoinSortOperator.doOpen() 会 auto-open upstream
         rightSort.open();
+    }
+
+    /**
+     * 按本片段两侧各自实际拥有的 shuffle 桶数重算排序算子的单槽阈值（须在 {@link #doOpen()} 前调用；
+     * 子排序算子在 {@code doOpen()} 里才创建，故先缓存到字段）。
+     */
+    public void setBudgetPartitions(int leftOwned, int rightOwned) {
+        if (leftOwned > 0) this.leftBudgetPartitions = leftOwned;
+        if (rightOwned > 0) this.rightBudgetPartitions = rightOwned;
     }
 
     @Override
@@ -1091,7 +1116,7 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
         List<FieldVector> copied = new ArrayList<>();
         try {
             FileChannel ch = FileChannel.open(file, StandardOpenOption.READ);
-            ArrowFileReader reader = new ArrowFileReader(ch, alloc);
+            ArrowFileReader reader = SpillCompression.reader(ch, alloc);
             try {
                 List<ArrowBlock> blocks = reader.getRecordBlocks();
                 if (firstBlock >= blocks.size()) return new FileSlice(null, blocks.size(), true);
@@ -1158,7 +1183,7 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
     static VectorSchemaRoot loadArrowFile(Path file, BufferAllocator alloc) {
         try {
             FileChannel ch = FileChannel.open(file, StandardOpenOption.READ);
-            ArrowFileReader reader = new ArrowFileReader(ch, alloc);
+            ArrowFileReader reader = SpillCompression.reader(ch, alloc);
             try {
                 List<ArrowBlock> blocks = reader.getRecordBlocks();
                 if (blocks.isEmpty()) return null;

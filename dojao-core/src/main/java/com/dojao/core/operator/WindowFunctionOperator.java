@@ -1478,6 +1478,7 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
     private void maybeSpillAccumulator() {
         if (accRoot == null || accRows == 0) return;
         if (accMemoryBytes() < BUFFER_SPILL_THRESHOLD) return;
+        getStats().recordSpillTrigger();
         spillAccumulator();
     }
 
@@ -1511,7 +1512,7 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
             FileChannel ch = FileChannel.open(file, StandardOpenOption.CREATE,
                     StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
             try {
-                ArrowFileWriter w = new ArrowFileWriter(accRoot, null, ch);
+                ArrowFileWriter w = SpillCompression.writer(accRoot, ch);
                 w.writeBatch();
                 w.close();
             } finally {
@@ -1520,6 +1521,7 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
             // ★整分区缓冲落盘同样是真实溢写 I/O：计入算子溢写统计（监控「溢写总量」）。
             //   不记账时，无过滤的大分区窗口在监控上完全看不到任何溢写。
             addSpilledBytes(Files.size(file));
+            getStats().recordSpillFile();
             bufferedPages.add(BufferedPage.file(file, accRows));
             accRoot.close();
             accRoot = null;
@@ -1553,7 +1555,7 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
     /** 读回一个溢写段（每次调用产生独立 root，调用方负责关闭）。 */
     private VectorSchemaRoot loadSpillSegment(Path file) throws IOException {
         FileChannel ch = FileChannel.open(file, StandardOpenOption.READ);
-        ArrowFileReader reader = new ArrowFileReader(ch, allocator);
+        ArrowFileReader reader = SpillCompression.reader(ch, allocator);
         VectorSchemaRoot loaded = null;
         try {
             List<ArrowBlock> blocks = reader.getRecordBlocks();

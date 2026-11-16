@@ -30,6 +30,10 @@ public record OperatorSnapshot(
         long currentMemBytes,
         long peakMemBytes,
         long spilledBytes,
+        /** 累计溢写文件数（含归并重写）；平均文件大小 = spilledBytes / spillFiles。 */
+        long spillFiles,
+        /** 累计溢写触发次数（分区缓冲槽满 → 提交一次溢写）。 */
+        long spillTriggers,
         long elapsedMs,
         /** 瞬时吞吐（行/秒）：两次快照间 rowsOut 差分 / 时间差。 */
         long instantRowsPerSec,
@@ -55,6 +59,8 @@ public record OperatorSnapshot(
                        long bytesIn, long bytesOut,
                        /** 该片段（阶段）在 Worker 侧的累计溢写字节 —— 各阶段框各报各的。 */
                        long spilledBytes,
+                       /** 该片段的溢写文件数 / 触发次数（与 spilledBytes 同帧遥测）。 */
+                       long spillFiles, long spillTriggers,
                        long dispatchNanos, long finishNanos,
                        String failure, String source,
                        /** Producer 扫描基表的探查行数总量估计（{@code schema.table} 命中才有，否则 -1）。 */

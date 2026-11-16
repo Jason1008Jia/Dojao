@@ -145,7 +145,7 @@ public final class MaterializedCteConnector implements DojaoConnector {
         FileChannel ch = FileChannel.open(file, StandardOpenOption.READ);
         ArrowFileReader reader = null;
         try {
-            reader = new ArrowFileReader(ch, tmp);
+            reader = SpillCompression.reader(ch, tmp);
             List<ArrowBlock> blocks = reader.getRecordBlocks();
             if (blocks.isEmpty()) {
                 return new byte[0];
@@ -265,7 +265,7 @@ public final class MaterializedCteConnector implements DojaoConnector {
         FileChannel ch = FileChannel.open(file, StandardOpenOption.READ);
         ArrowFileReader reader = null;
         try {
-            reader = new ArrowFileReader(ch, tmp);
+            reader = SpillCompression.reader(ch, tmp);
             List<ArrowBlock> blocks = reader.getRecordBlocks();
             if (blocks.isEmpty()) {
                 return Page.eof();

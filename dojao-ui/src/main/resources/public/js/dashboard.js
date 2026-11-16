@@ -419,6 +419,15 @@ function doSubmitQuery(raw) {
     var sent = withAutoLimit(completeCatalogQualifiers(raw));
     sqlAutoLimited = sent.autoLimit;
     sqlBatchCount = sqlStatementCount(raw);   // >1 = 引擎侧按分号切分后串行执行
+    // ★ 必须同时写回「发起控制台的 preview」：renderActivePreview 会用 p.lastSqlText 回写全局，
+    //   只改全局会被下一次渲染覆盖成空 ⇒ 出错卡片的「复制」退回整个编辑器内容（把页面上所有 SQL 都复制走）。
+    var submitPreview = activePreview();
+    if (submitPreview) {
+        submitPreview.lastSqlText = raw;
+        submitPreview.ranSelection = sqlRanSelection;
+        submitPreview.autoLimited = sqlAutoLimited;
+        submitPreview.batchCount = sqlBatchCount;
+    }
     var btn = document.getElementById('submit-btn');
     if (btn) btn.disabled = true;
     // 记住「是哪个控制台提交的」：POST 在途时用户可能切走，结果仍要能回到发起它的控制台
@@ -951,13 +960,21 @@ function hideSqlError() {
 }
 
 /**
- * 出错卡片「复制 / 用 AI 修复」用的 SQL：优先用<b>本次真正执行的那段</b>
- * （有选区时是选中片段，不是整框），拿不到才退回编辑器全文。都不带 UI 自动补的 limit。
+ * 出错卡片「复制 / 用 AI 修复」用的 SQL：只用<b>本次真正执行的那段</b>
+ * （有选区时是选中片段，不是整框）。都不带 UI 自动补的 limit。
+ *
+ * <p>拿不到时只回退到编辑器<b>选区</b>，绝不回退整框内容 —— 编辑器里常并排放着多条 SQL，
+ * 整框回退会把很多无关语句一起复制出去（用户报过的缺陷）。</p>
  */
 function currentSqlText() {
     if (lastSqlText) return lastSqlText;
     var input = document.getElementById('query-input');
-    return input && input.value ? input.value.trim() : '';
+    if (!input) return '';
+    var sel = '';
+    if (input.selectionStart != null && input.selectionEnd > input.selectionStart) {
+        sel = input.value.slice(input.selectionStart, input.selectionEnd);
+    }
+    return sel.trim();
 }
 
 /** 复制「SQL + 报错」到剪贴板：方便贴给同事或贴进 AI 对话。反馈打在按钮上（首页无顶栏横幅）。 */
@@ -1856,6 +1873,49 @@ function aiMentionAt(text, caret) {
     return { start: start, query: m[2], trigger: before.charAt(start) };
 }
 
+/** 过滤候选：全名 / 说明包含输入即命中；前缀命中排前面（@su → sum 先于其它含 sum 的名字）。 */
+function aiMentionFilter(list, q) {
+    var hits = list.filter(function (it) {
+        return !q || it.name.toLowerCase().indexOf(q) >= 0
+                || (it.hint || '').toLowerCase().indexOf(q) >= 0;
+    });
+    hits.sort(function (a, b) {
+        var ap = q && a.name.toLowerCase().indexOf(q) === 0 ? 0 : 1;
+        var bp = q && b.name.toLowerCase().indexOf(q) === 0 ? 0 : 1;
+        return ap !== bp ? ap - bp : a.name.localeCompare(b.name);
+    });
+    return hits;
+}
+
+/**
+ * @ 当前该展示的层级：0 = catalog，1 = schema，2 = 表。
+ * 已点选路径优先；没点选时按手打名字里的点号隐式定层（兼容直接输入 catalog.schema.table）。
+ */
+function aiMentionLevel(path, query) {
+    if (path && path.length) return Math.min(path.length, 2);
+    var dots = 0;
+    for (var i = 0; i < (query || '').length; i++) {
+        if (query.charAt(i) === '.') dots++;
+    }
+    return Math.min(dots, 2);
+}
+
+/** 该层级可选的候选（钻取后按已点选的前缀收窄到该 catalog / schema 之下）。 */
+function aiMentionLevelList(data, level, path) {
+    if (level <= 0) return data.catalogs;
+    if (level === 1) {
+        var catPrefix = path && path.length ? path[0].name + '.' : null;
+        return catPrefix
+                ? data.schemas.filter(function (s) { return s.name.indexOf(catPrefix) === 0; })
+                : data.schemas;
+    }
+    var prefix = path && path.length >= 2 ? path[path.length - 1].name + '.'
+            : path && path.length === 1 ? path[0].name + '.' : null;
+    return prefix
+            ? data.tables.filter(function (t) { return t.name.indexOf(prefix) === 0; })
+            : data.tables;
+}
+
 /** 输入 / 光标移动后刷新候选面板（候选数据未就绪则等它加载完）。 */
 function aiMentionUpdate() {
     var input = document.getElementById('ai-input');
@@ -1868,28 +1928,23 @@ function aiMentionUpdate() {
         if (!cur) { aiMentionClose(); return; }
         var now = aiMentionAt(cur.value, cur.selectionStart);
         if (!now || now.trigger !== hit.trigger) { aiMentionClose(); return; }
+        // 同一个 @ 词重算时沿用已钻取路径；换了触发位置（新的 @）则从 catalog 层重来。
+        var prev = aiMentionState;
+        var path = prev && prev.start === now.start && prev.trigger === now.trigger
+                ? (prev.path || []) : [];
         var q = now.query.toLowerCase();
-        var pick = function (list) {
-            var hits = list.filter(function (it) {
-                return !q || it.name.toLowerCase().indexOf(q) >= 0
-                        || (it.hint || '').toLowerCase().indexOf(q) >= 0;
-            });
-            // 前缀命中排前面（@su → sum / sum_if 先于其它含 sum 的名字）。
-            hits.sort(function (a, b) {
-                var ap = q && a.name.toLowerCase().indexOf(q) === 0 ? 0 : 1;
-                var bp = q && b.name.toLowerCase().indexOf(q) === 0 ? 0 : 1;
-                return ap !== bp ? ap - bp : a.name.localeCompare(b.name);
-            });
-            return hits;
-        };
-        // @ = 数据对象（catalog → schema → 表）；# = 函数。
-        var items = now.trigger === '#'
-                ? pick(data.functions).slice(0, 20)
-                : pick(data.catalogs).slice(0, 8)
-                    .concat(pick(data.schemas).slice(0, 10))
-                    .concat(pick(data.tables).slice(0, 20));
+        var level = 0;
+        var items;
+        if (now.trigger === '#') {
+            items = aiMentionFilter(data.functions, q).slice(0, 20);
+        } else {
+            // @ = 数据对象：`@` 只出 catalog，点选后才逐层展开 schema / 表。
+            level = aiMentionLevel(path, now.query);
+            items = aiMentionFilter(aiMentionLevelList(data, level, path), q)
+                    .slice(0, level === 0 ? 8 : level === 1 ? 12 : 24);
+        }
         aiMentionState = { start: now.start, query: now.query, trigger: now.trigger,
-            items: items, index: 0 };
+            items: items, index: 0, path: path, level: level };
         aiMentionRender();
     });
 }
@@ -1901,12 +1956,36 @@ function aiMentionRender() {
     var st = aiMentionState;
     pop.textContent = '';
     if (!st) { pop.hidden = true; return; }
+    // 已钻取：面包屑 + 返回上一层。点空白处离开时只引用当前层对象（见 aiMentionDismiss）。
+    if (st.trigger === '@' && st.path && st.path.length) {
+        var crumb = document.createElement('div');
+        crumb.className = 'ai-mention-crumb';
+        var crumbPath = document.createElement('span');
+        crumbPath.textContent = st.path.map(function (p) { return p.name; }).join(' › ');
+        var crumbTip = document.createElement('span');
+        crumbTip.textContent = '点空白处只引用 ' + st.path[st.path.length - 1].name;
+        crumb.appendChild(crumbPath);
+        crumb.appendChild(crumbTip);
+        pop.appendChild(crumb);
+        var back = document.createElement('div');
+        back.className = 'ai-mention-back';
+        back.textContent = '← 返回上一层';
+        back.addEventListener('mousedown', function (e) {
+            e.preventDefault();
+            if (!aiMentionState || !aiMentionState.path || !aiMentionState.path.length) return;
+            var input = document.getElementById('ai-input');
+            if (input) aiMentionClearQuery(input, aiMentionState);
+            aiMentionState.path.pop();
+            aiMentionUpdate();
+        });
+        pop.appendChild(back);
+    }
     if (!st.items.length) {
+        var what = st.trigger === '#' ? '函数'
+                : st.level >= 2 ? '表' : st.level === 1 ? 'schema' : 'catalog';
         var empty = document.createElement('div');
         empty.className = 'ai-mention-empty';
-        empty.textContent = st.trigger === '#'
-                ? '没有匹配的函数'
-                : (aiMentionLoading ? '正在加载 catalog / schema / 表…' : '没有匹配的 catalog / schema / 表');
+        empty.textContent = aiMentionLoading ? '正在加载…' : '没有匹配的 ' + what;
         pop.appendChild(empty);
         aiMentionPlace(pop);
         pop.hidden = false;
@@ -1986,13 +2065,44 @@ function aiMentionMove(delta) {
     aiMentionHighlight();
 }
 
-/** 选中一项：把「@当前词」替换为「@名字 」，光标落在其后。 */
+/**
+ * 选中一项：
+ * catalog → 展开该 catalog 的 schema（不动正文）；schema → 展开该 schema 的表；
+ * 表 / 函数 → 把「@当前词」替换为「@名字 」，光标落在其后。
+ */
 function aiMentionPick(idx) {
     var st = aiMentionState;
     var input = document.getElementById('ai-input');
     if (!st || !input) { aiMentionClose(); return; }
     var item = st.items[idx == null ? st.index : idx];
     if (!item) { aiMentionClose(); return; }
+    if (item.type === 'catalog' || item.type === 'schema') {
+        var path = item.type === 'catalog'
+                ? [{ type: 'catalog', name: item.name }]
+                : [{ type: 'catalog', name: item.name.slice(0, item.name.lastIndexOf('.')) },
+                   { type: 'schema', name: item.name }];
+        st.path = path;
+        aiMentionClearQuery(input, st);
+        aiMentionUpdate();
+        return;
+    }
+    aiMentionInsert(st, item);
+}
+
+/** 逐层展开时清掉「@」后面已打的过滤词，避免拿 catalog 名去过滤 schema 列表。 */
+function aiMentionClearQuery(input, st) {
+    var caret = input.selectionStart;
+    if (caret <= st.start + 1) return;
+    input.value = input.value.slice(0, st.start + 1) + input.value.slice(caret);
+    var pos = st.start + 1;
+    input.setSelectionRange(pos, pos);
+    if (aiInputGrow) aiInputGrow();
+}
+
+/** 把「@当前词」替换为「@名字 」，光标落在其后。 */
+function aiMentionInsert(st, item) {
+    var input = document.getElementById('ai-input');
+    if (!input) { aiMentionClose(); return; }
     var caret = input.selectionStart;
     var token = st.trigger + item.name;
     var before = input.value.slice(0, st.start);
@@ -2004,6 +2114,24 @@ function aiMentionPick(idx) {
     aiMentionClose();
     if (aiInputGrow) aiInputGrow();
     if (item.type === 'catalog') aiMentionLoadCatalogSchemas(item.name);
+    if (item.type === 'schema' && !aiMentionExtra['schema:' + item.name]) {
+        var cat = item.name.slice(0, item.name.lastIndexOf('.'));
+        aiMentionExtra['schema:' + item.name] = '位于 catalog ' + cat;
+    }
+}
+
+/**
+ * 点空白处 / 输入框失焦：已钻取的层级视为最终选择 —— 只选了 catalog 就引用 catalog，
+ * 选到 schema 就引用 schema（用户不必再往下钻）。未钻取（只有 @ 或手打全名）则直接关闭。
+ */
+function aiMentionDismiss() {
+    var st = aiMentionState;
+    if (!st) return;
+    if (st.trigger === '@' && st.path && st.path.length) {
+        aiMentionInsert(st, st.path[st.path.length - 1]);
+    } else {
+        aiMentionClose();
+    }
 }
 
 /** 关闭候选面板。 */
@@ -2084,12 +2212,13 @@ function bindAiMentions() {
         }
     });
     input.addEventListener('blur', function () {
-        // 延迟关闭：让候选项的 mousedown 先完成插入。
-        setTimeout(aiMentionClose, 120);
+        // 延迟处理：让候选项的 mousedown 先完成插入 / 钻取。
+        setTimeout(aiMentionDismiss, 120);
     });
     document.addEventListener('mousedown', function (e) {
         var pop = document.getElementById('ai-mention-pop');
-        if (pop && !pop.contains(e.target) && e.target !== input) aiMentionClose();
+        // 点空白处：钻取过就按当前层提交（只选了 catalog 就只引用 catalog）。
+        if (pop && !pop.contains(e.target) && e.target !== input) aiMentionDismiss();
     });
 }
 
@@ -2117,6 +2246,14 @@ function bindAiChat() {
             if (aiMentionState) {
                 if (e.key === 'ArrowDown') { e.preventDefault(); aiMentionMove(1); return; }
                 if (e.key === 'ArrowUp') { e.preventDefault(); aiMentionMove(-1); return; }
+                // → 之前（过滤词已为空）左方向键退回上一层。
+                if (e.key === 'ArrowLeft' && aiMentionState.path && aiMentionState.path.length
+                        && input.selectionStart === aiMentionState.start + 1) {
+                    e.preventDefault();
+                    aiMentionState.path.pop();
+                    aiMentionUpdate();
+                    return;
+                }
                 if (e.key === 'Escape') { e.preventDefault(); aiMentionClose(); return; }
                 if (aiMentionState.items.length
                         && (e.key === 'Enter' || e.key === 'Tab')

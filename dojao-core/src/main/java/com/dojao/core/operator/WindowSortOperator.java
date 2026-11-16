@@ -332,7 +332,7 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
         VectorSchemaRoot root = new VectorSchemaRoot(fields, outVectors, 0);
         try (FileChannel ch = FileChannel.open(file, StandardOpenOption.CREATE,
                 StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
-             ArrowFileWriter writer = new ArrowFileWriter(root, null, ch)) {
+             ArrowFileWriter writer = SpillCompression.writer(root, ch)) {
             int off = 0;
             while (off < total) {
                 int rows = Math.min(SPILL_BATCH_ROWS, total - off);
@@ -467,6 +467,7 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
      */
     private int[] flattenGroupSortedIndices(RowAccumulator acc) {
         int keep = pruneKeepRows();   // 每组只保留前 N 行（位置型等值/≤/<N 过滤时），否则不裁
+        boolean rankPrune = rankPrunableOnSpill();
         int[] sortedIndices = new int[acc.rowCount];
         int pos = 0;
         if (acc.hasIntKeys()) {
@@ -476,8 +477,9 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
                 if (indices.size() > 1) {
                     indices.sort((a, b) -> compareOrderByOnly(acc.vectors, a, acc.vectors, b));
                 }
-                int lim = Math.min(keep, indices.size());
-                for (int i = 0; i < lim; i++) sortedIndices[pos++] = indices.get(i);
+                List<Integer> sel = rankPrune ? pruneRankGroup(acc.vectors, indices) : indices;
+                int lim = rankPrune ? sel.size() : Math.min(keep, indices.size());
+                for (int i = 0; i < lim; i++) sortedIndices[pos++] = sel.get(i);
             }
         } else {
             List<Object> keys = new ArrayList<>(acc.keyToRowIndices.keySet());
@@ -488,12 +490,58 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
                 if (indices.size() > 1) {
                     indices.sort((a, b) -> compareOrderByOnly(acc.vectors, a, acc.vectors, b));
                 }
-                int lim = Math.min(keep, indices.size());
-                for (int i = 0; i < lim; i++) sortedIndices[pos++] = indices.get(i);
+                List<Integer> sel = rankPrune ? pruneRankGroup(acc.vectors, indices) : indices;
+                int lim = rankPrune ? sel.size() : Math.min(keep, indices.size());
+                for (int i = 0; i < lim; i++) sortedIndices[pos++] = sel.get(i);
             }
         }
         // 裁剪后行数可能少于 acc.rowCount ⇒ 必须截断（否则调用方按 length 会写出 0 值尾行）
         return pos == sortedIndices.length ? sortedIndices : Arrays.copyOf(sortedIndices, pos);
+    }
+
+    /**
+     * 排名型过滤（RANK / DENSE_RANK）能否在溢写时就地裁剪。
+     *
+     * <p>可裁剪的是 {@code EQ / LE / LT}：行的<b>局部排名 ≤ 全局排名</b>（局部组是全局组的子集，
+     * 排在前面的行只会更少），所以「局部排名 ≤ N」的行必然是全局命中的超集 —— 提前丢掉的行走
+     * 到归并阶段也不可能满足条件。{@code GE / GT} 相反（局部排名可能远小于全局排名），不裁。</p>
+     *
+     * <p>与位置型的「每组只留前 N 行」是同一类 top-N 可分解性，但这里不能按行数裁：并列行
+     * （同一个 ORDER BY 值）的排名相同，必须整组并列行一起保留，故按「局部排名」逐行判定。</p>
+     */
+    private boolean rankPrunableOnSpill() {
+        WindowFilterConfig f = filterConfig;
+        if (f == null || !f.isActive() || !f.isRank() || f.noOrderBy()) return false;
+        return f.operator() == WindowFilterConfig.FilterOp.EQ
+                || f.operator() == WindowFilterConfig.FilterOp.LE
+                || f.operator() == WindowFilterConfig.FilterOp.LT;
+    }
+
+    /**
+     * 对已按 ORDER BY 排好序的<b>局部</b>分组，保留「局部排名 ≤ 上限」的行。
+     *
+     * <p>上限：{@code EQ/LE → N}、{@code LT → N-1}。排名单调不减 ⇒ 一旦超限可直接跳出。
+     * 归并阶段还会对「并集」重新算一次排名并过滤（{@code Phase2Out.runGroupFilter}），
+     * 这里只是把不可能命中的行提前丢掉，不会漏掉任何结果。</p>
+     */
+    private List<Integer> pruneRankGroup(List<FieldVector> vectors, List<Integer> sorted) {
+        long n = filterConfig.targetValue();
+        long lim = filterConfig.operator() == WindowFilterConfig.FilterOp.LT ? n - 1 : n;
+        if (lim <= 0) return List.of();
+        boolean dense = filterConfig.functionType() == WindowFunctionType.DENSE_RANK;
+        List<Integer> kept = new ArrayList<>();
+        long rankVal = 1, sameCount = 1, denseRank = 1;
+        for (int i = 0; i < sorted.size(); i++) {
+            if (i > 0) {
+                int cmp = compareOrderByOnly(vectors, sorted.get(i), vectors, sorted.get(i - 1));
+                if (cmp != 0) { rankVal += sameCount; sameCount = 1; denseRank++; }
+                else { sameCount++; }
+            }
+            long cur = dense ? denseRank : rankVal;
+            if (cur > lim) break;
+            kept.add(sorted.get(i));
+        }
+        return kept;
     }
 
     /**
@@ -1041,14 +1089,20 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
             //   摊薄）比较，别处分区占用的内存会把本次归并的路数直接压到 2 路 —— 文件数上千时
             //   就要多轮重写（每轮都重写全量数据），线上表现为「溢写量 200+GB」。
             long baseAlloc = allocator.getAllocatedMemory();
+            // ★ 绝对水位：增量口径只管「本次归并自己装了多少」，但输出缓冲与别处分区也在吃同一个
+            //   分配器 —— 若只看增量，几个分区同时归并时可能一起撞上 total limit（堆外 OOM）。
+            //   接近上限时提前收手，给输出缓冲留出余量。
+            long hardLimit = allocator.getLimit();
+            long headroom = Math.max(16L << 20, hardLimit / 8);
             while (cursor < n && loaded < MAX_MERGE_K) {
                 checkCancelled();
                 // 用分配器「实时占用（增量）」判路数，而不是预估单批大小：Arrow 分配按 2 的幂
                 // 向上取整，预估会低估近一倍。至少放 2 路进来，保证多轮归并必然收敛。
-                if (loaded >= 2 && allocator.getAllocatedMemory() - baseAlloc >= inputCap) break;
+                if (loaded >= 2 && (allocator.getAllocatedMemory() - baseAlloc >= inputCap
+                        || allocator.getAllocatedMemory() >= hardLimit - headroom)) break;
                 Path srcPath = sources.get(cursor++);
                 FileChannel ch = FileChannel.open(srcPath, StandardOpenOption.READ);
-                ArrowFileReader r = new ArrowFileReader(ch, allocator);
+                ArrowFileReader r = SpillCompression.reader(ch, allocator);
                 List<ArrowBlock> blocks = r.getRecordBlocks();
                 if (blocks.isEmpty()) {
                     r.close();
@@ -1133,7 +1187,7 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
                             "p" + pid + "_c" + round + "_s" + start + ".arrow");
                     outCh = FileChannel.open(outFile, StandardOpenOption.CREATE,
                             StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
-                    outWriter = new ArrowFileWriter(outRoot, null, outCh);
+                    outWriter = SpillCompression.writer(outRoot, outCh);
                 }
                 Object curKey = curKeys[si];
                 // newGroup：curKey 与上一个 key 不同（含首行）。
@@ -1336,7 +1390,7 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
     private void streamBatchFile(PartitionState<RowAccumulator> pa, int batchIndex, int pid) {
         Path file = pa.batchFiles.get(batchIndex);
         try (FileChannel ch = FileChannel.open(file, StandardOpenOption.READ);
-             ArrowFileReader reader = new ArrowFileReader(ch, allocator)) {
+             ArrowFileReader reader = SpillCompression.reader(ch, allocator)) {
             Phase2Out out = new Phase2Out(pid);
             try {
                 for (ArrowBlock block : reader.getRecordBlocks()) {
@@ -1375,7 +1429,7 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
     private void streamBatchFileFlat(PartitionState<RowAccumulator> pa, int batchIndex, int pid) {
         Path file = pa.batchFiles.get(batchIndex);
         try (FileChannel ch = FileChannel.open(file, StandardOpenOption.READ);
-             ArrowFileReader reader = new ArrowFileReader(ch, allocator)) {
+             ArrowFileReader reader = SpillCompression.reader(ch, allocator)) {
             FlatOut out = new FlatOut(pid);
             try {
                 for (ArrowBlock block : reader.getRecordBlocks()) {

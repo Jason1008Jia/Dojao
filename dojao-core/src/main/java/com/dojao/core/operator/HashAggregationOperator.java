@@ -228,6 +228,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                     Path file = spillDirForWrite().resolve(
                             "p" + pid + "_b" + written.batchIndex() + "_d" + ord + ".arrow");
                     long bytes = writeArrowFile(file, droot);
+                    noteSpillFile();
                     pa.distinctFilesFor(ord).add(file);
                     synchronized (pa) { pa.dataFileSize += bytes; }
                     accountSpilledBytes(bytes);
@@ -360,7 +361,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
         // 再对 ≤ K 个顺串做流式 K 路归并输出，峰值 = 路数 × 单批 + 一个输出批，与总溢写量无关。
         List<Path> runPaths;
         boolean compacted;
-        if (fileCount > MAX_SCALAR_MERGE_K) {
+        if (shouldCompactScalarRuns(pa.batchFiles)) {
             runPaths = compactScalarRuns(pa.batchFiles, pa, pid, stateColCount);
             compacted = true;
         } else {
@@ -471,14 +472,43 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
     }
 
     /**
+     * 标量溢写流是否需要归并压缩：文件数超过路数上限（内存有界归并的前提），或平均文件大小低于
+     * {@code query.spill.minPartitionBytes} 下限（小文件风暴）—— 后者是单槽阈值被静态摊薄到几 MB
+     * 时的直接产物：每个分区溢出一串小文件，Phase 2 的打开路数与随机读被放大。
+     */
+    private boolean shouldCompactScalarRuns(List<Path> files) {
+        int n = files.size();
+        if (n > MAX_SCALAR_MERGE_K) return true;
+        if (n <= 1) return false;
+        long floor = ResourceConfig.spillMinPartitionBytes();
+        if (floor <= 0) return false;
+        return averageFileSize(files) < floor;
+    }
+
+    /** 顺串平均文件大小（读不到大小时返回 {@link Long#MAX_VALUE} = 不触发小文件合并）。 */
+    private static long averageFileSize(List<Path> files) {
+        if (files.isEmpty()) return 0;
+        long total = 0;
+        for (Path p : files) {
+            try {
+                total += Files.size(p);
+            } catch (IOException e) {
+                return Long.MAX_VALUE;
+            }
+        }
+        return total / files.size();
+    }
+
+    /**
      * 把标量溢写流的多个顺串归并成更少的顺串（可含多个 record batch），直至文件数 ≤
-     * {@link #MAX_SCALAR_MERGE_K}。每轮把 {@code laneCount} 个源并成一个文件，文件数至少按路数收敛。
+     * {@link #MAX_SCALAR_MERGE_K} 且平均文件大小不低于下限。每轮把 {@code laneCount} 个源并成一个文件，
+     * 文件数至少按路数收敛。
      */
     private List<Path> compactScalarRuns(List<Path> input, PartitionState<Slot> pa, int pid,
                                          int[] stateColCount) throws IOException {
         List<Path> runs = new ArrayList<>(input);
         int round = 0;
-        while (runs.size() > MAX_SCALAR_MERGE_K) {
+        while (runs.size() > MAX_SCALAR_MERGE_K || shouldCompactScalarRuns(runs)) {
             checkCancelled();
             List<Path> next = new ArrayList<>();
             int i = 0;
@@ -542,7 +572,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
 
             try (FileChannel outCh = FileChannel.open(outFile, StandardOpenOption.CREATE,
                     StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
-                 ArrowFileWriter writer = new ArrowFileWriter(out, null, outCh)) {
+                 ArrowFileWriter writer = SpillCompression.writer(out, outCh)) {
                 while (!pq.isEmpty()) {
                     checkCancelled();
                     Object minKey = runs.get(pq.peek()).key();
@@ -773,10 +803,9 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
         // 2) 标量流（键 + 标量状态）同样做内存有界的多轮归并压缩 + 流式游标。此前只把「去重值流」
         //    改成流式，标量流仍全量 loadBatchFromArrow —— 高基数分组键（group by user_id, device_type）
         //    + count(distinct) 时键本身就能溢写几百个文件，照样与溢写闸门同阶地 OOM。与纯标量路径同修。
-        int fileCount = pa.batchFiles.size();
         List<Path> runPaths;
         boolean compacted;
-        if (fileCount > MAX_SCALAR_MERGE_K) {
+        if (shouldCompactScalarRuns(pa.batchFiles)) {
             runPaths = compactScalarRuns(pa.batchFiles, pa, pid, stateColCount);
             compacted = true;
         } else {
@@ -1061,7 +1090,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
 
             try (FileChannel outCh = FileChannel.open(outFile, StandardOpenOption.CREATE,
                     StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
-                 ArrowFileWriter writer = new ArrowFileWriter(out, null, outCh)) {
+                 ArrowFileWriter writer = SpillCompression.writer(out, outCh)) {
                 while (!pq.isEmpty()) {
                     checkCancelled();
                     int ri = pq.poll();
@@ -1152,7 +1181,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
         ScalarRun(Path path) throws IOException {
             this.path = path;
             this.channel = FileChannel.open(path, StandardOpenOption.READ);
-            this.reader = new ArrowFileReader(channel, allocator);
+            this.reader = SpillCompression.reader(channel, allocator);
             this.blocks = reader.getRecordBlocks();
             if (loadNextBlock()) positionAtCurrentRow();
             else valid = false;
@@ -1223,7 +1252,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
             this.path = path;
             this.specIndex = specIndex;
             this.channel = FileChannel.open(path, StandardOpenOption.READ);
-            this.reader = new ArrowFileReader(channel, allocator);
+            this.reader = SpillCompression.reader(channel, allocator);
             this.blocks = reader.getRecordBlocks();
             this.valueCol = keyColumns.size();
             if (loadNextBlock()) positionAtCurrentRow();

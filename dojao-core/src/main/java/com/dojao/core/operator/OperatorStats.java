@@ -31,6 +31,10 @@ public class OperatorStats {
     private final AtomicLong currentMemoryBytes = new AtomicLong(0);
     private volatile long peakMemoryBytes;
     private final AtomicLong spilledBytes = new AtomicLong(0);
+    /** 已写出的溢写文件数（含归并重写产生的批次文件）——平均文件大小 = spilledBytes / spillFiles。 */
+    private final AtomicLong spillFiles = new AtomicLong(0);
+    /** 溢写触发次数（一个分区缓冲槽满 → 提交一次溢写 = 一次）。与 spillFiles 分开：归并会写文件但不触发。 */
+    private final AtomicLong spillTriggers = new AtomicLong(0);
 
     // CPU
     private final AtomicLong cpuTimeNanos = new AtomicLong(0);
@@ -109,6 +113,16 @@ public class OperatorStats {
         spilledBytes.addAndGet(bytes);
     }
 
+    /** 记一次溢写文件写出（含归并重写）。 */
+    void recordSpillFile() {
+        spillFiles.incrementAndGet();
+    }
+
+    /** 记一次溢写触发（分区缓冲槽达到阈值 → 提交溢写）。 */
+    void recordSpillTrigger() {
+        spillTriggers.incrementAndGet();
+    }
+
     // ==================== CPU ====================
 
     void recordCpuTime(long nanos) { cpuTimeNanos.addAndGet(nanos); }
@@ -131,6 +145,8 @@ public class OperatorStats {
     public long getCurrentMemoryBytes() { return currentMemoryBytes.get(); }
     public long getPeakMemoryBytes() { return peakMemoryBytes; }
     public long getSpilledBytes() { return spilledBytes.get(); }
+    public long getSpillFiles() { return spillFiles.get(); }
+    public long getSpillTriggers() { return spillTriggers.get(); }
     public long getCpuTimeNanos() { return cpuTimeNanos.get(); }
     public long getInputBytes() { return inputBytes.get(); }
     public long getOutputBytes() { return outputBytes.get(); }

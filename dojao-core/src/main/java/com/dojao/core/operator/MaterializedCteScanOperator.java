@@ -102,7 +102,7 @@ public final class MaterializedCteScanOperator extends AbstractMeasurableOperato
         List<FieldVector> copied = new ArrayList<>();
         boolean ok = false;
         try {
-            reader = new ArrowFileReader(ch, allocator);
+            reader = SpillCompression.reader(ch, allocator);
             List<ArrowBlock> blocks = reader.getRecordBlocks();
             if (blocks.isEmpty()) {
                 ok = true;

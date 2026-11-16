@@ -146,6 +146,24 @@ public final class ResourceConfig {
     public static final String QUERY_SPILL_DIR = "query.spill.dir";
     /** 溢写盘使用率上限（{@code query.spill.disk.maxUsage}，(0,1]）：达到即不再往该盘写。 */
     public static final String QUERY_SPILL_DISK_MAX_USAGE = "query.spill.disk.maxUsage";
+    /**
+     * 溢写 Arrow 文件压缩开关（{@code system.query.spill.compression}，兼容 {@code query.spill.compression}）。
+     *
+     * <p>只认 {@code true} / {@code false}，<b>默认开启</b>；压缩算法固定 <b>LZ4 frame</b>
+     * （Arrow IPC body compression，每 record batch 独立压缩）。见 {@code SpillCompression}。</p>
+     */
+    public static final String SYSTEM_QUERY_SPILL_COMPRESSION = "system.query.spill.compression";
+    /** 上述开关的兼容写法（{@code query.spill.compression}）。 */
+    public static final String QUERY_SPILL_COMPRESSION = "query.spill.compression";
+    /**
+     * 单分区单槽溢写阈值的<b>下限</b>（{@code query.spill.minPartitionBytes}，默认 16M）。
+     *
+     * <p>静态预算是「最坏并发」摊薄的结果：分区多 / 并行度高时，单槽阈值会被除到几 MB ——
+     * 每批数据刚攒起来就溢写，产生大量小文件与归并放大（「为了溢写而溢写」）。下限保证单槽至少
+     * 能装下一批量级的数据；同时受 {@code query.direct.limit} 硬约束（{@code P × 3槽 × 阈值}
+     * 不得超过单算子堆外上限），不会把内存撑爆。</p>
+     */
+    public static final String QUERY_SPILL_MIN_PARTITION_BYTES = "query.spill.minPartitionBytes";
     /** 单个溢写算子的 Arrow 直接内存上限（{@code query.direct.limit}，字节；0/未配 = 由 slot.memory 派生）。 */
     public static final String QUERY_DIRECT_LIMIT = "query.direct.limit";
     public static final String QUERY_DEFAULT_PARALLELISM = "query.default.parallelism";
@@ -274,10 +292,14 @@ public final class ResourceConfig {
     public static final long DEFAULT_SLOT_MEMORY_BYTES = 2L * 1024 * 1024 * 1024;
 
     public static final double DEFAULT_SPILL_RATIO = 0.8;
+    /** 单分区单槽溢写阈值下限默认 16M（一批数据量级）。 */
+    public static final long DEFAULT_SPILL_MIN_PARTITION_BYTES = 16L * 1024 * 1024;
     /** 默认溢写目录名（相对安装根目录）：{@code <DOJAO_HOME>/spill}。 */
     public static final String DEFAULT_SPILL_DIR_NAME = "spill";
     /** 默认溢写盘使用率上限 0.8：用满 80% 的盘不再承接溢写。 */
     public static final double DEFAULT_SPILL_DISK_MAX_USAGE = 0.8;
+    /** 溢写文件压缩默认开启：溢写是临时中间数据（字符串多、重复度高），LZ4 显著降低写盘量与盘占用。 */
+    public static final boolean DEFAULT_SPILL_COMPRESSION = true;
     /** 聚合 Phase 2 每批 key 数默认 50000（query.agg.perBatchKeys）。 */
     public static final int DEFAULT_AGG_PER_BATCH_KEYS = 50000;
     /** 聚合溢写归并每批 key 数默认 10000（query.agg.spill.perBatchKeys）。 */
@@ -778,6 +800,30 @@ public final class ResourceConfig {
     public static double spillRatio() {
         double d = doubleValue(QUERY_SPILL_RATIO, DEFAULT_SPILL_RATIO);
         return d > 0 && d <= 1 ? d : DEFAULT_SPILL_RATIO;
+    }
+
+    /** 单分区单槽溢写阈值下限（{@code query.spill.minPartitionBytes}，默认 16M，可为 0 = 不设下限）。 */
+    public static long spillMinPartitionBytes() {
+        long v = sizeValue(QUERY_SPILL_MIN_PARTITION_BYTES, DEFAULT_SPILL_MIN_PARTITION_BYTES);
+        return Math.max(0L, v);
+    }
+
+    /**
+     * 溢写 Arrow 文件是否压缩（{@code system.query.spill.compression}，兼容 {@code query.spill.compression}）。
+     *
+     * <p>只认 {@code true} / {@code false}，默认 {@link #DEFAULT_SPILL_COMPRESSION}（开启）；
+     * 除 {@code false} 外一律按开启处理（与全仓其它布尔开关同口径，容忍笔误不至于静默退回大文件）。
+     * 压缩算法固定 LZ4 frame，见 {@code com.dojao.core.operator.SpillCompression}。</p>
+     */
+    public static boolean spillCompressionEnabled() {
+        String v = value(SYSTEM_QUERY_SPILL_COMPRESSION, null);
+        if (v == null || v.isBlank()) {
+            v = value(QUERY_SPILL_COMPRESSION, null);
+        }
+        if (v == null || v.isBlank()) {
+            return DEFAULT_SPILL_COMPRESSION;
+        }
+        return !"false".equalsIgnoreCase(v.trim());
     }
 
     /**

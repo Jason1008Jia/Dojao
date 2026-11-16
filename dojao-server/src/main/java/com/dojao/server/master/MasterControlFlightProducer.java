@@ -203,7 +203,8 @@ public final class MasterControlFlightProducer implements FlightProducer {
                 appliedGroups++;
                 for (QueryFragmentTelemetryMsg frag : group.getFragmentsList()) {
                     qm.acceptFragmentTelemetry(frag.getTaskId(), frag.getRowsEmitted(),
-                            frag.getBytesIn(), frag.getBytesOut(), frag.getSpilledBytes(), frag.getDone());
+                            frag.getBytesIn(), frag.getBytesOut(), frag.getSpilledBytes(),
+                            frag.getSpillFiles(), frag.getSpillTriggers(), frag.getDone());
                     appliedFrags++;
                 }
             }

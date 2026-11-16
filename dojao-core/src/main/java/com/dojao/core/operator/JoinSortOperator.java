@@ -621,7 +621,7 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
                 if (loaded >= 2 && allocator.getAllocatedMemory() >= inputCap) break;
                 Path srcPath = sources.get(cursor++);
                 FileChannel ch = FileChannel.open(srcPath, StandardOpenOption.READ);
-                ArrowFileReader r = new ArrowFileReader(ch, allocator);
+                ArrowFileReader r = SpillCompression.reader(ch, allocator);
                 List<ArrowBlock> blocks = r.getRecordBlocks();
                 if (blocks.isEmpty()) { r.close(); ch.close(); continue; }
                 blockLists[loaded] = blocks;
@@ -667,7 +667,7 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
                             "p" + pid + "_c" + round + "_s" + start + ".arrow");
                     outCh = FileChannel.open(outFile, StandardOpenOption.CREATE,
                             StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
-                    outWriter = new ArrowFileWriter(outRoot, null, outCh);
+                    outWriter = SpillCompression.writer(outRoot, outCh);
                 }
 
                 // 缓冲满 → 立即落一个 batch，<b>不要求 key 换组</b>。

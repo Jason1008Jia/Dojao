@@ -49,6 +49,13 @@ function setTextIfChanged(el, text) {
     if (el && el.textContent !== text) el.textContent = text;
 }
 
+/** 溢写平均文件大小副标题：调参判断「阈值是否过低 / 是否小文件风暴」的直接依据。 */
+function spillAvgText(op) {
+    var files = Number(op.spillFiles) || 0;
+    var bytes = Number(op.spilledBytes) || 0;
+    return files > 0 ? '平均 ' + fmtBytes(bytes / files) : '无文件';
+}
+
 /** 算子详情指标卡：带 data-metric 键，轮询时可原地刷新数值而不重建 DOM。 */
 function opCard(key, label, value, sub, cls) {
     return '<div class="metric-card ' + (cls || '') + '" data-metric="' + key + '">'
@@ -125,6 +132,8 @@ function refreshLiveOperator() {
             + opCard('cpu', 'CPU', fmtDuration(op.cpuMs), '', '')
             + opCard('mem', 'Memory', fmtBytes(op.currentMemBytes), '峰值 ' + fmtBytes(op.peakMemBytes), '')
             + opCard('spilled', 'Spilled', op.spilledBytes > 0 ? fmtBytes(op.spilledBytes) : '\u2014', '溢写总量', '')
+            + opCard('spillFiles', 'Spill Files', op.spillFiles > 0 ? fmtRows(op.spillFiles) : '\u2014', spillAvgText(op), '')
+            + opCard('spillTrig', 'Spill Triggers', op.spillTriggers > 0 ? fmtRows(op.spillTriggers) : '\u2014', '槽满 → 提交溢写', '')
             + '</div></div>'
             + '<div class="section"><div class="section-title">分布式任务（' + tasks.length + '）</div>'
             + '<div class="task-list2" id="task-list-container"></div>'
@@ -146,6 +155,8 @@ function refreshLiveOperator() {
     setMetric(body, 'cpu', fmtDuration(op.cpuMs));
     setMetric(body, 'mem', fmtBytes(op.currentMemBytes), '峰值 ' + fmtBytes(op.peakMemBytes));
     setMetric(body, 'spilled', op.spilledBytes > 0 ? fmtBytes(op.spilledBytes) : '\u2014');
+    setMetric(body, 'spillFiles', op.spillFiles > 0 ? fmtRows(op.spillFiles) : '\u2014', spillAvgText(op));
+    setMetric(body, 'spillTrig', op.spillTriggers > 0 ? fmtRows(op.spillTriggers) : '\u2014');
 
     // 保持原先分页位置
     var keepPage = window._taskPage || 0;
