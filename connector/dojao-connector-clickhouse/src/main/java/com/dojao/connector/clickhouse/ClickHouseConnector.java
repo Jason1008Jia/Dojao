@@ -47,6 +47,16 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
 
+    /**
+     * 读查询的服务端块大小上限（{@code SETTINGS max_block_size}）。
+     *
+     * <p>CK 服务端按块返回结果，块大小默认 65409 行；宽行表（如 ES 原始 JSON 存 {@code String}）
+     * 一块就可能几百 MB，JDBC 驱动按块解码时直接 {@code OutOfMemoryError: Java heap space}。
+     * 压到 4096 行让驱动与转换器的临时内存都跟着受控 —— {@code setFetchSize} 只能给驱动提示，
+     * 真正决定块大小的是服务端这个设置。</p>
+     */
+    private static final int READ_MAX_BLOCK_SIZE = 4096;
+
     /** 此连接器的 catalog 名称（对外暴露的 catalog 标识）。 */
     private final String catalogName;
 
@@ -690,7 +700,7 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
                 readConnection = getConnection();
                 readPreparedStatement = readConnection.prepareStatement(sql);
                 // 正数 fetchSize → ClickHouse JDBC 走流式结果集（边读边拉，不全量物化）
-                readPreparedStatement.setFetchSize(CommonConfig.DEFAULT_BATCH_SIZE);
+                readPreparedStatement.setFetchSize(READ_MAX_BLOCK_SIZE);
                 readResultSet = readPreparedStatement.executeQuery();
                 readConverter = new JdbcArrowConverter(allocator, CommonConfig.DEFAULT_BATCH_SIZE);
                 activeReadSql = sql;
@@ -809,6 +819,8 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
         if (request.offset() > 0) {
             sql.append(" OFFSET ").append(request.offset());
         }
+        // 服务端块大小必须显式压小，见 READ_MAX_BLOCK_SIZE（宽行表按默认块解码 = 爆 Java 堆）
+        sql.append(" SETTINGS max_block_size=").append(READ_MAX_BLOCK_SIZE);
         return sql.toString();
     }
 

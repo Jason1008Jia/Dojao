@@ -19,7 +19,9 @@ import org.apache.hadoop.hive.metastore.api.TableValidWriteIds;
 import org.apache.hadoop.hive.metastore.api.TxnInfo;
 import org.apache.hadoop.hive.metastore.api.TxnState;
 import org.apache.hadoop.hive.metastore.api.Database;
+import org.apache.hadoop.security.UserGroupInformation;
 
+import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
@@ -62,6 +64,8 @@ public class HiveMetastore implements AutoCloseable {
     private final boolean acidRead;
     /** 只有 Hive2 需要 txn-id 快照（Hive3 用 write-id 快照），故记版本。 */
     private final HiveVersion version;
+    /** catalog 的 Hadoop 访问身份（{@code hadoop.user.name}）；null = 用进程默认 UGI。 */
+    private final String user;
 
     private final Map<String, HiveTableMeta> tableCache = new ConcurrentHashMap<>();
 
@@ -69,14 +73,30 @@ public class HiveMetastore implements AutoCloseable {
 
     public HiveMetastore(String catalogName, String uris, Configuration conf, boolean acidRead,
                          HiveVersion version) {
+        this(catalogName, uris, conf, acidRead, version, null);
+    }
+
+    /**
+     * @param user Hadoop 访问身份（catalog 属性 {@code hadoop.user.name}），可为 null。
+     *             非空时 HMS 连接在 {@code createRemoteUser(user).doAs(...)} 里建立 ——
+     *             {@link HiveMetaStoreClient} 建连会对连接执行 {@code set_ugi(用户, 组)}，
+     *             HMS 之后所有 HDFS 权限检查都按这个身份执行（HMS 侧按连接记住，后续 RPC 无需
+     *             再次 doAs）。null 则沿用进程默认 UGI（{@code HADOOP_USER_NAME} / OS 用户）。
+     */
+    public HiveMetastore(String catalogName, String uris, Configuration conf, boolean acidRead,
+                         HiveVersion version, String user) {
         this.catalogName = catalogName;
         this.uris = uris;
         this.conf = conf;
         this.acidRead = acidRead;
         this.version = version;
+        this.user = user == null || user.isBlank() ? null : user.trim();
     }
 
     public String uris() { return uris; }
+
+    /** catalog 声明的 Hadoop 访问身份；null = 进程默认（见构造器 javadoc）。 */
+    public String user() { return user; }
 
     /** 是否已开启 ACID 表读取（catalog 属性 {@code hive.acid.read}）。 */
     public boolean acidReadEnabled() { return acidRead; }
@@ -93,9 +113,14 @@ public class HiveMetastore implements AutoCloseable {
             if (client == null) {
                 conf.set("hive.metastore.uris", uris);
                 try {
-                    client = new HiveMetaStoreClient(conf);
+                    client = user == null
+                            ? new HiveMetaStoreClient(conf)
+                            : UserGroupInformation.createRemoteUser(user).doAs(
+                                    (PrivilegedExceptionAction<HiveMetaStoreClient>)
+                                            () -> new HiveMetaStoreClient(conf));
                 } catch (Exception e) {
-                    throw new IllegalStateException("连接 Hive MetaStore 失败: " + uris, e);
+                    throw new IllegalStateException("连接 Hive MetaStore 失败: " + uris
+                            + (user == null ? "" : "（Hadoop 访问身份: " + user + "）"), e);
                 }
             }
             return client;
@@ -285,6 +310,77 @@ public class HiveMetastore implements AutoCloseable {
             }
         }
         return new ValidReadTxnList(exceptions, abortedBits, hwm, minOpen);
+    }
+
+    // ==================== ACID 写事务 ====================
+    //
+    // 与上面的「读快照」对称：写侧也按版本分流 —— Hive3 有独立的 writeId（openTxn +
+    // allocateTableWriteId），Hive2 没有 writeId 概念，事务 id 本身就是目录 / 行标识里的 id。
+
+    /**
+     * 打开一个写事务（HMS {@code open_txns}），返回事务 id。
+     *
+     * <p>用批量版 RPC（{@code open_txns}）而非已废弃的单事务接口 —— Hive 2.3+ / 3.x 都支持，
+     * 老于 2.3 的 HMS 会直接报 unknown method。</p>
+     */
+    public synchronized long openTxn(String user) {
+        try {
+            return client().openTxn(user);
+        } catch (Exception e) {
+            throw new RuntimeException("打开 Hive ACID 写事务失败（需 HMS 支持 open_txns）", e);
+        }
+    }
+
+    /**
+     * 在事务下为该表取<b>写 id</b>。
+     *
+     * <p>Hive3 走 HMS {@code allocate_write_id}；<b>Hive2 没有 writeId 概念</b>，事务 id 即目录 /
+     * 行标识里的 id，直接返回 {@code txnId}。调用方拿到的这个 id 统称 {@code acidId}
+     * （见 {@link HiveAcidLayout#deltaDirName(long)}）。</p>
+     */
+    public synchronized long allocateWriteId(long txnId, String database, String table) {
+        if (hive2()) return txnId;
+        try {
+            return client().allocateTableWriteId(txnId, database, table);
+        } catch (Exception e) {
+            throw new RuntimeException("获取 Hive ACID 写 id 失败: " + database + "." + table
+                    + "（需要 Hive 3.x 及以上 HMS；hive2 catalog 不做这一步）", e);
+        }
+    }
+
+    /** 提交写事务 —— 提交后本次写出的 delta 目录才对读者可见。 */
+    public synchronized void commitTxn(long txnId) {
+        try {
+            client().commitTxn(txnId);
+        } catch (Exception e) {
+            throw new RuntimeException("提交 Hive ACID 写事务失败（事务 " + txnId + "）", e);
+        }
+    }
+
+    /** 回滚写事务（失败 / 取消时清理）。事务已不存在（超时被 HMS 回收）视为成功。 */
+    public synchronized void rollbackTxn(long txnId) {
+        try {
+            client().rollbackTxn(txnId);
+        } catch (org.apache.hadoop.hive.metastore.api.NoSuchTxnException e) {
+            // 事务早已超时 / 被回滚 → 目标状态已达成
+        } catch (Exception e) {
+            throw new RuntimeException("回滚 Hive ACID 写事务失败（事务 " + txnId + "）", e);
+        }
+    }
+
+    /**
+     * 事务保活（HMS {@code heartbeat}）。长写（大 INSERT）超过 {@code hive.txn.timeout}
+     * 会被 HMS 判为超时并回滚，写侧须定时心跳。
+     *
+     * <p>心跳失败一律吞掉：真正的失败由随后的 {@code commitTxn} 响亮报出，心跳线程不该把
+     * 写线程打断在 HDFS 上。</p>
+     */
+    public synchronized void heartbeatTxn(long txnId) {
+        try {
+            client().heartbeat(txnId, 0L);
+        } catch (Exception ignored) {
+            // 见 javadoc：commit 阶段兜底报错
+        }
     }
 
     private HiveTableMeta translate(String database, String table, Table t) {

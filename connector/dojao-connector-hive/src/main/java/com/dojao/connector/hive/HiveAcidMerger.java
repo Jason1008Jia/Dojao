@@ -104,10 +104,20 @@ final class HiveAcidMerger {
     static Result mergeGroup(String root, List<String> paths, HiveTableMeta meta,
                              BufferAllocator allocator, Configuration conf, int batchSize,
                              boolean nestedNative) {
+        return mergeGroup(root, paths, meta, allocator, conf, batchSize, nestedNative, null);
+    }
+
+    /**
+     * @param fs 调用方按 <b>catalog 身份</b>取得的文件系统（见 {@code HiveConnector#fsOf}）；
+     *           {@code null} = 退化为 {@code path.getFileSystem(conf)}（进程默认 UGI）
+     */
+    static Result mergeGroup(String root, List<String> paths, HiveTableMeta meta,
+                             BufferAllocator allocator, Configuration conf, int batchSize,
+                             boolean nestedNative, FileSystem fs) {
         Stager stager = new Stager(meta.dataFields(nestedNative), allocator, batchSize, nestedNative);
         try {
             for (String p : paths) {
-                stager.readFile(p, meta, conf, batchSize);
+                stager.readFile(p, meta, conf, batchSize, fs);
             }
             return stager.finish(root);
         } finally {
@@ -143,12 +153,19 @@ final class HiveAcidMerger {
         }
 
         void readFile(String path, HiveTableMeta meta, Configuration conf, int batchSize) {
+            readFile(path, meta, conf, batchSize, null);
+        }
+
+        void readFile(String path, HiveTableMeta meta, Configuration conf, int batchSize,
+                      FileSystem catalogFs) {
             Path p = new Path(path);
-            FileSystem fs;
-            try {
-                fs = p.getFileSystem(conf);
-            } catch (IOException e) {
-                throw new RuntimeException("取 Hive ACID 文件 FileSystem 失败: " + path, e);
+            FileSystem fs = catalogFs;
+            if (fs == null) {
+                try {
+                    fs = p.getFileSystem(conf);
+                } catch (IOException e) {
+                    throw new RuntimeException("取 Hive ACID 文件 FileSystem 失败: " + path, e);
+                }
             }
             try (Reader reader = OrcFile.createReader(p, OrcFile.readerOptions(conf).filesystem(fs))) {
                 TypeDescription schema = reader.getSchema();

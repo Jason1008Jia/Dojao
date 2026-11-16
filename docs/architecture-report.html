@@ -1,0 +1,1112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dojao 技术架构汇报 · 从 AI 智能层到分布式执行层</title>
+<style>
+  :root {
+    --ink: #0f172a;
+    --ink-2: #1e293b;
+    --muted: #64748b;
+    --faint: #94a3b8;
+    --line: #e2e8f0;
+    --line-2: #cbd5e1;
+    --bg: #f6f8fb;
+    --card: #ffffff;
+    --accent: #2563eb;
+    --accent-2: #7c3aed;
+    --accent-soft: #eff4ff;
+    --green: #059669;
+    --green-soft: #ecfdf5;
+    --amber: #d97706;
+    --amber-soft: #fffbeb;
+    --red: #dc2626;
+    --red-soft: #fef2f2;
+    --slate-soft: #f1f5f9;
+    --shadow: 0 1px 2px rgba(15, 23, 42, .06), 0 8px 24px rgba(15, 23, 42, .05);
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB", system-ui, -apple-system, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+    line-height: 1.75;
+    font-size: 15px;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  code {
+    font-family: ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace;
+    font-size: .88em;
+    background: var(--slate-soft);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 1px 5px;
+  }
+  .page { max-width: 1180px; margin: 0 auto; padding: 0 28px 90px; }
+
+  /* ---------- 封面 ---------- */
+  .hero {
+    margin: 0 -28px 44px;
+    padding: 64px 56px 52px;
+    color: #e8eefc;
+    background:
+      radial-gradient(1200px 420px at 85% -10%, rgba(37, 99, 235, .45), transparent 60%),
+      radial-gradient(900px 360px at 0% 110%, rgba(124, 58, 237, .35), transparent 55%),
+      linear-gradient(135deg, #0b1220 0%, #13203d 55%, #1b2a52 100%);
+  }
+  .hero .kicker {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 12.5px; letter-spacing: .12em; text-transform: uppercase;
+    color: #9fb4e6; border: 1px solid rgba(159, 180, 230, .35);
+    padding: 5px 12px; border-radius: 999px;
+  }
+  .hero h1 {
+    margin: 20px 0 10px; font-size: 40px; line-height: 1.25;
+    letter-spacing: .01em; color: #fff; font-weight: 700;
+  }
+  .hero h1 .thin { color: #a9bdf0; font-weight: 400; }
+  .hero .lede {
+    max-width: 880px; margin: 0 0 30px; font-size: 16.5px; color: #b9c8ea;
+  }
+  .hero .meta { display: flex; flex-wrap: wrap; gap: 8px 26px; font-size: 13px; color: #8fa4d4; }
+  .stats {
+    display: grid; grid-template-columns: repeat(6, 1fr); gap: 14px;
+    margin-top: 38px;
+  }
+  .stat {
+    background: rgba(255, 255, 255, .06);
+    border: 1px solid rgba(255, 255, 255, .12);
+    border-radius: 12px; padding: 16px 18px;
+    backdrop-filter: blur(2px);
+  }
+  .stat b { display: block; font-size: 26px; line-height: 1.2; color: #fff; font-weight: 700; }
+  .stat span { display: block; margin-top: 4px; font-size: 12.5px; color: #9db1de; }
+
+  /* ---------- 导航 ---------- */
+  .toc {
+    position: sticky; top: 0; z-index: 20;
+    margin: 0 -28px 40px; padding: 10px 28px;
+    background: rgba(246, 248, 251, .92);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line);
+    display: flex; gap: 6px; overflow-x: auto;
+  }
+  .toc a {
+    flex: none; padding: 6px 12px; border-radius: 8px;
+    font-size: 13px; color: var(--muted); white-space: nowrap;
+  }
+  .toc a:hover { background: var(--accent-soft); color: var(--accent); }
+
+  /* ---------- 通用 ---------- */
+  section { margin: 0 0 56px; scroll-margin-top: 60px; }
+  .sec-head { display: flex; align-items: baseline; gap: 14px; margin-bottom: 8px; }
+  .sec-no {
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 13px; color: var(--accent);
+    background: var(--accent-soft); border: 1px solid #dbe6ff;
+    border-radius: 7px; padding: 2px 9px;
+  }
+  h2 { margin: 0; font-size: 25px; letter-spacing: .01em; }
+  .sec-desc { margin: 0 0 22px; color: var(--muted); max-width: 900px; }
+  h3 { margin: 30px 0 12px; font-size: 18px; }
+  h3 .tag {
+    display: inline-block; margin-left: 8px; vertical-align: 2px;
+    font-size: 11px; font-weight: 600; color: var(--accent);
+    background: var(--accent-soft); border-radius: 999px; padding: 2px 9px;
+  }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0; padding-left: 22px; }
+  li { margin: 5px 0; }
+
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: var(--radius); box-shadow: var(--shadow);
+    padding: 22px 24px;
+  }
+  .grid { display: grid; gap: 16px; }
+  .g2 { grid-template-columns: repeat(2, 1fr); }
+  .g3 { grid-template-columns: repeat(3, 1fr); }
+  .g4 { grid-template-columns: repeat(4, 1fr); }
+  @media (max-width: 920px) {
+    .g2, .g3, .g4 { grid-template-columns: 1fr; }
+    .stats { grid-template-columns: repeat(3, 1fr); }
+    .hero { padding: 46px 30px 40px; }
+    .hero h1 { font-size: 30px; }
+  }
+
+  /* ---------- 总体架构图（Draw.io 风格内联 SVG） ---------- */
+  .diagram {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 14px; box-shadow: var(--shadow);
+    padding: 14px 14px 6px; margin: 18px 0 6px; overflow-x: auto;
+  }
+  .diagram svg { display: block; width: 100%; min-width: 880px; height: auto; }
+  .diagram figcaption {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: center;
+    gap: 8px 22px; padding: 10px 6px 8px; color: var(--muted); font-size: 12.5px;
+  }
+  .lg { display: inline-flex; align-items: center; gap: 7px; }
+  .lg .sw-line { width: 30px; height: 0; border-top: 2px solid #6c8ebf; }
+  .lg .sw-dash { width: 30px; height: 0; border-top: 2px dashed #7c3aed; }
+  .lg .sw-both { width: 30px; height: 0; border-top: 2px solid #82b366; }
+  .lg .sw-cyl {
+    width: 16px; height: 12px; border: 1.5px solid #d79b00;
+    border-radius: 50% / 26%; background: #ffe6cc;
+  }
+
+  /* ---------- 流程 ---------- */
+  .flow { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  .flow.six { grid-template-columns: repeat(3, 1fr); }
+  @media (max-width: 920px) { .flow { grid-template-columns: 1fr 1fr; } .flow.six { grid-template-columns: 1fr 1fr; } }
+  .step {
+    position: relative; background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 16px 16px 14px 16px; box-shadow: var(--shadow);
+  }
+  .step .n {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; border-radius: 50%;
+    background: var(--accent); color: #fff; font-size: 12.5px; font-weight: 700;
+    margin-bottom: 8px;
+  }
+  .step b { display: block; font-size: 14px; margin-bottom: 4px; }
+  .step span { font-size: 12.5px; color: var(--muted); display: block; }
+  .step .where {
+    display: inline-block; margin-top: 8px; font-size: 11px;
+    color: var(--accent); background: var(--accent-soft);
+    border-radius: 999px; padding: 1px 8px;
+  }
+
+  /* ---------- 表格 ---------- */
+  .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; background: var(--card); box-shadow: var(--shadow); }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  thead th {
+    text-align: left; padding: 12px 16px; background: var(--slate-soft);
+    border-bottom: 1px solid var(--line); color: var(--ink-2);
+    font-weight: 600; white-space: nowrap;
+  }
+  tbody td { padding: 11px 16px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: #fbfdff; }
+  td .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+
+  /* ---------- 要点卡 ---------- */
+  .point { border-left: 3px solid var(--accent); background: var(--card); border-radius: 0 12px 12px 0; padding: 14px 18px; box-shadow: var(--shadow); }
+  .point b { display: block; margin-bottom: 2px; }
+  .point span { color: var(--muted); font-size: 13.5px; }
+  .point.green { border-left-color: var(--green); }
+  .point.amber { border-left-color: var(--amber); }
+  .point.violet { border-left-color: var(--accent-2); }
+
+  .callout {
+    border: 1px solid #dbe6ff; background: linear-gradient(180deg, #f7faff, #ffffff);
+    border-radius: 12px; padding: 16px 20px; margin: 18px 0;
+  }
+  .callout .t { font-size: 12px; font-weight: 700; letter-spacing: .08em; color: var(--accent); text-transform: uppercase; margin-bottom: 4px; }
+  .callout p { margin: 4px 0; }
+
+  .kv { display: grid; grid-template-columns: 130px 1fr; gap: 8px 16px; font-size: 13.5px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; }
+
+  .pill { display: inline-block; font-size: 11.5px; padding: 1px 9px; border-radius: 999px; margin-right: 6px; }
+  .pill.blue { background: var(--accent-soft); color: var(--accent); }
+  .pill.green { background: var(--green-soft); color: var(--green); }
+  .pill.amber { background: var(--amber-soft); color: var(--amber); }
+  .pill.red { background: var(--red-soft); color: var(--red); }
+
+  footer {
+    margin-top: 70px; padding-top: 22px; border-top: 1px solid var(--line);
+    color: var(--faint); font-size: 12.5px; display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  }
+
+  @media print {
+    body { background: #fff; font-size: 12.5px; }
+    .toc { display: none; }
+    .hero { margin: 0 0 26px; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .card, .step, .diagram, .table-wrap, .point { break-inside: avoid; box-shadow: none; }
+    section { margin-bottom: 30px; }
+    .page { max-width: none; padding: 0 8mm 10mm; }
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="kicker">DOJAO · 产品介绍</div>
+  <h1>从提问到结论<br><span class="thin">面向 AI 时代的联邦数据分析平台</span></h1>
+  <p class="lede">
+    用一句话提问，或写一条 SQL，就能同时分析散落在多个业务系统里的数据 —— 不用先把数据搬进数仓。
+    内置的 AI 分析师会把问题拆成步骤：找表、写查询、先试跑、出图、讲结论、导出文件；
+    数据不动、计算汇聚，从个人单机到团队集群，同一套产品覆盖从探索到交付的完整分析过程。
+  </p>
+  <div class="meta">
+    <span>版本：v0.2</span>
+    <span>日期：2026-11</span>
+    <span>读者：产品 / 业务 / 管理层</span>
+  </div>
+  <div class="stats">
+    <div class="stat"><b>9</b><span>类数据源开箱即用</span></div>
+    <div class="stat"><b>13</b><span>个内置 AI 工具</span></div>
+    <div class="stat"><b>11</b><span>类可视化图表</span></div>
+    <div class="stat"><b>8</b><span>种结果导出格式</span></div>
+    <div class="stat"><b>16</b><span>步单轮推理上限</span></div>
+    <div class="stat"><b>3</b><span>类角色各取所需</span></div>
+  </div>
+</header>
+
+<div class="page">
+
+<nav class="toc">
+  <a href="#position">产品定位</a>
+  <a href="#arch">产品架构</a>
+  <a href="#users">目标用户与场景</a>
+  <a href="#features">核心能力</a>
+  <a href="#journey">使用旅程</a>
+  <a href="#ai">AI 能力 · 重点</a>
+  <a href="#memory">大查询保障</a>
+  <a href="#compare">竞争与差异化</a>
+  <a href="#next">路线图</a>
+</nav>
+
+<!-- ============================================================ -->
+<section id="position">
+  <div class="sec-head"><span class="sec-no">01</span><h2>产品定位与核心价值</h2></div>
+  <p class="sec-desc">一句话：不是又一个数据库，也不是又一个 BI 报表工具，而是「数据不动、计算汇聚」的分析平台 —— 原生带一个懂数据、会动手的 AI 分析师。</p>
+
+  <div class="grid g3">
+    <div class="card">
+      <h3 style="margin-top:0">数据不搬家<span class="tag">核心</span></h3>
+      <p style="color:var(--muted);font-size:13.5px">订单在 MySQL、库存在 PostgreSQL、流水在 ClickHouse —— 一条查询直接跨库分析，
+      不需要先建数仓、不需要每晚抽数同步。减少一条数据链路，就少一份不一致与运维成本。</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">会动手的 AI 分析师<span class="tag">差异化</span></h3>
+      <p style="color:var(--muted);font-size:13.5px">说人话就能问数：AI 自动找表、生成并执行只读查询、画图、导出文件、解释结论。
+      涉及改表等写操作时，必须由你点头确认。</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">大查询也能跑完<span class="tag">稳定性</span></h3>
+      <p style="color:var(--muted);font-size:13.5px">内存吃紧时自动把中间结果落到磁盘继续计算，而不是直接报错。
+      优先保证「按时拿到结果」，单条查询出问题也不拖垮整个集群。</p>
+    </div>
+  </div>
+
+  <div class="grid g4" style="margin-top:16px">
+    <div class="point"><b>开箱即用</b><span>一个安装包即可在本机跑起来，个人分析无需申请集群；团队要扩再横向加机器。</span></div>
+    <div class="point green"><b>一种语法，所有数据源</b><span>统一命名与统一的 SQL 体验，跨源关联像查一张表。</span></div>
+    <div class="point amber"><b>过程看得见</b><span>每一步在做什么、跑到哪、占多少资源，界面实时可见，随时可以叫停。</span></div>
+    <div class="point violet"><b>安全可控</b><span>默认只读、写操作人工确认、按角色授权、数据按账号隔离。</span></div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="arch">
+  <div class="sec-head"><span class="sec-no">02</span><h2>产品架构：一张图看懂它如何运转</h2></div>
+  <p class="sec-desc">用户从网页、命令行或常用 BI / 数据库工具进入；AI 助手帮助把问题变成查询；调度中心负责规划并把计算分发给多台机器；
+      底层直接连接各类数据源。用户只看到「提问 → 结果」，中间过程被产品隐藏。</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 1200 1170" role="img" aria-labelledby="archTitle archDesc"
+         font-family="'Segoe UI','PingFang SC','Microsoft YaHei',system-ui,sans-serif">
+      <title id="archTitle">Dojao 总体架构图</title>
+      <desc id="archDesc">自上而下：接入层、AI 智能层（产品核心：多步推理、意图理解、数据发现、SQL 生成校验、执行观测、图表解读、安全护栏）、查询服务层、分布式执行层、数据与元数据层、运行时底座。</desc>
+
+      <defs>
+        <pattern id="dotgrid" width="16" height="16" patternUnits="userSpaceOnUse">
+          <circle cx="1.5" cy="1.5" r="1" fill="#dbe4ef"/>
+        </pattern>
+        <filter id="softShadow" x="-20%" y="-20%" width="150%" height="160%">
+          <feDropShadow dx="0" dy="1.5" stdDeviation="2" flood-color="#0f172a" flood-opacity="0.12"/>
+        </filter>
+        <marker id="arwGray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#64748b"/>
+        </marker>
+        <marker id="arwBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#5b8ab8"/>
+        </marker>
+        <marker id="arwGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#7aab7c"/>
+        </marker>
+        <marker id="arwViolet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/>
+        </marker>
+      </defs>
+
+      <!-- 画布与网格 -->
+      <rect x="0" y="0" width="1200" height="1170" rx="12" fill="#fbfdff"/>
+      <rect x="0" y="0" width="1200" height="1170" rx="12" fill="url(#dotgrid)"/>
+
+      <!-- ============ 接入层 ============ -->
+      <rect x="20" y="24" width="520" height="118" rx="10" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.4" filter="url(#softShadow)"/>
+      <text x="36" y="48" font-size="13" font-weight="650" fill="#475569">接入层 · ENTRY</text>
+
+      <rect x="36" y="64" width="115" height="48" rx="6" fill="#e2e8f0" stroke="#94a3b8"/>
+      <text x="93.5" y="84" font-size="12" font-weight="600" text-anchor="middle" fill="#334155">Web 控制台</text>
+      <text x="93.5" y="100" font-size="10" text-anchor="middle" fill="#64748b">SQL · 监控 · AI</text>
+
+      <rect x="160" y="64" width="115" height="48" rx="6" fill="#e2e8f0" stroke="#94a3b8"/>
+      <text x="217.5" y="84" font-size="12" font-weight="600" text-anchor="middle" fill="#334155">CLI</text>
+      <text x="217.5" y="100" font-size="10" text-anchor="middle" fill="#64748b">命令行</text>
+
+      <rect x="284" y="64" width="115" height="48" rx="6" fill="#e2e8f0" stroke="#94a3b8"/>
+      <text x="341.5" y="84" font-size="12" font-weight="600" text-anchor="middle" fill="#334155">JDBC</text>
+      <text x="341.5" y="100" font-size="10" text-anchor="middle" fill="#64748b">标准驱动</text>
+
+      <rect x="408" y="64" width="115" height="48" rx="6" fill="#e2e8f0" stroke="#94a3b8"/>
+      <text x="465.5" y="84" font-size="12" font-weight="600" text-anchor="middle" fill="#334155">HTTP / REST</text>
+      <text x="465.5" y="100" font-size="10" text-anchor="middle" fill="#64748b">查询与管理接口</text>
+
+      <!-- ============ AI 智能层（产品核心，放大展示） ============ -->
+      <rect x="560" y="24" width="620" height="282" rx="10" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1.8" filter="url(#softShadow)"/>
+      <text x="576" y="48" font-size="13" font-weight="650" fill="#6d28d9">AI 智能层 · 产品核心</text>
+      <text x="1164" y="48" font-size="9.5" text-anchor="end" fill="#7c3aed">推理内核 + 业务能力 + 安全护栏</text>
+
+      <!-- 第一行：思考与编排 -->
+      <rect x="576" y="64" width="138" height="48" rx="6" fill="#ede9fe" stroke="#8b5cf6"/>
+      <text x="645" y="84" font-size="11.5" font-weight="600" text-anchor="middle" fill="#4c1d95">推理内核</text>
+      <text x="645" y="100" font-size="9.5" text-anchor="middle" fill="#6d28d9">多步推理 · 流式输出 · 可中断</text>
+
+      <rect x="726" y="64" width="138" height="48" rx="6" fill="#ede9fe" stroke="#8b5cf6"/>
+      <text x="795" y="84" font-size="11.5" font-weight="600" text-anchor="middle" fill="#4c1d95">意图理解</text>
+      <text x="795" y="100" font-size="9.5" text-anchor="middle" fill="#6d28d9">指标 · 维度 · 时间 · 口径</text>
+
+      <rect x="876" y="64" width="138" height="48" rx="6" fill="#ede9fe" stroke="#8b5cf6"/>
+      <text x="945" y="84" font-size="11.5" font-weight="600" text-anchor="middle" fill="#4c1d95">数据发现</text>
+      <text x="945" y="100" font-size="9.5" text-anchor="middle" fill="#6d28d9">找库表 · 看字段 · 查函数</text>
+
+      <rect x="1026" y="64" width="138" height="48" rx="6" fill="#ede9fe" stroke="#8b5cf6"/>
+      <text x="1095" y="84" font-size="11.5" font-weight="600" text-anchor="middle" fill="#4c1d95">工具编排</text>
+      <text x="1095" y="100" font-size="9.5" text-anchor="middle" fill="#6d28d9">13 内置工具 · 按角色裁剪</text>
+
+      <!-- 第二行：生成、执行与交付 -->
+      <rect x="576" y="122" width="138" height="48" rx="6" fill="#ede9fe" stroke="#8b5cf6"/>
+      <text x="645" y="142" font-size="11.5" font-weight="600" text-anchor="middle" fill="#4c1d95">上下文工程</text>
+      <text x="645" y="158" font-size="9.5" text-anchor="middle" fill="#6d28d9">语义 · 知识库 · 血缘</text>
+
+      <rect x="726" y="122" width="138" height="48" rx="6" fill="#ede9fe" stroke="#8b5cf6"/>
+      <text x="795" y="142" font-size="11.5" font-weight="600" text-anchor="middle" fill="#4c1d95">SQL 生成与校验</text>
+      <text x="795" y="158" font-size="9.5" text-anchor="middle" fill="#6d28d9">只读校验 · 试跑纠错</text>
+
+      <rect x="876" y="122" width="138" height="48" rx="6" fill="#ede9fe" stroke="#8b5cf6"/>
+      <text x="945" y="142" font-size="11.5" font-weight="600" text-anchor="middle" fill="#4c1d95">执行与观测</text>
+      <text x="945" y="158" font-size="9.5" text-anchor="middle" fill="#6d28d9">任务 · 阶段 · 资源可见</text>
+
+      <rect x="1026" y="122" width="138" height="48" rx="6" fill="#ede9fe" stroke="#8b5cf6"/>
+      <text x="1095" y="142" font-size="11.5" font-weight="600" text-anchor="middle" fill="#4c1d95">图表与解读</text>
+      <text x="1095" y="158" font-size="9.5" text-anchor="middle" fill="#6d28d9">11 类图表 · 趋势 · 异常</text>
+
+      <!-- 第三行：会话产物与安全 -->
+      <rect x="576" y="180" width="286" height="48" rx="6" fill="#ede9fe" stroke="#8b5cf6"/>
+      <text x="719" y="200" font-size="11.5" font-weight="600" text-anchor="middle" fill="#4c1d95">会话与产物</text>
+      <text x="719" y="216" font-size="9.5" text-anchor="middle" fill="#6d28d9">多轮追问 · 结果引用复用 · 8 种导出</text>
+
+      <rect x="878" y="180" width="286" height="48" rx="6" fill="#ede9fe" stroke="#8b5cf6"/>
+      <text x="1021" y="200" font-size="11.5" font-weight="600" text-anchor="middle" fill="#4c1d95">安全护栏</text>
+      <text x="1021" y="216" font-size="9.5" text-anchor="middle" fill="#6d28d9">默认只读 · 写操作确认 · 行数上限</text>
+
+      <!-- 闭环条 -->
+      <rect x="576" y="236" width="588" height="36" rx="6" fill="#f3e8ff" stroke="#c4b5fd"/>
+      <text x="870" y="259" font-size="10.5" text-anchor="middle" fill="#6d28d9">分析闭环：提问 → 理解 → 找数 → 生成校验 → 执行 → 图表解读 → 导出沉淀</text>
+
+      <!-- 入口 → 调度中心；AI → 调度中心 -->
+      <line x1="150" y1="144" x2="150" y2="320" stroke="#64748b" stroke-width="1.6" marker-end="url(#arwGray)"/>
+      <line x1="800" y1="306" x2="800" y2="320" stroke="#7c3aed" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#arwViolet)"/>
+      <text x="810" y="316" font-size="10" fill="#7c3aed">工具调用 / 执行 SQL（AI 不参与计算）</text>
+
+      <!-- 以下各层整体下移 150，为放大的 AI 智能层让出空间 -->
+      <g transform="translate(0,150)">
+      <!-- ============ 调度中心 ============ -->
+      <rect x="20" y="172" width="1160" height="262" rx="10" fill="#f2f7fd" stroke="#93b6dd" stroke-width="1.4" filter="url(#softShadow)"/>
+      <text x="36" y="198" font-size="13" font-weight="650" fill="#1e4b78">查询服务层 · 调度中心（规划 · 调度 · 汇聚）</text>
+
+      <rect x="40" y="212" width="196" height="74" rx="6" fill="#dae8fc" stroke="#6c8ebf"/>
+      <text x="138" y="236" font-size="12" font-weight="600" text-anchor="middle" fill="#1e3a5f">查询接入</text>
+      <text x="138" y="253" font-size="10" text-anchor="middle" fill="#3b5c7f">统一查询入口</text>
+      <text x="138" y="270" font-size="9.5" text-anchor="middle" fill="#5b7c9f">网页 · 命令行 · 标准驱动</text>
+
+      <rect x="268" y="212" width="196" height="74" rx="6" fill="#dae8fc" stroke="#6c8ebf"/>
+      <text x="366" y="236" font-size="12" font-weight="600" text-anchor="middle" fill="#1e3a5f">语义校验</text>
+      <text x="366" y="253" font-size="10" text-anchor="middle" fill="#3b5c7f">语句与权限检查</text>
+      <text x="366" y="270" font-size="9.5" text-anchor="middle" fill="#5b7c9f">只读校验 · 子查询作用域</text>
+
+      <rect x="496" y="212" width="196" height="74" rx="6" fill="#dae8fc" stroke="#6c8ebf"/>
+      <text x="594" y="236" font-size="12" font-weight="600" text-anchor="middle" fill="#1e3a5f">优化器</text>
+      <text x="594" y="253" font-size="10" text-anchor="middle" fill="#3b5c7f">查询改写与优化</text>
+      <text x="594" y="270" font-size="9.5" text-anchor="middle" fill="#5b7c9f">少读列 · 少读行 · 公共结果复用</text>
+
+      <rect x="724" y="212" width="196" height="74" rx="6" fill="#dae8fc" stroke="#6c8ebf"/>
+      <text x="822" y="236" font-size="12" font-weight="600" text-anchor="middle" fill="#1e3a5f">物理计划</text>
+      <text x="822" y="253" font-size="10" text-anchor="middle" fill="#3b5c7f">可执行计划</text>
+      <text x="822" y="270" font-size="9.5" text-anchor="middle" fill="#5b7c9f">扫描 / 关联 / 聚合 / 窗口</text>
+
+      <rect x="952" y="212" width="196" height="74" rx="6" fill="#dae8fc" stroke="#6c8ebf"/>
+      <text x="1050" y="236" font-size="12" font-weight="600" text-anchor="middle" fill="#1e3a5f">调度切片</text>
+      <text x="1050" y="253" font-size="10" text-anchor="middle" fill="#3b5c7f">任务调度</text>
+      <text x="1050" y="270" font-size="9.5" text-anchor="middle" fill="#5b7c9f">任务拆分 · 并行度预算</text>
+
+      <line x1="238" y1="249" x2="266" y2="249" stroke="#5b8ab8" stroke-width="1.6" marker-end="url(#arwBlue)"/>
+      <line x1="466" y1="249" x2="494" y2="249" stroke="#5b8ab8" stroke-width="1.6" marker-end="url(#arwBlue)"/>
+      <line x1="694" y1="249" x2="722" y2="249" stroke="#5b8ab8" stroke-width="1.6" marker-end="url(#arwBlue)"/>
+      <line x1="922" y1="249" x2="950" y2="249" stroke="#5b8ab8" stroke-width="1.6" marker-end="url(#arwBlue)"/>
+
+      <line x1="171" y1="288" x2="171" y2="302" stroke="#94a3b8" stroke-width="1.3" stroke-dasharray="3 3" marker-end="url(#arwGray)"/>
+      <line x1="459" y1="288" x2="459" y2="302" stroke="#94a3b8" stroke-width="1.3" stroke-dasharray="3 3" marker-end="url(#arwGray)"/>
+      <line x1="747" y1="288" x2="747" y2="302" stroke="#94a3b8" stroke-width="1.3" stroke-dasharray="3 3" marker-end="url(#arwGray)"/>
+      <line x1="1035" y1="288" x2="1035" y2="302" stroke="#94a3b8" stroke-width="1.3" stroke-dasharray="3 3" marker-end="url(#arwGray)"/>
+
+      <rect x="42" y="306" width="258" height="92" rx="6" fill="#ffffff" stroke="#93b6dd"/>
+      <text x="171" y="333" font-size="12" font-weight="600" text-anchor="middle" fill="#1e3a5f">资源分派</text>
+      <text x="171" y="350" font-size="10" text-anchor="middle" fill="#3b5c7f">按可用容量分配</text>
+      <text x="171" y="368" font-size="9.5" text-anchor="middle" fill="#5b7c9f">并行预算 · 健康节点容量</text>
+
+      <rect x="330" y="306" width="258" height="92" rx="6" fill="#ffffff" stroke="#93b6dd"/>
+      <text x="459" y="333" font-size="12" font-weight="600" text-anchor="middle" fill="#1e3a5f">查询管理</text>
+      <text x="459" y="350" font-size="10" text-anchor="middle" fill="#3b5c7f">任务状态管理</text>
+      <text x="459" y="368" font-size="9.5" text-anchor="middle" fill="#5b7c9f">运行状态 · 取消 · 心跳 · 失败诊断</text>
+
+      <rect x="618" y="306" width="258" height="92" rx="6" fill="#ffffff" stroke="#93b6dd"/>
+      <text x="747" y="333" font-size="12" font-weight="600" text-anchor="middle" fill="#1e3a5f">结果汇聚</text>
+      <text x="747" y="350" font-size="10" text-anchor="middle" fill="#3b5c7f">汇总结果回传客户端</text>
+      <text x="747" y="368" font-size="9.5" text-anchor="middle" fill="#5b7c9f">分批回传 · 背压保护</text>
+
+      <rect x="906" y="306" width="258" height="92" rx="6" fill="#ffffff" stroke="#93b6dd"/>
+      <text x="1035" y="333" font-size="12" font-weight="600" text-anchor="middle" fill="#1e3a5f">元数据服务</text>
+      <text x="1035" y="350" font-size="10" text-anchor="middle" fill="#3b5c7f">库表与函数目录</text>
+      <text x="1035" y="368" font-size="9.5" text-anchor="middle" fill="#5b7c9f">业务元数据统一维护</text>
+
+      <!-- 调度中心 → 计算节点 -->
+      <line x1="210" y1="438" x2="210" y2="474" stroke="#5b8ab8" stroke-width="1.6" marker-end="url(#arwBlue)"/>
+      <line x1="990" y1="438" x2="990" y2="474" stroke="#5b8ab8" stroke-width="1.6" marker-end="url(#arwBlue)"/>
+      <text x="600" y="462" font-size="10.5" text-anchor="middle" fill="#3b6ea5">分发计算任务 · 按健康节点容量调度</text>
+
+      <!-- ============ 计算节点层 ============ -->
+      <rect x="20" y="478" width="1160" height="268" rx="10" fill="#f2faf1" stroke="#9ec7a0" stroke-width="1.4" filter="url(#softShadow)"/>
+      <text x="36" y="504" font-size="13" font-weight="650" fill="#2c6e3f">分布式执行层 · 计算节点 — 多节点并行</text>
+
+      <!-- 计算节点 0 -->
+      <rect x="40" y="514" width="340" height="210" rx="8" fill="#ffffff" stroke="#9ec7a0"/>
+      <text x="56" y="540" font-size="12.5" font-weight="650" fill="#2c6e3f">计算节点 0</text>
+      <text x="364" y="540" font-size="9.5" text-anchor="end" fill="#6b8f6b">节点内存预算</text>
+      <rect x="58" y="554" width="304" height="34" rx="5" fill="#d5e8d4" stroke="#82b366"/>
+      <text x="210" y="575" font-size="10.5" text-anchor="middle" fill="#24522f">分片扫描（少读列 / 少读行）</text>
+      <rect x="58" y="596" width="304" height="34" rx="5" fill="#d5e8d4" stroke="#82b366"/>
+      <text x="210" y="617" font-size="10.5" text-anchor="middle" fill="#24522f">本地计算：关联 → 聚合 → 窗口 → 排序</text>
+      <rect x="58" y="638" width="304" height="34" rx="5" fill="#ffffff" stroke="#82b366" stroke-dasharray="4 3"/>
+      <text x="210" y="659" font-size="10.5" text-anchor="middle" fill="#3d6b47">结果交换 → 下一阶段</text>
+      <ellipse cx="210" cy="709" rx="152" ry="7" fill="#fff4e6" stroke="#d79b00"/>
+      <rect x="58" y="685" width="304" height="24" fill="#fff4e6"/>
+      <line x1="58" y1="685" x2="58" y2="709" stroke="#d79b00"/>
+      <line x1="362" y1="685" x2="362" y2="709" stroke="#d79b00"/>
+      <ellipse cx="210" cy="685" rx="152" ry="7" fill="#ffe6cc" stroke="#d79b00"/>
+      <text x="210" y="701" font-size="9.5" text-anchor="middle" fill="#8a5200">内存不足自动落盘 → 归并 → 输出</text>
+
+      <!-- 计算节点 1 -->
+      <rect x="430" y="514" width="340" height="210" rx="8" fill="#ffffff" stroke="#9ec7a0"/>
+      <text x="446" y="540" font-size="12.5" font-weight="650" fill="#2c6e3f">计算节点 1</text>
+      <text x="754" y="540" font-size="9.5" text-anchor="end" fill="#6b8f6b">节点内存预算</text>
+      <rect x="448" y="554" width="304" height="34" rx="5" fill="#d5e8d4" stroke="#82b366"/>
+      <text x="600" y="575" font-size="10.5" text-anchor="middle" fill="#24522f">分片扫描（少读列 / 少读行）</text>
+      <rect x="448" y="596" width="304" height="34" rx="5" fill="#d5e8d4" stroke="#82b366"/>
+      <text x="600" y="617" font-size="10.5" text-anchor="middle" fill="#24522f">本地计算：关联 → 聚合 → 窗口 → 排序</text>
+      <rect x="448" y="638" width="304" height="34" rx="5" fill="#ffffff" stroke="#82b366" stroke-dasharray="4 3"/>
+      <text x="600" y="659" font-size="10.5" text-anchor="middle" fill="#3d6b47">结果交换 → 下一阶段</text>
+      <ellipse cx="600" cy="709" rx="152" ry="7" fill="#fff4e6" stroke="#d79b00"/>
+      <rect x="448" y="685" width="304" height="24" fill="#fff4e6"/>
+      <line x1="448" y1="685" x2="448" y2="709" stroke="#d79b00"/>
+      <line x1="752" y1="685" x2="752" y2="709" stroke="#d79b00"/>
+      <ellipse cx="600" cy="685" rx="152" ry="7" fill="#ffe6cc" stroke="#d79b00"/>
+      <text x="600" y="701" font-size="9.5" text-anchor="middle" fill="#8a5200">内存不足自动落盘 → 归并 → 输出</text>
+
+      <!-- 计算节点 2 -->
+      <rect x="820" y="514" width="340" height="210" rx="8" fill="#ffffff" stroke="#9ec7a0"/>
+      <text x="836" y="540" font-size="12.5" font-weight="650" fill="#2c6e3f">计算节点 2</text>
+      <text x="1144" y="540" font-size="9.5" text-anchor="end" fill="#6b8f6b">节点内存预算</text>
+      <rect x="838" y="554" width="304" height="34" rx="5" fill="#d5e8d4" stroke="#82b366"/>
+      <text x="990" y="575" font-size="10.5" text-anchor="middle" fill="#24522f">分片扫描（少读列 / 少读行）</text>
+      <rect x="838" y="596" width="304" height="34" rx="5" fill="#d5e8d4" stroke="#82b366"/>
+      <text x="990" y="617" font-size="10.5" text-anchor="middle" fill="#24522f">本地计算：关联 → 聚合 → 窗口 → 排序</text>
+      <rect x="838" y="638" width="304" height="34" rx="5" fill="#ffffff" stroke="#82b366" stroke-dasharray="4 3"/>
+      <text x="990" y="659" font-size="10.5" text-anchor="middle" fill="#3d6b47">结果交换 → 下一阶段</text>
+      <ellipse cx="990" cy="709" rx="152" ry="7" fill="#fff4e6" stroke="#d79b00"/>
+      <rect x="838" y="685" width="304" height="24" fill="#fff4e6"/>
+      <line x1="838" y1="685" x2="838" y2="709" stroke="#d79b00"/>
+      <line x1="1142" y1="685" x2="1142" y2="709" stroke="#d79b00"/>
+      <ellipse cx="990" cy="685" rx="152" ry="7" fill="#ffe6cc" stroke="#d79b00"/>
+      <text x="990" y="701" font-size="9.5" text-anchor="middle" fill="#8a5200">内存不足自动落盘 → 归并 → 输出</text>
+
+      <!-- 节点间数据交换 -->
+      <line x1="384" y1="613" x2="426" y2="613" stroke="#7aab7c" stroke-width="1.8"
+            marker-start="url(#arwGreen)" marker-end="url(#arwGreen)"/>
+      <text x="405" y="604" font-size="8.5" text-anchor="middle" fill="#4d7c4d">数据交换</text>
+      <line x1="774" y1="613" x2="816" y2="613" stroke="#7aab7c" stroke-width="1.8"
+            marker-start="url(#arwGreen)" marker-end="url(#arwGreen)"/>
+      <text x="795" y="604" font-size="8.5" text-anchor="middle" fill="#4d7c4d">数据交换</text>
+
+      <!-- 计算节点 ← 数据源 -->
+      <line x1="210" y1="776" x2="210" y2="750" stroke="#7aab7c" stroke-width="1.6" marker-end="url(#arwGreen)"/>
+      <line x1="990" y1="776" x2="990" y2="750" stroke="#7aab7c" stroke-width="1.6" marker-end="url(#arwGreen)"/>
+      <text x="600" y="766" font-size="10.5" text-anchor="middle" fill="#3d7a4a">按需拉取 · 只读必要行列（数据不动，计算汇聚）</text>
+
+      <!-- ============ 数据与元数据层 ============ -->
+      <rect x="20" y="778" width="1160" height="150" rx="10" fill="#fff8ef" stroke="#e8b672" stroke-width="1.4" filter="url(#softShadow)"/>
+      <text x="36" y="804" font-size="13" font-weight="650" fill="#8a5200">数据与元数据层 · CONNECTORS — 联邦数据源（9 个内置连接器）</text>
+
+      <rect x="64" y="816" width="112" height="44" rx="6" fill="#ffe6cc" stroke="#d79b00"/>
+      <text x="120" y="843" font-size="11.5" text-anchor="middle" fill="#7c4a00">MySQL</text>
+      <rect x="184" y="816" width="112" height="44" rx="6" fill="#ffe6cc" stroke="#d79b00"/>
+      <text x="240" y="843" font-size="11.5" text-anchor="middle" fill="#7c4a00">TiDB</text>
+      <rect x="304" y="816" width="112" height="44" rx="6" fill="#ffe6cc" stroke="#d79b00"/>
+      <text x="360" y="843" font-size="11.5" text-anchor="middle" fill="#7c4a00">Doris</text>
+      <rect x="424" y="816" width="112" height="44" rx="6" fill="#ffe6cc" stroke="#d79b00"/>
+      <text x="480" y="843" font-size="11" text-anchor="middle" fill="#7c4a00">PostgreSQL</text>
+      <rect x="544" y="816" width="112" height="44" rx="6" fill="#ffe6cc" stroke="#d79b00"/>
+      <text x="600" y="843" font-size="11" text-anchor="middle" fill="#7c4a00">SQL Server</text>
+      <rect x="664" y="816" width="112" height="44" rx="6" fill="#ffe6cc" stroke="#d79b00"/>
+      <text x="720" y="843" font-size="11.5" text-anchor="middle" fill="#7c4a00">Oracle</text>
+      <rect x="784" y="816" width="112" height="44" rx="6" fill="#ffe6cc" stroke="#d79b00"/>
+      <text x="840" y="843" font-size="11.5" text-anchor="middle" fill="#7c4a00">Hive</text>
+      <rect x="904" y="816" width="112" height="44" rx="6" fill="#ffe6cc" stroke="#d79b00"/>
+      <text x="960" y="843" font-size="11" text-anchor="middle" fill="#7c4a00">ClickHouse</text>
+      <rect x="1024" y="816" width="112" height="44" rx="6" fill="#ffe6cc" stroke="#d79b00"/>
+      <text x="1080" y="843" font-size="11.5" text-anchor="middle" fill="#7c4a00">Excel</text>
+
+      <rect x="40" y="872" width="360" height="44" rx="6" fill="#ffffff" stroke="#e8b672"/>
+      <text x="220" y="890" font-size="11" font-weight="600" text-anchor="middle" fill="#8a5200">数据源接入</text>
+      <text x="220" y="906" font-size="9.5" text-anchor="middle" fill="#a06a1c">按需读取 · 自动过滤与裁剪</text>
+
+      <rect x="420" y="872" width="360" height="44" rx="6" fill="#ffffff" stroke="#e8b672"/>
+      <text x="600" y="890" font-size="11" font-weight="600" text-anchor="middle" fill="#8a5200">元数据目录</text>
+      <text x="600" y="906" font-size="9.5" text-anchor="middle" fill="#a06a1c">库表 / 列 / 统计 / 函数 持久化</text>
+
+      <rect x="800" y="872" width="360" height="44" rx="6" fill="#ffffff" stroke="#e8b672"/>
+      <text x="980" y="890" font-size="11" font-weight="600" text-anchor="middle" fill="#8a5200">Python 扩展</text>
+      <text x="980" y="906" font-size="9.5" text-anchor="middle" fill="#a06a1c">对接自定义 Python 计算逻辑</text>
+
+      <!-- ============ 运行时底座 ============ -->
+      <rect x="20" y="948" width="1160" height="56" rx="10" fill="#1e293b" stroke="#0f172a" stroke-width="1.4" filter="url(#softShadow)"/>
+      <text x="36" y="982" font-size="13" font-weight="650" fill="#f8fafc">基础底座 · 运行时</text>
+      <rect x="236" y="960" width="176" height="32" rx="6" fill="#334155" stroke="#475569"/>
+      <text x="324" y="980" font-size="10.5" text-anchor="middle" fill="#e2e8f0">列式内存引擎</text>
+      <rect x="424" y="960" width="176" height="32" rx="6" fill="#334155" stroke="#475569"/>
+      <text x="512" y="980" font-size="10.5" text-anchor="middle" fill="#e2e8f0">统一内存预算</text>
+      <rect x="612" y="960" width="176" height="32" rx="6" fill="#334155" stroke="#475569"/>
+      <text x="700" y="980" font-size="10.5" text-anchor="middle" fill="#e2e8f0">高效数据传输</text>
+      <rect x="800" y="960" width="176" height="32" rx="6" fill="#334155" stroke="#475569"/>
+      <text x="888" y="980" font-size="10.5" text-anchor="middle" fill="#e2e8f0">统一交互协议</text>
+      <rect x="988" y="960" width="176" height="32" rx="6" fill="#334155" stroke="#475569"/>
+      <text x="1076" y="980" font-size="10.5" text-anchor="middle" fill="#e2e8f0">高并发运行时</text>
+      </g>
+    </svg>
+    <figcaption>
+      <span class="lg"><span class="sw-line"></span>数据流 / 调用</span>
+      <span class="lg"><span class="sw-dash"></span>AI 工具调用（与执行层解耦）</span>
+      <span class="lg"><span class="sw-both"></span>节点间数据交换</span>
+      <span class="lg"><span class="sw-cyl"></span>磁盘落盘通道</span>
+    </figcaption>
+  </figure>
+
+  <div class="callout">
+    <div class="t">两个产品级取舍</div>
+    <p><b>AI 只负责「理解」，执行交给引擎。</b>模型换代、切换供应商，都不会影响查询结果的正确性；
+    执行过程始终可复现、可审计。</p>
+    <p><b>中间结果不回流中心节点。</b>分布式计算在计算节点之间完成，中心只做调度与结果汇总 ——
+    大查询不会把中心节点压垮，集群越大收益越明显。</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="users">
+  <div class="sec-head"><span class="sec-no">03</span><h2>目标用户与典型场景</h2></div>
+  <p class="sec-desc">同一个产品，三类角色各取所需：业务同学用自然语言直接问数，分析师用 SQL 精细加工，管理员守住数据与集群边界。</p>
+
+  <div class="grid g3">
+    <div class="card">
+      <h3 style="margin-top:0">业务分析师<span class="tag">零门槛</span></h3>
+      <p style="color:var(--muted);font-size:13.5px">不会写 SQL 也能问：「上个月各区域销售额同比如何？」
+      系统自动找表、生成查询、画图并给出结论，结果可一键导出。</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">数据工程师 / 分析师<span class="tag">高效率</span></h3>
+      <p style="color:var(--muted);font-size:13.5px">多标签 SQL 工作台、脚本保存、结果转置与导出；复杂多表关联、窗口函数、分组聚合，
+      一条 SQL 直连多个业务系统。</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">管理员 / IT<span class="tag">可控</span></h3>
+      <p style="color:var(--muted);font-size:13.5px">账号与角色隔离、集群资源看板、任务随时可停；
+      新数据源以插件方式接入，不需要改动计算引擎。</p>
+    </div>
+  </div>
+
+  <h3>典型场景</h3>
+  <div class="grid g2">
+    <div class="point"><b>跨系统经营分析</b><span>订单在 MySQL、库存在 PostgreSQL、流水在 ClickHouse —— 一条查询合并分析，不用先建数仓、不用每晚抽数。</span></div>
+    <div class="point green"><b>自助式问数</b><span>业务同学直接在对话框提问，省去「提需求 → 排期 → 出报表」的往返。</span></div>
+    <div class="point amber"><b>大促 / 月结等大查询</b><span>数据量大、内存吃紧时自动落盘继续跑，优先保证按时出结果。</span></div>
+    <div class="point violet"><b>临时取数与交付</b><span>结果直接导出 Excel / CSV / PDF / 图片，或把查询保存为脚本，下次复用。</span></div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="features">
+  <div class="sec-head"><span class="sec-no">04</span><h2>核心能力</h2></div>
+  <p class="sec-desc">六个能力模块，覆盖「取数 → 分析 → 交付」全流程；用户不需要知道背后用了什么技术。</p>
+
+  <div class="grid g3">
+    <div class="card">
+      <h3 style="margin-top:0">联邦查询<span class="tag">一站式</span></h3>
+      <p style="color:var(--muted);font-size:13.5px">已支持 MySQL、TiDB、Doris、PostgreSQL、SQL Server、Oracle、Hive、ClickHouse、Excel。
+      统一命名、统一语法，跨源关联像查一张表。</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">自然语言问数<span class="tag">AI</span></h3>
+      <p style="color:var(--muted);font-size:13.5px">用一句话描述想看什么，AI 自动完成找表、写查询、执行、画图、解释；
+      追问可延续上下文，逐步收敛到想要的答案。</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">SQL 工作台<span class="tag">专业</span></h3>
+      <p style="color:var(--muted);font-size:13.5px">多标签并行编辑、语法高亮与补全、Ctrl+S 保存脚本、右键复制粘贴、
+      结果一键「列转行」；标签与内容自动记忆，刷新不丢。</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">可视化与导出<span class="tag">交付</span></h3>
+      <p style="color:var(--muted);font-size:13.5px">11 类二维图表，支持混合与双轴；结果可导出 Markdown / TXT / HTML / CSV / Excel / PNG / JPG / PDF，
+      直接进入汇报或邮件。</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">任务与集群看板<span class="tag">透明</span></h3>
+      <p style="color:var(--muted);font-size:13.5px">查询进度、执行阶段、资源占用、网络带宽、溢写趋势实时可见；
+      慢在哪一步、卡在哪个节点，一目了然。</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">账号、角色与安全<span class="tag">可控</span></h3>
+      <p style="color:var(--muted);font-size:13.5px">账号级数据隔离；管理员 / 开发者 / 分析师角色决定可见功能；
+      默认只读，改表等写操作必须人工确认。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="journey">
+  <div class="sec-head"><span class="sec-no">05</span><h2>使用旅程</h2></div>
+  <p class="sec-desc">从打开产品到拿到可交付的结论，只有六步；每一步都可以由用户接管。</p>
+
+  <div class="flow six">
+    <div class="step"><span class="n">1</span><b>连接数据源</b><span>使用已接入的业务系统，或请管理员接入新系统</span><span class="where">开箱即用</span></div>
+    <div class="step"><span class="n">2</span><b>提出问题</b><span>自然语言或 SQL，二选一，不必切换工具</span><span class="where">零门槛</span></div>
+    <div class="step"><span class="n">3</span><b>AI 理解与规划</b><span>自动找表、确认口径、生成可执行的查询</span><span class="where">智能辅助</span></div>
+    <div class="step"><span class="n">4</span><b>自动执行</b><span>任务自动拆分，多节点并行计算，大查询也不中断</span><span class="where">自动</span></div>
+    <div class="step"><span class="n">5</span><b>查看结果</b><span>表格、图表、排序与转置；随时可停止</span><span class="where">实时</span></div>
+    <div class="step"><span class="n">6</span><b>导出与沉淀</b><span>导出文件、保存脚本、分享结论给同事</span><span class="where">可交付</span></div>
+  </div>
+
+  <div class="grid g2" style="margin-top:18px">
+    <div class="card">
+      <h3 style="margin-top:0">全程可看</h3>
+      <p style="color:var(--muted);font-size:13.5px">AI 的思考过程、每一步调用了什么、查询执行到哪个阶段、占用了多少资源，
+      都在界面上实时呈现。结论不是「黑盒吐出来」的，而是可以逐层追问与复核。</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">随时可停</h3>
+      <p style="color:var(--muted);font-size:13.5px">AI 回答或查询执行都可以一键停止；停止后计算资源立即释放，
+      不会在后台继续占用集群。被取消的任务不计入失败率，也不影响其他人。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="ai">
+  <div class="sec-head"><span class="sec-no">06</span><h2>AI 能力：把「一句提问」直接变成「可交付的结论」</h2></div>
+  <p class="sec-desc">这不是一个聊天窗，而是一名会动手的分析师：它理解问题、自己去找数据、写查询、先试跑验证、画图、讲结论，
+      最后把结果变成可以直接转发的文件。数据和执行始终在引擎里，AI 只负责「把分析做对、把结论讲清楚」。</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 1100 214" role="img" aria-label="AI 分析闭环">
+      <defs>
+        <marker id="arwAi" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#8b5cf6"/>
+        </marker>
+      </defs>
+
+      <rect x="20" y="40" width="130" height="64" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+      <text x="85" y="66" font-size="12" font-weight="650" text-anchor="middle" fill="#4c1d95">① 提问</text>
+      <text x="85" y="86" font-size="9.5" text-anchor="middle" fill="#6d28d9">自然语言 / SQL</text>
+
+      <rect x="174" y="40" width="130" height="64" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+      <text x="239" y="66" font-size="12" font-weight="650" text-anchor="middle" fill="#4c1d95">② 理解意图</text>
+      <text x="239" y="86" font-size="9.5" text-anchor="middle" fill="#6d28d9">指标 · 维度 · 口径</text>
+
+      <rect x="328" y="40" width="130" height="64" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+      <text x="393" y="66" font-size="12" font-weight="650" text-anchor="middle" fill="#4c1d95">③ 数据发现</text>
+      <text x="393" y="86" font-size="9.5" text-anchor="middle" fill="#6d28d9">找表 · 看字段</text>
+
+      <rect x="482" y="40" width="130" height="64" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+      <text x="547" y="66" font-size="12" font-weight="650" text-anchor="middle" fill="#4c1d95">④ 生成与校验</text>
+      <text x="547" y="86" font-size="9.5" text-anchor="middle" fill="#6d28d9">只读 · 试跑纠错</text>
+
+      <rect x="636" y="40" width="130" height="64" rx="8" fill="#dbeafe" stroke="#6c8ebf"/>
+      <text x="701" y="66" font-size="12" font-weight="650" text-anchor="middle" fill="#1e3a5f">⑤ 执行</text>
+      <text x="701" y="86" font-size="9.5" text-anchor="middle" fill="#3b5c7f">分布式引擎</text>
+
+      <rect x="790" y="40" width="130" height="64" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+      <text x="855" y="66" font-size="12" font-weight="650" text-anchor="middle" fill="#4c1d95">⑥ 图表与解读</text>
+      <text x="855" y="86" font-size="9.5" text-anchor="middle" fill="#6d28d9">选图 · 讲趋势</text>
+
+      <rect x="944" y="40" width="136" height="64" rx="8" fill="#ecfdf5" stroke="#6ee7b7"/>
+      <text x="1012" y="66" font-size="12" font-weight="650" text-anchor="middle" fill="#065f46">⑦ 导出沉淀</text>
+      <text x="1012" y="86" font-size="9.5" text-anchor="middle" fill="#047857">文件 · 脚本 · 复用</text>
+
+      <line x1="150" y1="72" x2="172" y2="72" stroke="#8b5cf6" stroke-width="1.8" marker-end="url(#arwAi)"/>
+      <line x1="304" y1="72" x2="326" y2="72" stroke="#8b5cf6" stroke-width="1.8" marker-end="url(#arwAi)"/>
+      <line x1="458" y1="72" x2="480" y2="72" stroke="#8b5cf6" stroke-width="1.8" marker-end="url(#arwAi)"/>
+      <line x1="612" y1="72" x2="634" y2="72" stroke="#8b5cf6" stroke-width="1.8" marker-end="url(#arwAi)"/>
+      <line x1="766" y1="72" x2="788" y2="72" stroke="#8b5cf6" stroke-width="1.8" marker-end="url(#arwAi)"/>
+      <line x1="920" y1="72" x2="942" y2="72" stroke="#8b5cf6" stroke-width="1.8" marker-end="url(#arwAi)"/>
+
+      <path d="M701 104 L701 150 L547 150 L547 108" fill="none" stroke="#8b5cf6" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#arwAi)"/>
+      <text x="624" y="144" font-size="9.5" text-anchor="middle" fill="#6d28d9">报错 / 结果不符 → 自动改写重试</text>
+
+      <text x="550" y="190" font-size="10" text-anchor="middle" fill="#64748b">一轮推理 = 思考 → 调用工具 → 观察结果 → 再思考；拿到足够信息立即收敛作答</text>
+    </svg>
+    <figcaption>
+      <span class="lg"><span class="sw-dash"></span>自动纠错回环</span>
+      <span class="lg"><span class="sw-line"></span>分析主链路</span>
+    </figcaption>
+  </figure>
+
+  <div class="grid g3" style="margin-top:18px">
+    <div class="card">
+      <h3 style="margin-top:0">听得懂<span class="tag">理解</span></h3>
+      <p style="color:var(--muted);font-size:13.5px">从一句业务话里识别指标、维度、时间范围与口径；上下文里追问「按区域拆一下」，它知道接着上一问继续，而不是从头再来。</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">找得到<span class="tag">动手</span></h3>
+      <p style="color:var(--muted);font-size:13.5px">先查有哪些数据源、表、字段和函数，再写 SQL；不臆造表名，也不靠猜字段。跨数据源关联与分析同样一句话完成。</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">交得出<span class="tag">交付</span></h3>
+      <p style="color:var(--muted);font-size:13.5px">结果自动选图、解释趋势与异常，并能一键导出为表格、图片、PDF 或带交互图表的网页报告，直接用于汇报。</p>
+    </div>
+  </div>
+
+  <h3>它是怎么工作的：一轮「思考—动手—看结果」的循环</h3>
+  <p>AI 不是一次性把 SQL 猜出来，而是像分析师一样边做边验证：每一步先想清楚要查什么，调用一个工具拿到真实结果，再决定下一步。
+      整个过程对用户可见 —— 思考过程、生成的 SQL、查询结果都实时流式展示，随时可以叫停。</p>
+
+  <div class="table-wrap" style="margin-top:12px">
+    <table>
+      <thead><tr><th>步骤</th><th>它在做什么</th><th>用到什么</th><th>用户看到什么</th></tr></thead>
+      <tbody>
+        <tr><td><b>1 · 理解</b></td><td>识别指标、维度、时间与口径，判断要不要追问</td><td>推理内核 + 上下文</td><td>思考过程流式输出</td></tr>
+        <tr><td><b>2 · 找数</b></td><td>列出数据源、表、字段与函数，确认数据是否存在</td><td>数据探查工具</td><td>「正在查看 orders 表…」</td></tr>
+        <tr><td><b>3 · 写查询</b></td><td>按目标库方言生成只读 SQL</td><td>上下文工程</td><td>可展开的 SQL 卡片</td></tr>
+        <tr><td><b>4 · 试跑</b></td><td>先在引擎里跑一遍，验证列名、口径与结果规模</td><td><code>execute_sql</code></td><td>结果预览与耗时</td></tr>
+        <tr><td><b>5 · 纠错</b></td><td>报错或结果不符时改写重试，而不是把错误抛给用户</td><td>推理内循环</td><td>自动纠正轨迹</td></tr>
+        <tr><td><b>6 · 交付</b></td><td>选最合适的图表，讲趋势与异常，生成可下载文件</td><td><code>render_chart</code> / <code>export_file</code></td><td>图表 + 结论 + 下载按钮</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="grid g3" style="margin-top:16px">
+    <div class="point violet"><b>多轮追问不丢上下文</b><span>同一会话里可以连续追问「那华东呢」「按周看」，上一轮结果会被复用。</span></div>
+    <div class="point violet"><b>结果引用免重算</b><span>已经查过的结果会带一个引用（如 <code>rs3</code> / <code>last</code>），画图和导出直接复用，不重复提交查询。</span></div>
+    <div class="point violet"><b>自动收敛</b><span>单轮推理最多 16 步，通常 3~6 次工具调用就给出结论，不会无止境试探。</span></div>
+  </div>
+
+  <h3>13 个内置工具：AI 的能力边界，就是工具边界</h3>
+  <p>AI 能做什么，不由模型「自由发挥」决定，而是由它被授予的工具决定。工具集按账号角色裁剪：分析师拿不到集群诊断类工具，开发者 / 管理员才可见。</p>
+
+  <div class="table-wrap" style="margin-top:12px">
+    <table>
+      <thead><tr><th>类别</th><th>工具</th><th>它能做到什么</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><b>数据探查</b></td>
+          <td class="mono">list_catalogs · list_tables · describe_table · describe_function</td>
+          <td>有哪些数据源、库表、列定义与可用函数（含自己的 UDF），先看清楚再写查询。</td>
+        </tr>
+        <tr>
+          <td><b>取数执行</b></td>
+          <td class="mono">execute_sql</td>
+          <td>执行只读 SQL（SELECT / SHOW / DESCRIBE / EXPLAIN），返回列名与结果预览；可附带真实耗时用于性能对比。</td>
+        </tr>
+        <tr>
+          <td><b>变更结构</b></td>
+          <td class="mono">execute_ddl</td>
+          <td>CTAS、创建 / 删除数据源、创建 / 删除函数、删表、清空表；执行前必须由用户在界面上确认。</td>
+        </tr>
+        <tr>
+          <td><b>可视化</b></td>
+          <td class="mono">render_chart</td>
+          <td>把结果直接画在回答里，支持 11 类二维图表与「柱状 + 折线」混合图、双 Y 轴。</td>
+        </tr>
+        <tr>
+          <td><b>交付</b></td>
+          <td class="mono">export_file</td>
+          <td>导出 md / txt / html / csv / excel / png / jpg / pdf，生成后回答下方出现下载按钮。</td>
+        </tr>
+        <tr>
+          <td><b>诊断</b></td>
+          <td class="mono">cluster_status · read_logs · list_queries · query_status · operator_status</td>
+          <td>仅管理员 / 开发者可见：看集群负载、节点日志、查询列表与算子级指标，回答「为什么慢 / 为什么失败 / 卡在哪台机器」。</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note">分析师角色会被自动剔除上述 5 个诊断工具，即使技能白名单里写了也不会下发；角色边界优先于任何提示词。</div>
+
+  <h3>上下文工程：让 AI 懂业务、懂方言、懂函数</h3>
+  <div class="grid g2" style="margin-top:12px">
+    <div class="card">
+      <h3 style="margin-top:0">它每次都被「交代」了什么</h3>
+      <ul style="margin:0">
+        <li><b>SQL 方言：</b>当前连接的数据源语法差异，生成的查询直接可跑。</li>
+        <li><b>函数目录：</b>内置函数 + 当前账号可见的 UDF 清单，不必检索，也不许臆造函数名。</li>
+        <li><b>角色与边界：</b>当前账号能用哪些工具、哪些话题不该回答。</li>
+        <li><b>场景技能：</b>把「常用分析套路 + 允许的工具子集」打包成技能，业务同学选中场景即可开始。</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">模型与上下文</h3>
+      <p style="color:var(--muted);font-size:13.5px">AI 的能力来自「模型 + 企业上下文」两层：模型可以替换，上下文由产品持续沉淀。</p>
+      <div class="grid" style="gap:8px;margin-top:10px">
+        <div class="point violet"><b>模型可替换</b><span>可对接任意兼容主流协议的大模型服务，按账号配置，不被单一供应商锁定。</span></div>
+        <div class="point violet"><b>结果可追溯</b><span>每一步分析、生成的 SQL、拿到的结果与图表都在会话中留痕，可回看、可复核。</span></div>
+      </div>
+    </div>
+  </div>
+
+  <h3>下一步：让 AI 真正懂「这家企业」<span class="tag">近期规划</span></h3>
+  <p>执行层已经就绪；下面三项是把「AI 会查数」变成「AI 懂业务」的关键。它们都与执行引擎解耦，升级知识不会影响计算结果。</p>
+
+  <div class="grid g3" style="margin-top:12px">
+    <div class="card">
+      <h3 style="margin-top:0">语义层<span class="tag">v0.2</span></h3>
+      <p style="color:var(--muted);font-size:13.5px">把业务描述、同义词与指标口径沉淀为可维护的定义：让 AI 知道「GMV」「活跃用户」在本企业到底怎么算，不只靠字段名猜。</p>
+      <ul style="margin:8px 0 0">
+        <li><b>指标口径：</b>含不含退款、按什么时间粒度统计。</li>
+        <li><b>同义词与别名：</b>一线叫法映射到物理字段。</li>
+        <li><b>回答可解释：</b>说明本次用的是哪套口径。</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">企业知识库<span class="tag">规划</span></h3>
+      <p style="color:var(--muted);font-size:13.5px">把制度文档、数据字典、历史分析与常见问题接入 AI 的检索范围；回答前先查企业自己的资料，而不是只靠通用常识。</p>
+      <ul style="margin:8px 0 0">
+        <li><b>业务规则：</b>回答时标注依据了哪份文档、哪一条。</li>
+        <li><b>数据字典：</b>表 / 字段的业务含义与使用禁忌。</li>
+        <li><b>分析沉淀：</b>复用团队已有的分析方法与历史问答。</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">数据血缘<span class="tag">规划</span></h3>
+      <p style="color:var(--muted);font-size:13.5px">理解表与字段之间的上下游关系：一个指标由哪些表加工而来、改一张表会影响哪些报表与指标，让「数从哪来、改了会怎样」有据可查。</p>
+      <ul style="margin:8px 0 0">
+        <li><b>来源追踪：</b>「这个数从哪来」可一路看到上游。</li>
+        <li><b>影响分析：</b>「改这张表会影响谁」提前暴露。</li>
+        <li><b>归因辅助：</b>异常时顺着血缘找根因，而不是盲查。</li>
+      </ul>
+    </div>
+  </div>
+  <div class="note">语义层进入 v0.2；企业知识库与数据血缘随后续版本逐步落地。三者共同构成 AI 的「企业上下文」，让回答从「查得到」升级为「答得对、说得清、改得稳」。</div>
+
+  <h3>结果不只是文字：能出图，也能直接交付</h3>
+  <p>拿到数据后，AI 会根据数据形态自动选择图表，而不是一律贴表格；需要文件时，它会把同一份结果直接导出，不需要用户再复制粘贴。</p>
+
+  <div class="grid g2" style="margin-top:12px">
+    <div class="card">
+      <h3 style="margin-top:0">11 类图表，覆盖常见分析表达</h3>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
+        <span class="pill blue">柱状 bar</span><span class="pill blue">折线 line</span><span class="pill blue">面积 area</span>
+        <span class="pill green">饼图 pie</span><span class="pill green">漏斗 funnel</span><span class="pill green">散点 scatter</span>
+        <span class="pill amber">矩形树图 treemap</span><span class="pill amber">树图 tree</span><span class="pill amber">热力图 heatmap</span>
+        <span class="pill red">关系图 graph</span><span class="pill red">数据集表格 dataset</span>
+      </div>
+      <p style="color:var(--muted);font-size:13px;margin-top:10px">还支持混合图与双 Y 轴：例如「销售额（柱）+ 同比（线）」「数量（主轴）+ 转化率（副轴）」放在同一张图里。</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">8 种导出格式，直接进入交付</h3>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
+        <span class="pill blue">Markdown</span><span class="pill blue">TXT</span><span class="pill blue">HTML</span>
+        <span class="pill green">CSV</span><span class="pill green">Excel</span>
+        <span class="pill amber">PNG</span><span class="pill amber">JPG</span><span class="pill red">PDF</span>
+      </div>
+      <p style="color:var(--muted);font-size:13px;margin-top:10px">PDF 可导出「图表页 + 正文 / 表格页」；HTML 可生成带交互图表的完整报告。用户说「导出 / 下载 / 生成报告」，回答下方直接出现下载按钮。</p>
+    </div>
+  </div>
+
+  <div class="callout">
+    <div class="t">一段典型对话（示意）</div>
+    <p><b>用户：</b>「上个月各区域销售额同比怎么样？顺便给我一份能转发的报告。」</p>
+    <p><b>AI：</b>查看数据源 → 确认 <code>orders</code> 与 <code>region</code> 字段 → 生成并试跑查询 → 自动画出「区域 × 同比」柱状图 →
+    用两句话说明增长最快与下滑的区域及可能原因 → 导出 PDF 报告并给出下载按钮。全程无需用户写一行 SQL。</p>
+  </div>
+
+  <h3>安全护栏：能干活，但不越界</h3>
+  <div class="grid g2" style="margin-top:12px">
+    <div class="card">
+      <h3 style="margin-top:0">对数据与集群的保护</h3>
+      <ul style="margin:0">
+        <li><b>默认只读：</b>取数工具只接受 SELECT / SHOW / DESCRIBE / EXPLAIN；写操作走单独的 DDL 工具。</li>
+        <li><b>写操作人工确认：</b>建表、删表、改函数等必须先由用户点击确认，AI 不能自行提交。</li>
+        <li><b>行数硬上限：</b>AI 提交的查询自动加 <code>LIMIT 500</code>，图表取数最多 200 行，避免拉全表撑爆界面。</li>
+        <li><b>集群繁忙保护：</b>重查询前先看集群负载；繁忙时自动拒绝并建议稍后重试，不把集群压垮。</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">对角色与过程的约束</h3>
+      <ul style="margin:0">
+        <li><b>按角色授权：</b>集群、日志、算子诊断 5 个工具只对管理员 / 开发者开放，分析师不可绕过。</li>
+        <li><b>数据按账号隔离：</b>会话、结果缓存、导出文件互相不可见。</li>
+        <li><b>自动收敛：</b>单轮推理最多 16 步，同一问题不反复执行等价查询。</li>
+        <li><b>随时可停：</b>一键中断推理与查询，后台资源立即释放。</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>典型场景</h3>
+  <div class="grid g4" style="margin-top:12px">
+    <div class="point violet"><b>经营分析问答</b><span>「本月各渠道 GMV 环比」一句话出数、出图、出结论，业务同学不必等排期。</span></div>
+    <div class="point violet"><b>跨系统对数 / 对账</b><span>订单在 MySQL、流水在 ClickHouse，一条 SQL 直接比对两边金额与笔数差异。</span></div>
+    <div class="point violet"><b>异常归因</b><span>从总盘下滑一路下钻到区域、渠道、商品，AI 连续追问并逐步缩小范围。</span></div>
+    <div class="point violet"><b>开发者排障</b><span>查查询列表、看算子阶段与节点日志，回答「这条查询为什么慢、卡在哪个 Worker」。</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="t">能力边界</div>
+    <p><b>AI 不直接改数据结构，也不替用户做业务判断。</b>它负责把「怎么查」做对，把口径与假设说清楚；
+    指标口径的最终解释权仍在业务方。涉及写入与删除的操作，一律需要人工确认。</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="memory">
+  <div class="sec-head"><span class="sec-no">07</span><h2>大查询保障：优先「跑完」，而不是「跑得快」</h2></div>
+  <p class="sec-desc">大查询最常见的失败不是慢，而是内存不够直接报错。产品把「内存不够」变成「先落盘、再继续」——
+      宁可多花一点时间，也要把结果交到用户手上。</p>
+
+  <div class="grid g2">
+    <div class="card">
+      <h3 style="margin-top:0">内存不够时会发生什么</h3>
+      <ul style="margin:0">
+        <li><b>自动落盘：</b>中间结果超出内存预算时，自动写入本地磁盘，继续计算。</li>
+        <li><b>边算边减压：</b>窗口 Top-N、分组聚合等场景动态压缩中间状态，内存占用不随数据量线性增长。</li>
+        <li><b>读得慢一点：</b>下游消费变慢时自动放慢读取节奏，给落盘留出追赶时间，而不是直接崩溃。</li>
+        <li><b>多盘与保护：</b>支持多块磁盘轮转写入；磁盘写满时安全中止，不影响节点上其它任务。</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">对用户意味着什么</h3>
+      <ul style="margin:0">
+        <li><b>结果确定性：</b>同样的查询在内存紧张时也能给出同样正确的结果。</li>
+        <li><b>故障隔离：</b>单条查询资源超限只影响它自己，不会把整台机器拖死。</li>
+        <li><b>可预期的成本：</b>磁盘落盘有总量上限，不会悄悄写满整块盘。</li>
+        <li><b>可观测：</b>看板实时显示落盘趋势，容量规划有据可依。</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>覆盖常见的大查询形态</h3>
+  <div class="grid g4">
+    <div class="point"><b>分组聚合</b><span>高基数分组、去重统计的中间状态可落盘，内存峰值不随分组数线性增长。</span></div>
+    <div class="point green"><b>窗口分析</b><span>超大分区的排序与排名可落盘；Top-N 场景先裁剪再计算。</span></div>
+    <div class="point amber"><b>大表关联</b><span>两侧数据都很大时也能完成关联，不因一侧装不进内存而失败。</span></div>
+    <div class="point violet"><b>排序与去重</b><span>超出内存的数据自动分段排序后归并，结果保持稳定。</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="t">产品取舍</div>
+    <p><b>慢一点，但一定给出答案。</b>对经营分析、月结、大促复盘这类「结果必须按时交付」的场景，
+    我们优先保证完成率，而不是极限速度。需要极致性能的固定报表，仍建议沉淀到数仓。</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="compare">
+  <div class="sec-head"><span class="sec-no">08</span><h2>竞争定位：它补的是哪块空白</h2></div>
+  <p class="sec-desc">Dojao 不替代数仓，也不替代 BI；它解决的是「数据散、要得急、会写 SQL 的人不够」这三件同时发生的事。</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>能力维度</th><th>传统数仓 / ETL</th><th>开源联邦查询引擎</th><th>BI 报表工具</th><th>Dojao</th></tr></thead>
+      <tbody>
+        <tr><td><b>跨系统查询</b></td><td>需先汇聚建模</td><td>支持</td><td>依赖已接入的数据集</td><td><span class="pill blue">原生支持</span></td></tr>
+        <tr><td><b>数据搬迁</b></td><td>必须搬运</td><td>不搬迁</td><td>通常需先抽数</td><td><span class="pill green">不搬迁</span></td></tr>
+        <tr><td><b>自然语言问数</b></td><td>不支持</td><td>不支持</td><td>部分支持</td><td><span class="pill green">内置 AI 分析师</span></td></tr>
+        <tr><td><b>大查询完成率</b></td><td>依赖资源投入</td><td>依赖内存配置</td><td>不承担计算</td><td><span class="pill amber">落盘保障，优先跑完</span></td></tr>
+        <tr><td><b>开箱成本</b></td><td>高（建模 + 运维）</td><td>中（需平台能力）</td><td>中（需准备数据）</td><td><span class="pill green">单机即用</span></td></tr>
+        <tr><td><b>过程可观测</b></td><td>依赖额外监控</td><td>依赖日志</td><td>只看结果</td><td><span class="pill blue">任务 / 集群 / AI 全链路</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="grid g2" style="margin-top:16px">
+    <div class="point green"><b>适合</b><span>多系统并存、需求变化快、希望降低取数门槛的团队；探索式分析与临时取数；想用 AI 提效但担心不可控的组织。</span></div>
+    <div class="point amber"><b>暂不适合</b><span>超大规模、固定口径的高并发报表仓库（建议沉淀到数仓）；强事务写入场景；毫秒级高并发点查。</span></div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="next">
+  <div class="sec-head"><span class="sec-no">09</span><h2>路线图与下一步</h2></div>
+  <p class="sec-desc">先把「能问、能算、能交付」做扎实，再逐步降低使用的门槛与不确定性。</p>
+
+  <div class="grid g3">
+    <div class="card">
+      <h3 style="margin-top:0">现在可用</h3>
+      <ul style="margin:0">
+        <li>9 类数据源的联邦查询</li>
+        <li>自然语言问数 + 图表 + 导出</li>
+        <li>SQL 工作台与脚本沉淀</li>
+        <li>任务 / 集群监控与随时停止</li>
+        <li>单机与集群两种部署</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">近期（v0.2）</h3>
+      <ul style="margin:0">
+        <li><b>语义层：</b>补业务描述、同义词与指标口径，让 AI 更懂业务。</li>
+        <li><b>执行前护栏：</b>先评估成本与集群负载，再决定是否执行。</li>
+        <li><b>错误自修复：</b>针对常见错误自动纠正并重试，减少人工介入。</li>
+        <li><b>效果评测：</b>用标准问题集量化问数准确率与改进幅度。</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">中期方向</h3>
+      <ul style="margin:0">
+        <li><b>企业知识库：</b>接入制度文档、数据字典与历史分析，回答带引用来源。</li>
+        <li><b>数据血缘：</b>表 / 字段上下游与影响分析，回答「数从哪来、改表影响谁」。</li>
+        <li>AI 能力服务化：命令行、JDBC 与二次开发均可复用。</li>
+        <li>运行轨迹与成本看板：token、耗时、采纳情况可量化。</li>
+        <li>团队协作：查询与结论的分享、复用与沉淀。</li>
+        <li>数据源扩展：消息队列、搜索、文档库、数据湖。</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>衡量成功的四个指标</h3>
+  <div class="grid g4">
+    <div class="point"><b>问数采纳率</b><span>AI 给出的查询与结论被直接使用的比例。</span></div>
+    <div class="point green"><b>首答成功率</b><span>第一次提问就得到可执行结果的比例。</span></div>
+    <div class="point amber"><b>大查询完成率</b><span>资源紧张场景下仍能按时返回结果的比例。</span></div>
+    <div class="point violet"><b>周活跃分析用户</b><span>每周至少完成一次分析的用户数。</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="t">一句话总结</div>
+    <p>让每个业务问题都能用一条查询回答 —— 而答案可解释、可复现、可交付。</p>
+  </div>
+</section>
+
+<footer>
+  <span>Dojao · 产品介绍（v0.2 · 2026-11）</span>
+  <span>内部资料 · 请勿外传</span>
+</footer>
+
+</div>
+</body>
+</html>

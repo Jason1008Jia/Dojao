@@ -42,6 +42,7 @@ import org.apache.hadoop.hive.metastore.api.Partition;
 import org.apache.hadoop.hive.metastore.api.SerDeInfo;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.hadoop.hive.metastore.api.Table;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.orc.OrcFile;
 import org.apache.orc.Reader;
 import org.apache.orc.StripeInformation;
@@ -51,9 +52,11 @@ import org.apache.parquet.hadoop.util.HadoopInputFile;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.io.UncheckedIOException;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -150,6 +153,13 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
     private static final String ACID_READ_KEY = "hive.acid.read";
 
     /**
+     * ACID（事务表）写入开关（catalog 属性 {@code catalog.hive.acid.write}）。默认<b>开启</b>：
+     * INSERT INTO 事务表走 delta 目录 + 写事务提交（Hive2 用事务 id，Hive3 用 writeId；
+     * full ACID 写五列包装 ORC，insert_only 写普通数据文件）。关掉则回到「明确拒绝写事务表」。
+     */
+    private static final String ACID_WRITE_KEY = "hive.acid.write";
+
+    /**
      * 复合类型（array / map / struct）的呈现方式（catalog 属性 {@code catalog.hive.nested.mode}）：
      * {@code native}（默认）读成真实嵌套向量、可原样写回；{@code text} 读成 JSON 风格字符串列。
      * {@code uniontype} 两种模式下都是文本。
@@ -160,6 +170,23 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
     private final HiveVersion version;
     private final HiveMetastore metastore;
     private final Configuration conf;
+
+    /**
+     * catalog 的 Hadoop 访问身份（{@code hadoop.user.name}）；null = 用进程默认 UGI。
+     *
+     * <p>Hadoop 的 UGI 是 JVM 级单例、首次访问即锁定（之后改 {@code HADOOP_USER_NAME} 无效），
+     * 所以同一个 JVM 里的多个 hive catalog 只能靠「各自 make 一个 UGI + 显式指定用户」隔离：
+     * HMS 连接在 {@code doAs} 里建（{@code set_ugi} 把身份注册到连接），HDFS 文件系统按这个身份
+     * {@code newInstance} 并缓存（见 {@link #fsOf}）。</p>
+     */
+    private final String hadoopUser;
+
+    /** 该身份的 UGI —— 只给「没有 user 入参」的 API（parquet footer 读）用 {@code doAs} 兜底。 */
+    private final UserGroupInformation hadoopUgi;
+
+    /** 每个 scheme/authority 一个 FileSystem（按 catalog 身份隔离，见 {@link #fsOf}）。 */
+    private final ConcurrentMap<String, FileSystem> fsByAuthority = new ConcurrentHashMap<>();
+
     private final BufferAllocator allocator;
     private final int batchSize;
     private final int partitionLimit;
@@ -200,6 +227,12 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
      * 按 {@code RecordIdentifier} 做行级删除/更新合并。
      */
     private final boolean acidRead;
+
+    /**
+     * ACID（事务表）写入开关（catalog 属性 {@code catalog.hive.acid.write}，默认 <b>true</b>）。
+     * 开启后 INSERT INTO 事务表按 Hive 的事务写法落 delta 目录并提交事务；关闭则明确拒绝。
+     */
+    private final boolean acidWrite;
 
     /**
      * 复合类型按原生嵌套结构读取（{@code catalog.hive.nested.mode=native}，默认）还是按文本读取
@@ -249,8 +282,12 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
 
         HadoopEnvironment.prepare(props);
         this.conf = HadoopEnvironment.newConfiguration(props);
+        // Hadoop 身份是 catalog 级的：HMS 连接在 doAs 里建（set_ugi 注册到连接），HDFS 文件系统
+        // 按这个身份 newInstance 并缓存 —— 同 JVM 里多个 hive catalog 各用各的用户。
+        this.hadoopUser = firstNonBlank(props.get("hadoop.user.name"), props.get("HADOOP_USER_NAME"));
+        this.hadoopUgi = hadoopUser == null ? null : UserGroupInformation.createRemoteUser(hadoopUser);
         this.metastore = new HiveMetastore(catalogName, uris, conf,
-                Boolean.parseBoolean(props.getOrDefault("hive.acid.read", "false")), version);
+                Boolean.parseBoolean(props.getOrDefault("hive.acid.read", "false")), version, hadoopUser);
         this.allocator = NodeMemory.shared().newChildAllocator("connector/hive", 0);
         this.batchSize = intProp(props, "hive.batch.size", CommonConfig.DEFAULT_BATCH_SIZE);
         this.partitionLimit = intProp(props, "hive.partition.limit", 10000);
@@ -260,6 +297,7 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         this.writeFormat = resolveWriteFormat(props);
         this.bucketPruning = Boolean.parseBoolean(props.getOrDefault(BUCKET_PRUNING_KEY, "true"));
         this.acidRead = Boolean.parseBoolean(props.getOrDefault(ACID_READ_KEY, "false"));
+        this.acidWrite = Boolean.parseBoolean(props.getOrDefault(ACID_WRITE_KEY, "true"));
         this.nestedNative = !"text".equalsIgnoreCase(
                 props.getOrDefault(NESTED_MODE_KEY, "native").trim());
     }
@@ -940,7 +978,7 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
     private List<long[]> orcSplitRanges(String file, long target) throws IOException {
         Path path = new Path(file);
         try (Reader reader = OrcFile.createReader(path,
-                OrcFile.readerOptions(conf).filesystem(path.getFileSystem(conf)))) {
+                OrcFile.readerOptions(conf).filesystem(fsOf(file)))) {
             List<StripeInformation> stripes = reader.getStripes();
             if (stripes.size() <= 1) return List.of();
             long[] segStart = new long[stripes.size()];
@@ -1125,7 +1163,7 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         String stagingDir = sep < 0 ? null : target.substring(sep + 1);
 
         HiveTableMeta meta = requireTable(request.schema(), realTable);
-        checkWritableTarget(meta);
+        checkWritableTarget(meta, acidWrite, metastore.hive2());
         // 目标列名（INSERT INTO t(a,b)）：页列按位置对应这些名字，否则用页自己的列名
         List<String> pageColumns = request.targetColumns();
         if (pageColumns != null && pageColumns.size() != root.getSchema().getFields().size()) {
@@ -1164,17 +1202,37 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
     /**
      * 写入前的目标表护栏（fail-loud，宁可报错也不写坏表）：
      * <ul>
-     *   <li><b>ACID 事务表</b>：拒绝 —— 写出非 ACID 文件会破坏事务表；</li>
+     *   <li><b>ACID 事务表</b>：需开启 {@code catalog.hive.acid.write}。full ACID 只支持 ORC
+     *       且<b>必须分桶</b>（Hive 的 ACID 写格式要求，桶号是行身份的一部分）；insert_only
+     *       （Hive3 轻量事务表）写普通数据文件，Hive2 catalog 不存在这种表；</li>
      *   <li><b>文本格式（TEXTFILE）</b>：只接受 LazySimpleSerDe，且<b>拒绝嵌套类型列</b> ——
      *       分隔文本没有结构信息，array/map/struct 写进去 Hive 读回来只是字符串；</li>
      *   <li><b>分桶表</b>：校验每个分桶列类型可哈希（{@code date}/{@code timestamp}/{@code decimal}/
      *       复杂类型暂不支持写入分桶），否则报错而不是把行散进错误的桶。</li>
      * </ul>
      */
-    static void checkWritableTarget(HiveTableMeta meta) {
+    static void checkWritableTarget(HiveTableMeta meta, boolean acidWrite, boolean hive2) {
         if (meta.transactional()) {
-            throw new UnsupportedOperationException("暂不支持写入 Hive ACID 事务表: "
-                    + meta.database() + "." + meta.table());
+            if (!acidWrite) {
+                throw new UnsupportedOperationException("Hive ACID 写入未开启（catalog.hive.acid.write=false）: "
+                        + meta.database() + "." + meta.table());
+            }
+            if (meta.insertOnly()) {
+                if (hive2) {
+                    throw new UnsupportedOperationException("insert_only 事务表是 Hive3 特性，"
+                            + "hive2 catalog 无法写入: " + meta.database() + "." + meta.table());
+                }
+            } else {
+                if (meta.format() != HiveStorageFormat.ORC) {
+                    throw new UnsupportedOperationException("ACID 事务表只支持 ORC 写入（目标表格式 "
+                            + meta.format() + "）: " + meta.database() + "." + meta.table());
+                }
+                if (!meta.bucketed()) {
+                    throw new UnsupportedOperationException("ACID 事务表写入要求分桶表"
+                            + "（CLUSTERED BY ... INTO N BUCKETS）: "
+                            + meta.database() + "." + meta.table());
+                }
+            }
         }
         if (meta.format() == HiveStorageFormat.TEXT) {
             String serde = meta.serdeLib() == null ? "" : meta.serdeLib();
@@ -1214,7 +1272,13 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         HiveWriteSession existing = writeSessions.get(self);
         if (existing != null) return existing;
 
-        writeSessions.keySet().removeIf(t -> t != self && !t.isAlive());   // 失败/取消残留的会话
+        // 失败/取消残留的会话：所属线程已死，不会再有 close 调用 —— 丢弃（ACID 回滚事务）而不是
+        // 把半截数据提交进去；顺带停掉心跳线程，避免悬挂事务被无限续命。
+        for (Thread t : new ArrayList<>(writeSessions.keySet())) {
+            if (t == self || t.isAlive()) continue;
+            HiveWriteSession abandoned = writeSessions.remove(t);
+            if (abandoned != null) abandoned.discard();
+        }
         FileSystem fs = fsOf(meta.location());
         String tempDir;
         boolean moveOnClose;
@@ -1261,7 +1325,8 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         Table t = new Table();
         t.setDbName(schema);
         t.setTableName(table);
-        t.setOwner(System.getProperty("HADOOP_USER_NAME", System.getProperty("user.name", "dojao")));
+        t.setOwner(hadoopUser != null ? hadoopUser
+                : System.getProperty("HADOOP_USER_NAME", System.getProperty("user.name", "dojao")));
         t.setCreateTime((int) (System.currentTimeMillis() / 1000));
         t.setLastAccessTime(0);
         t.setRetention(0);
@@ -1391,7 +1456,12 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
             throw new IllegalStateException("INSERT OVERWRITE 目标表无 location: "
                     + schema + "." + table);
         }
-        checkWritableTarget(meta);
+        if (meta.transactional()) {
+            // ACID 的覆盖 = delete_delta + insert delta 的原子组合，当前只做纯追加
+            throw new UnsupportedOperationException("ACID 事务表暂不支持 INSERT OVERWRITE，"
+                    + "请改用 INSERT INTO: " + schema + "." + table);
+        }
+        checkWritableTarget(meta, acidWrite, metastore.hive2());
         String staging = new Path(new Path(meta.location()), HiveWriteSession.newTempDirName()).toString();
         try {
             fsOf(staging).mkdirs(new Path(staging));
@@ -1550,10 +1620,39 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         return UUID.randomUUID().toString().replace("-", "").substring(0, 8);
     }
 
+    /**
+     * 按 <b>catalog 身份</b>取 HDFS 文件系统。
+     *
+     * <p>为什么不用 {@code path.getFileSystem(conf)}：它走 JVM 全局 UGI（进程第一个碰 Hadoop 的用户），
+     * 多 catalog 共用 JVM 时会把 A catalog 的文件访问记到 B 用户头上 → 权限拒绝。也不用
+     * {@code FileSystem.get(uri, conf, user)}：它每次新建一个 UGI，而 UGI 的 equals 比的是 Subject
+     * 引用，永远不命中 Hadoop 的全局 FS 缓存 ⇒ 每次调用都泄漏一个 FileSystem。这里用
+     * {@code FileSystem.newInstance} 自建并<b>按 scheme/authority 缓存</b>，一个 catalog 一份。</p>
+     */
     private FileSystem fsOf(String location) {
+        Path p = new Path(location);
+        if (hadoopUgi == null) {
+            try {
+                return p.getFileSystem(conf);
+            } catch (IOException e) {
+                throw new UncheckedIOException("取 Hive 数据目录文件系统失败: " + location, e);
+            }
+        }
+        String key = p.toUri().getScheme() + "://" + String.valueOf(p.toUri().getAuthority());
+        FileSystem cached = fsByAuthority.get(key);
+        if (cached != null) return cached;
         try {
-            Path p = new Path(location);
-            return p.getFileSystem(conf);
+            FileSystem created = FileSystem.newInstance(p.toUri(), conf, hadoopUser);
+            FileSystem prev = fsByAuthority.putIfAbsent(key, created);
+            if (prev != null) {
+                created.close();
+                return prev;
+            }
+            return created;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new UncheckedIOException("取 Hive 数据目录文件系统被中断: " + location,
+                    new InterruptedIOException(e.getMessage()));
         } catch (IOException e) {
             throw new UncheckedIOException("取 Hive 数据目录文件系统失败: " + location, e);
         }
@@ -2018,12 +2117,17 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         return allDigits(head) ? parseIntSafe(head) : null;
     }
 
-    /** {@code bucket_<digits>} → 桶号；否则 null。 */
+    /**
+     * {@code bucket_<digits>[_<后缀>]} → 前导桶号；否则 null。后缀覆盖写侧同桶轮转出的
+     * {@code bucket_00007_1}（Hive ACID 目录内一个桶可能不止一个文件）。
+     */
     private static Integer parseBucketTag(String name) {
         String prefix = "bucket_";
         if (!name.startsWith(prefix)) return null;
-        String num = name.substring(prefix.length());
-        return allDigits(num) ? parseIntSafe(num) : null;
+        String rest = name.substring(prefix.length());
+        int i = 0;
+        while (i < rest.length() && Character.isDigit(rest.charAt(i))) i++;
+        return i == 0 ? null : parseIntSafe(rest.substring(0, i));
     }
 
     private static boolean allDigits(String s) {
@@ -2111,7 +2215,7 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         FileStatus[] statuses;
         try {
             Path p = new Path(dir);
-            fs = p.getFileSystem(conf);
+            fs = fsOf(dir);
             statuses = fs.listStatus(p);
         } catch (FileNotFoundException e) {
             return;   // 目录还不存在 / 已被清理 → 当空
@@ -2275,7 +2379,7 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
      * Hive 自己的 {@code .hive-staging_*} 都不该被当成数据读。
      */
     private void walk(Path dir, int depth, List<FileEntry> acc) throws IOException {
-        FileSystem fs = dir.getFileSystem(conf);
+        FileSystem fs = fsOf(dir.toString());
         FileStatus[] statuses;
         try {
             statuses = fs.listStatus(dir);
@@ -2340,7 +2444,7 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
 
     private long orcRowCount(String file) {
         try (Reader reader = OrcFile.createReader(new Path(file),
-                OrcFile.readerOptions(conf).filesystem(new Path(file).getFileSystem(conf)))) {
+                OrcFile.readerOptions(conf).filesystem(fsOf(file)))) {
             return reader.getNumberOfRows();
         } catch (Exception e) {
             return -1L;
@@ -2348,6 +2452,20 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
     }
 
     private long parquetRowCount(String file) {
+        try {
+            return hadoopUgi == null
+                    ? parquetRowCountAs(file)
+                    : hadoopUgi.doAs((PrivilegedExceptionAction<Long>) () -> parquetRowCountAs(file));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return -1L;
+        } catch (Exception e) {
+            return -1L;
+        }
+    }
+
+    /** 见 {@link #parquetRowCount}：footer 读取只收 conf，靠调用方包 catalog 身份的 {@code doAs}。 */
+    private long parquetRowCountAs(String file) throws IOException {
         try (ParquetFileReader reader = ParquetFileReader.open(
                 HadoopInputFile.fromPath(new Path(file), conf))) {
             long total = 0L;
@@ -2355,8 +2473,6 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
                 total += block.getRowCount();
             }
             return total;
-        } catch (Exception e) {
-            return -1L;
         }
     }
 
@@ -2370,15 +2486,16 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
             throws IOException {
         Path path = new Path(unit.path());
         long t0 = System.nanoTime();
-        FileSystem fs = path.getFileSystem(conf);
+        FileSystem fs = fsOf(unit.path());
         logSlow("取 FileSystem", System.nanoTime() - t0, unit.path());
         t0 = System.nanoTime();
         Object converter = switch (meta.format()) {
             // ORC / Parquet 把投影推给读取器：只读这几列的字节，不是读完再裁
             case ORC -> new ORCFileArrowConverter(allocator, path, fs, batchSize,
                     unit.start(), unit.length(), projection, nestedNativeFor(meta));
-            case PARQUET -> new ParquetFileArrowConverter(allocator, path, fs, batchSize,
-                    unit.start(), unit.length(), projection, nestedNativeFor(meta));
+            // Parquet 的 footer 读取只收 (Path, Configuration)，内部 path.getFileSystem(conf) 走全局
+            // UGI —— 必须用 catalog 身份包 doAs，否则文件访问记到别的用户头上。
+            case PARQUET -> openParquet(path, fs, unit, meta, projection);
             // 文本文件不自描述 schema：显式给出 Hive 列定义 + SerDe 分隔符 / 转义 / NULL 串。
             // 无列式索引可跳读，整行读入后由上层按名取列（投影照常生效）。
             case TEXT -> new TextFileArrowConverter(allocator, path, fs,
@@ -2387,6 +2504,23 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         };
         logSlow("打开数据文件（读 footer / schema）", System.nanoTime() - t0, unit.describe());
         return converter;
+    }
+
+    /** Parquet 读取器（见 {@link #openConverter} 里的说明）：catalog 身份的 {@code doAs} 兜住 footer 读。 */
+    private Object openParquet(Path path, FileSystem fs, HiveSplitUnit unit, HiveTableMeta meta,
+                               List<String> projection) throws IOException {
+        if (hadoopUgi == null) {
+            return new ParquetFileArrowConverter(allocator, path, fs, batchSize,
+                    unit.start(), unit.length(), projection, nestedNativeFor(meta));
+        }
+        try {
+            return hadoopUgi.doAs((PrivilegedExceptionAction<ParquetFileArrowConverter>)
+                    () -> new ParquetFileArrowConverter(allocator, path, fs, batchSize,
+                            unit.start(), unit.length(), projection, nestedNativeFor(meta)));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new InterruptedIOException("打开 Parquet 文件被中断: " + path);
+        }
     }
 
     /**
@@ -2637,7 +2771,7 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
                 long start = System.nanoTime();
                 HiveAcidMerger.Result res =
                         HiveAcidMerger.mergeGroup(groupRoot, paths, meta, allocator, conf, batchSize,
-                                nestedNative);
+                                nestedNative, fsOf(groupRoot));
                 System.err.printf("[Hive] ACID 合并：%s 桶组（%d 个文件）→ %d 行（耗时 %d ms）%n",
                         baseName(groupRoot), unitList.size(), res.rowCount(),
                         (System.nanoTime() - start) / 1_000_000L);

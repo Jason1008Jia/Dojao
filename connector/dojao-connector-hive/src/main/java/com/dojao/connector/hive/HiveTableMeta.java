@@ -64,6 +64,19 @@ public record HiveTableMeta(String catalogName, String database, String table, S
     }
 
     /**
+     * 是否 <b>insert_only 事务表</b>（Hive3 的轻量事务表）。
+     *
+     * <p>与 full ACID 的区别在写侧：insert_only 的数据文件<b>没有</b> {@code operation /
+     * originalTransaction / bucket / rowId / currentTransaction / row} 这层 ACID 包装，就是普通
+     * 数据文件；可见性只由所在 {@code delta_<id>_<id>_0/} 目录名 + 写事务快照决定。表参数
+     * {@code transactional_properties=insert_only} 标记它。</p>
+     */
+    public boolean insertOnly() {
+        return transactional && "insert_only".equalsIgnoreCase(
+                parameters.getOrDefault("transactional_properties", ""));
+    }
+
+    /**
      * 本表实际生效的「原生嵌套」开关。
      *
      * <p><b>TEXT 格式表恒按文本</b>：分隔文本里没有结构信息，嵌套列在文件里只有字符串，

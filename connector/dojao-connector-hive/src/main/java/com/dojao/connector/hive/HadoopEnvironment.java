@@ -16,7 +16,10 @@ import java.util.Map;
  *   <li>没有 {@code hadoop.home.dir} + {@code bin/winutils.exe} 时，任何
  *       {@code FileSystem.get()} 都会在 {@code Shell.<clinit>} 直接抛 —— 即使只写 hdfs://。
  *       这里用<b>空占位 winutils.exe</b> 兜底（Hadoop 只查存在性，hdfs 路径够用）。</li>
- *   <li>HDFS 访问身份由 {@code HADOOP_USER_NAME} 决定，需与集群侧一致。</li>
+ *   <li>HDFS 访问身份由 {@code HADOOP_USER_NAME} 决定，需与集群侧一致。<b>但 UGI 是 JVM 级单例、
+ *       首次访问即锁定</b>，后设置的属性不生效 —— 多 catalog 各自不同用户时必须走
+ *       {@code HiveConnector} 的 per-catalog 身份（HMS {@code doAs} + {@code FileSystem.newInstance}），
+ *       不能只靠这里设属性。</li>
  *   <li>公网链路被 NAT 掐断：NameNode/DataNode 的 RPC 连接空闲 ~30s 会被 RST。把
  *       {@code ipc.ping.interval} 压到 20s（客户端在 socket 读超时时发 ping 刷新映射）
  *       并放宽连接/重试参数，长连接才不会被单方面回收。</li>
@@ -116,6 +119,10 @@ public final class HadoopEnvironment {
                 boolProp(props, "hive.metastore.client.capability.check", false));
         conf.setBoolean("hive.metastore.sasl.enabled",
                 boolProp(props, "hive.metastore.sasl.enabled", false));
+        // 建连时把当前 UGI（catalog 身份，见 HiveMetastore.client）set_ugi 给 HMS 连接，
+        // HMS 之后所有 HDFS 权限检查都按这个身份执行。默认 true，显式写出来避免被外部配置关掉。
+        conf.setBoolean("hive.metastore.execute.setugi",
+                boolProp(props, "hive.metastore.execute.setugi", true));
         return conf;
     }
 

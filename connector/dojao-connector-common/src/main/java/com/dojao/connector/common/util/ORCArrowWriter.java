@@ -169,7 +169,11 @@ public class ORCArrowWriter implements ArrowFileWriter {
 
     // ==================== 列填充（Arrow → ORC ColumnVector） ====================
 
-    private static void fillColumn(ColumnVector dst, FieldVector src, int rows) {
+    /**
+     * 把一页 Arrow 向量填进 ORC 列（行区间 0..rows）。包级复用点：Hive ACID 写入器在
+     * {@code row} 结构体的各子列上调用它，避免为嵌套类型再写一份 Arrow→ORC 搬运逻辑。
+     */
+    public static void fillColumn(ColumnVector dst, FieldVector src, int rows) {
         fillRange(dst, src, 0, 0, rows);
     }
 

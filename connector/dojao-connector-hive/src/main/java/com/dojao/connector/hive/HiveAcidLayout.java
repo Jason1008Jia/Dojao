@@ -99,6 +99,30 @@ public final class HiveAcidLayout {
         return dirName != null && dirName.startsWith(DELETE_DELTA_PREFIX);
     }
 
+    // ==================== 目录 / 文件名（写侧，Hive 同口径） ====================
+
+    /**
+     * 一次写事务的 delta 目录名 —— 与 Hive {@code AcidUtils.deltaSubdir(min,max,stmt)} 同格式：
+     * {@code delta_%07d_%07d_%04d}（两张 id 相同、语句号取 0），即
+     * {@code delta_0000042_0000042_0000}。
+     *
+     * <p>{@code acidId} 在 Hive3 是 <b>writeId</b>（{@code allocateTableWriteId}），Hive2 则是
+     * <b>事务 id</b> —— 两版目录名格式相同，含义不同，见 {@link #Visibility}。</p>
+     */
+    public static String deltaDirName(long acidId) {
+        return String.format(java.util.Locale.ROOT, "%s%07d_%07d_%04d",
+                DELTA_PREFIX, acidId, acidId, 0);
+    }
+
+    /**
+     * 桶文件名 —— Hive 口径 {@code bucket_%05d}；同一桶在同一个 delta 目录里出现多个文件时
+     * （写侧超文件句柄上限后的轮转），第 {@code copy} 个带 {@code _<copy>} 后缀。
+     */
+    public static String bucketFileName(int bucketId, int copy) {
+        String name = String.format(java.util.Locale.ROOT, "bucket_%05d", bucketId);
+        return copy <= 0 ? name : name + "_" + copy;
+    }
+
     // ==================== 读快照可见性 ====================
 
     /**

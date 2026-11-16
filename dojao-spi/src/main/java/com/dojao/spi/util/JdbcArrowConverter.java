@@ -54,14 +54,28 @@ import java.util.Map;
  */
 public class JdbcArrowConverter {
 
+    /**
+     * 单批<b>字节</b>上界（默认 32MB）：只按行数分批时，宽行（大 JSON / 大文本 / BLOB）
+     * 会出现「10000 行一批 = 几百 MB 的 Java String + 同量 UTF-8 byte[]」的双份临时代，
+     * 直接把 Worker 堆撑爆（实测 {@code OutOfMemoryError: Java heap space} 停在大字段表扫描）。
+     * 行数到顶或字节到顶都收批 —— 页小一点只多几次网络往返，爆堆则查询直接失败。
+     */
+    public static final long DEFAULT_MAX_BATCH_BYTES = 32L * 1024 * 1024;
+
     private final BufferAllocator allocator;
     private final int batchSize;
+    private final long maxBatchBytes;
     private Schema cachedSchema;
     private List<ColumnWriter> cachedWriters;
 
     public JdbcArrowConverter(BufferAllocator allocator, int batchSize) {
+        this(allocator, batchSize, DEFAULT_MAX_BATCH_BYTES);
+    }
+
+    public JdbcArrowConverter(BufferAllocator allocator, int batchSize, long maxBatchBytes) {
         this.allocator = allocator;
         this.batchSize = batchSize;
+        this.maxBatchBytes = maxBatchBytes > 0 ? maxBatchBytes : DEFAULT_MAX_BATCH_BYTES;
     }
 
     // ==================== 批次转换（两阶段） ====================
@@ -78,13 +92,17 @@ public class JdbcArrowConverter {
             w.allocateTemp(batchSize);
         }
 
-        // Phase 1: 行扫描 → 列数组
+        // Phase 1: 行扫描 → 列数组（行数到顶或字节到顶即收批，见 DEFAULT_MAX_BATCH_BYTES）
         int rowCount = 0;
+        long bytes = 0L;
         while (rowCount < batchSize && rs.next()) {
             for (int col = 0; col < cachedWriters.size(); col++) {
-                cachedWriters.get(col).extract(rs, rowCount);
+                ColumnWriter w = cachedWriters.get(col);
+                w.extractRow(rs, rowCount);
+                bytes += w.lastBytes();
             }
             rowCount++;
+            if (bytes >= maxBatchBytes) break;
         }
 
         if (rowCount == 0) {
@@ -416,6 +434,12 @@ public class JdbcArrowConverter {
     abstract static class ColumnWriter {
         protected final int columnIndex;
 
+        /**
+         * 上一行该列提取出的<b>近似字节数</b>（只给宽列计数：字符串 / 二进制）。
+         * 标量列固定开销小，不计数 —— 单批字节上界只为拦住大字段。
+         */
+        private long lastBytes;
+
         protected ColumnWriter(int columnIndex) {
             this.columnIndex = columnIndex;
         }
@@ -425,6 +449,22 @@ public class JdbcArrowConverter {
 
         /** 从 ResultSet 当前行提取值，写入临时数组的 {@code row} 位置。 */
         abstract void extract(ResultSet rs, int row) throws SQLException;
+
+        /** 提取一行并把 {@link #lastBytes} 复位（宽列在 {@link #extract} 里按实际长度回填）。 */
+        final void extractRow(ResultSet rs, int row) throws SQLException {
+            lastBytes = 0L;
+            extract(rs, row);
+        }
+
+        /** 上一行该列的近似字节数（见 {@link #lastBytes}）。 */
+        final long lastBytes() {
+            return lastBytes;
+        }
+
+        /** 宽列覆写后回填本行字节数。 */
+        protected final void reportBytes(long bytes) {
+            lastBytes = Math.max(0L, bytes);
+        }
 
         /** 从临时数组批量写入 Arrow vector，返回填充后的 vector。 */
         abstract FieldVector writeBatch(BufferAllocator allocator, Field field, int rowCount);
@@ -650,8 +690,11 @@ public class JdbcArrowConverter {
         @Override void allocateTemp(int maxRows) { values = new String[maxRows]; nulls = new boolean[maxRows]; }
 
         @Override void extract(ResultSet rs, int row) throws SQLException {
-            values[row] = rs.getString(columnIndex);
+            String v = rs.getString(columnIndex);
+            values[row] = v;
             nulls[row] = rs.wasNull();
+            // 大字段（JSON / 长文本）是单批字节上界的主要来源：按字符数近似 Java 堆占用
+            reportBytes(v == null ? 0L : (long) v.length());
         }
 
         @Override FieldVector writeBatch(BufferAllocator allocator, Field field, int rowCount) {
@@ -800,8 +843,10 @@ public class JdbcArrowConverter {
         @Override void allocateTemp(int maxRows) { values = new byte[maxRows][]; nulls = new boolean[maxRows]; }
 
         @Override void extract(ResultSet rs, int row) throws SQLException {
-            values[row] = rs.getBytes(columnIndex);
+            byte[] v = rs.getBytes(columnIndex);
+            values[row] = v;
             nulls[row] = rs.wasNull();
+            reportBytes(v == null ? 0L : v.length);
         }
 
         @Override FieldVector writeBatch(BufferAllocator allocator, Field field, int rowCount) {

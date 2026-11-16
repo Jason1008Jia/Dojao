@@ -33,10 +33,13 @@ final class HiveConnectorFactorySupport {
         props.put("catalog.hive.partition.limit", "可选。分区枚举上限，默认 10000");
         props.put("catalog.hive.bucket.pruning", "可选，默认 true。分桶表桶裁剪开关 —— 分桶列被等值/IN 命中时只读命中桶文件");
         props.put("catalog.hive.acid.read", "可选，默认 false。ACID（事务表）读取开关 —— 开启后按写事务快照过滤 base/delta 并做行级删除/更新合并");
+        props.put("catalog.hive.acid.write", "可选，默认 true。ACID（事务表）写入开关 —— INSERT INTO 走写事务 + delta 目录（Hive2 用事务 id，Hive3 用 writeId）；关闭则明确拒绝写事务表");
         props.put("catalog.hive.compact.target.bytes", "可选。小文件合并目标大小（字节，可写 64M/1G），默认取 HDFS 块大小");
         props.put("catalog.hive.split.file.min.bytes", "可选。单文件大到该值才尝试文件内切割，默认 1G");
         props.put("catalog.hive.metastore.kerberos.principal", "可选。Kerberos 认证主体（HMS 开启 Kerberos 时需要）");
-        props.put("catalog.hive.hadoop.user.name", "可选。HDFS / HMS 访问身份，等价 HADOOP_USER_NAME（集群侧需存在该用户）");
+        props.put("catalog.hive.hadoop.user.name", "可选。HDFS / HMS 访问身份（集群侧需存在该用户）。"
+                + "per-catalog 生效：本 catalog 的 HMS 连接与 HDFS 文件系统都按此身份访问，"
+                + "同 JVM 多 hive catalog 可各用各的用户");
         props.put("catalog.hive.dfs.client.use.datanode.hostname",
                 "可选，默认 true。DataNode 回连用主机名；外网部署且只能解析 IP 时设为 false");
 

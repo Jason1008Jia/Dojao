@@ -14,6 +14,7 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.util.Text;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -38,6 +39,9 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 一次 Hive 写入的会话 —— 把某线程正在写的页攒成数据文件，最后整体落到表目录。
@@ -57,6 +61,13 @@ import java.util.UUID;
  *   <li>{@code moveOnClose} = false（INSERT OVERWRITE）：{@code close()} 只 flush 文件，
  *       搬运留给 {@code commitOverwrite}（要等全部 Worker 都写完才动，原表在此之前保持原样）。</li>
  * </ul>
+ *
+ * <p><b>ACID 事务表</b>（{@code transactional=true}）：文件不落分区目录，而是落
+ * {@code <分区目录>/delta_<id>_<id>_0/}，并走「开事务 → 写 → mv 入位 → 提交事务」。
+ * {@code id} 在 Hive3 是 writeId（{@code allocateTableWriteId}），Hive2 是事务 id；
+ * full ACID 文件带五列包装（{@link HiveAcidArrowWriter}），insert_only 表则写普通数据文件
+ * （无包装列，可见性只靠 delta 目录名）。收尾顺序固定为「先落地、后提交」—— 见
+ * {@link #commitAcid()}。</p>
  *
  * <p><b>线程隔离</b>：连接器实例按进程共享，Worker 任务池真并发跑片段 ⇒ 每个写线程一个会话
  * （{@link HiveConnector} 用 {@code Thread} 做键）。</p>
@@ -82,6 +93,27 @@ final class HiveWriteSession implements AutoCloseable {
     private final boolean moveOnClose;
     /** 复合类型按原生嵌套结构写（{@code catalog.hive.nested.mode=native}）还是按文本写。 */
     private final boolean nestedNative;
+
+    /** 目标表是否 ACID 事务表（写侧走 delta 目录 + 事务提交）。 */
+    private final boolean acid;
+    /** insert_only 事务表：delta 目录里写普通数据文件（无 ACID 包装列）。 */
+    private final boolean insertOnly;
+    /** 事务 id（懒开启：首次真正写数据才 openTxn）；-1 = 尚未开启。 */
+    private long txnId = -1;
+    /** 目录 / 行标识里的 id（Hive3 = writeId，Hive2 = txnId）。 */
+    private long acidId;
+    /** delta 目录名 —— 本会话写出的全部文件都在这个目录下。 */
+    private String deltaDirName;
+    /** 事务保活线程（写时长超过 {@code hive.txn.timeout} 时防止被 HMS 回滚）。 */
+    private ScheduledExecutorService heartbeat;
+    /** 任一页写入失败 → 收尾时回滚事务，不提交半截数据。 */
+    private boolean failed;
+    /** (分区, 桶) → 下一条记录的 rowId（跨文件连续，保证 RecordIdentifier 唯一）。 */
+    private final Map<String, Long> nextRowId = new HashMap<>();
+    /** (分区, 桶) → 该桶已打开的数据文件数（文件句柄轮转时用于 {@code bucket_XXXXX_<n>} 命名）。 */
+    private final Map<String, Integer> fileCopies = new HashMap<>();
+    /** 已 mv 进表目录的 delta 目录（回滚时清理）。 */
+    private final List<Path> placedDeltaDirs = new ArrayList<>();
 
     private final List<String> dataColumnNames;
     private final List<String> partitionColumnNames;
@@ -110,6 +142,8 @@ final class HiveWriteSession implements AutoCloseable {
         this.tempDir = new Path(tempDirLocation);
         this.moveOnClose = moveOnClose;
         this.nestedNative = nestedNative;
+        this.acid = meta.transactional();
+        this.insertOnly = meta.insertOnly();
         this.dataColumnNames = new ArrayList<>();
         for (Column c : meta.dataColumns()) dataColumnNames.add(c.name());
         this.partitionColumnNames = meta.partitionKeys();
@@ -132,28 +166,34 @@ final class HiveWriteSession implements AutoCloseable {
     void write(VectorSchemaRoot root, List<String> pageColumns) throws IOException {
         int rows = root.getRowCount();
         if (rows <= 0) return;
-        Map<String, Integer> idx = indexByName(root, pageColumns);
+        try {
+            Map<String, Integer> idx = indexByName(root, pageColumns);
 
-        if (!meta.partitioned() && !meta.bucketed()) {
-            writeGroup(root, allRows(rows), new WriteGroup("", -1), idx);
-            return;
-        }
-        // 动态分区 × 分桶：按（分区列值, 桶号）联合分组；非分桶表桶号恒 -1（只有分区维）
-        Map<WriteGroup, List<Integer>> groups = new LinkedHashMap<>();
-        for (int r = 0; r < rows; r++) {
-            String dir = "";
-            if (meta.partitioned()) {
-                List<String> values = new ArrayList<>(partitionColumnNames.size());
-                for (String pc : partitionColumnNames) {
-                    values.add(valueAsString(root, idx, pc, r, "分区列"));
-                }
-                dir = partitionDir(values);
+            if (!meta.partitioned() && !meta.bucketed()) {
+                writeGroup(root, allRows(rows), new WriteGroup("", -1), idx);
+                return;
             }
-            int bucketId = meta.bucketed() ? bucketId(root, idx, r) : -1;
-            groups.computeIfAbsent(new WriteGroup(dir, bucketId), k -> new ArrayList<>()).add(r);
-        }
-        for (Map.Entry<WriteGroup, List<Integer>> e : groups.entrySet()) {
-            writeGroup(root, e.getValue(), e.getKey(), idx);
+            // 动态分区 × 分桶：按（分区列值, 桶号）联合分组；非分桶表桶号恒 -1（只有分区维）
+            Map<WriteGroup, List<Integer>> groups = new LinkedHashMap<>();
+            for (int r = 0; r < rows; r++) {
+                String dir = "";
+                if (meta.partitioned()) {
+                    List<String> values = new ArrayList<>(partitionColumnNames.size());
+                    for (String pc : partitionColumnNames) {
+                        values.add(valueAsString(root, idx, pc, r, "分区列"));
+                    }
+                    dir = partitionDir(values);
+                }
+                int bucketId = meta.bucketed() ? bucketId(root, idx, r) : -1;
+                groups.computeIfAbsent(new WriteGroup(dir, bucketId), k -> new ArrayList<>()).add(r);
+            }
+            for (Map.Entry<WriteGroup, List<Integer>> e : groups.entrySet()) {
+                writeGroup(root, e.getValue(), e.getKey(), idx);
+            }
+        } catch (IOException | RuntimeException e) {
+            // 字面量失败 → 收尾时回滚事务，宁可整事务失败也不要提交半截数据
+            failed = true;
+            throw e;
         }
     }
 
@@ -207,25 +247,57 @@ final class HiveWriteSession implements AutoCloseable {
         } finally {
             slice.close();
         }
+        if (acid && !insertOnly) {
+            // rowId 在同一 (分区, 桶) 内单调递增 —— 轮转出的第二个文件必须接着数，不能从 0 重来
+            nextRowId.merge(group.key(), (long) rows.size(), Long::sum);
+        }
     }
 
     /**
      * 新开一个数据文件（格式取 {@link HiveTableMeta#format()}）：
      * <ul>
-     *   <li>分桶表 → 文件名 {@code <6位桶号>_<token>_<seq><后缀>}（读侧 {@code bucketIdOf} 按前导数字归桶）；</li>
-     *   <li>非分桶 → {@code part-<token>-<seq><后缀>}。</li>
+     *   <li>普通表：分桶 → {@code <6位桶号>_<token>_<seq><后缀>}（读侧 {@code bucketIdOf} 按前导数字归桶）；
+     *       非分桶 → {@code part-<token>-<seq><后缀>}；</li>
+     *   <li>ACID 表：路径固定 {@code <分区目录>/delta_<id>_<id>_0000/}，文件名用 Hive 口径
+     *       {@code bucket_%05d}（同桶轮转出的第 n 个文件带 {@code _<n>} 后缀）；full ACID 额外写
+     *       {@code _orc_acid_version}，且写入器换成 {@link HiveAcidArrowWriter}。</li>
      * </ul>
      */
     private ArrowFileWriter openWriter(WriteGroup group) throws IOException {
         List<Field> dataFields = meta.dataFields(nestedNative);
         HiveStorageFormat format = meta.format();
-        Path dir = group.dir().isEmpty() ? tempDir : new Path(tempDir, group.dir());
+        Path root = group.dir().isEmpty() ? tempDir : new Path(tempDir, group.dir());
+
+        if (acid) {
+            // 事务表：文件必须落在 delta_<id>_<id>_0000/ 下，收尾统一 mv + 提交事务
+            ensureTxn();
+            Path dir = new Path(root, deltaDirName);
+            fs.mkdirs(dir);
+            writeAcidVersionFile(dir);
+            int copy = fileCopies.merge(group.key(), 1, Integer::sum) - 1;
+            String name = group.bucketId() >= 0
+                    ? HiveAcidLayout.bucketFileName(group.bucketId(), copy)
+                    : "part-" + fileToken + "-" + (fileSeq++) + format.fileSuffix();
+            Path file = new Path(dir, name);
+            if (!insertOnly) {
+                return new HiveAcidArrowWriter(conf, file, fs, dataFields, acidId,
+                        group.bucketId(), nextRowId.getOrDefault(group.key(), 0L));
+            }
+            return formatWriter(format, file, dataFields);
+        }
+
+        Path dir = root;
         fs.mkdirs(dir);
         String suffix = format.fileSuffix();
         String name = group.bucketId() >= 0
                 ? String.format("%06d", group.bucketId()) + "_" + fileToken + "_" + (fileSeq++) + suffix
                 : "part-" + fileToken + "-" + (fileSeq++) + suffix;
-        Path file = new Path(dir, name);
+        return formatWriter(format, new Path(dir, name), dataFields);
+    }
+
+    /** 按目标表物理格式建普通数据文件写入器（非 ACID 与 insert_only 共用）。 */
+    private ArrowFileWriter formatWriter(HiveStorageFormat format, Path file, List<Field> dataFields)
+            throws IOException {
         int[] sourceIndexes = identity(dataFields.size());
         return switch (format) {
             case ORC -> new ORCArrowWriter(conf, file, fs, dataFields, sourceIndexes);
@@ -272,12 +344,166 @@ final class HiveWriteSession implements AutoCloseable {
         closed = true;
         for (ArrowFileWriter w : writers.values()) closeQuietly(w);
         writers.clear();
-        if (!moveOnClose) return;   // OVERWRITE：留给 commitOverwrite
         try {
+            if (!moveOnClose) {                 // OVERWRITE：留给 commitOverwrite
+                if (acid) abortAcid();
+                return;
+            }
+            if (acid) {
+                if (failed) abortAcid();        // 任一页失败 → 整事务回滚
+                else if (txnId >= 0) commitAcid();   // txnId<0：没写出数据，无需提交空事务
+                return;
+            }
             moveIntoPlace();
-        } catch (IOException e) {
+        } catch (IOException | RuntimeException e) {
+            if (acid) abortAcid();
             throw new RuntimeException("Hive 写入收尾失败（临时目录 " + tempDir + "）", e);
+        } finally {
+            stopHeartbeat();
         }
+    }
+
+    /**
+     * 丢弃一个<b>再也不会被收尾</b>的会话（所属线程已死 / 查询取消后连接器不再替它收尾）：
+     * 回滚事务（ACID）并删掉临时目录，<b>绝不提交</b>半截数据。
+     *
+     * <p>与 {@link #close()} 的区别：这里不做「搬入表目录 / commitTxn」—— 没有「写完了」的信号时，
+     * 宁可让本次写出的数据整体消失，也不能把被取消 / 异常打断的追加提交进去；同时停掉 ACID
+     * 心跳线程，免得事务被无限续命（HMS 会按 {@code hive.txn.timeout} 回收）。</p>
+     */
+    void discard() {
+        if (closed) return;
+        closed = true;
+        for (ArrowFileWriter w : writers.values()) closeQuietly(w);
+        writers.clear();
+        if (acid) {
+            abortAcid();
+        } else {
+            try {
+                fs.delete(tempDir, true);
+            } catch (IOException ignored) {
+                // 清理失败无碍：临时目录以 _dojao_tmp_ 前缀命名，不会被当成数据文件读
+            }
+        }
+        stopHeartbeat();
+    }
+
+    // ==================== ACID 收尾 ====================
+
+    /**
+     * 首次真正写数据时开启事务 —— 空写（没有任何行）不产生空事务 / 空 writeId。
+     *
+     * <p>{@code acidId}：Hive3 为 {@code allocateTableWriteId} 分配到的写 id，Hive2 直接是事务 id
+     * （见 {@link HiveMetastore#allocateWriteId(long, String, String)}）。分配失败时先回滚刚开的
+     * 事务再抛出，不留悬挂事务。</p>
+     */
+    private void ensureTxn() {
+        if (txnId >= 0) return;
+        // 事务归属用户必须与 catalog 的 Hadoop 身份一致（HMS 按连接身份做 HDFS 权限检查），
+        // 不能用 System 属性兜底 —— 同一 JVM 多 catalog 时那是进程级别的、已被别的 catalog 改过。
+        String user = metastore.user() != null ? metastore.user()
+                : System.getProperty("user.name", "hive");
+        long opened = metastore.openTxn(user);
+        try {
+            acidId = metastore.allocateWriteId(opened, meta.database(), meta.table());
+        } catch (RuntimeException e) {
+            try { metastore.rollbackTxn(opened); } catch (RuntimeException ignored) { }
+            throw e;
+        }
+        txnId = opened;
+        deltaDirName = HiveAcidLayout.deltaDirName(acidId);
+        startHeartbeat();
+    }
+
+    /**
+     * 事务保活线程（60s 一次）。HMS 的 {@code hive.txn.timeout} 默认 300s —— 大 INSERT 写 HDFS
+     * 可能远超这个时间，没有心跳就会被判超时回滚，commit 阶段直接失败。
+     */
+    private void startHeartbeat() {
+        long id = txnId;
+        heartbeat = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "hive-acid-heartbeat");
+            t.setDaemon(true);
+            return t;
+        });
+        heartbeat.scheduleWithFixedDelay(() -> metastore.heartbeatTxn(id), 60, 60, TimeUnit.SECONDS);
+    }
+
+    private void stopHeartbeat() {
+        ScheduledExecutorService hb = heartbeat;
+        heartbeat = null;
+        if (hb != null) hb.shutdownNow();
+    }
+
+    /**
+     * 在 delta 目录写 ACID 格式标记 —— 与 Hive {@code OrcRecordUpdater} 同款：文件
+     * {@code _orc_acid_version}，内容是 4 字节大端整数 {@code 0}。Hive 的读侧靠它区分
+     * 「老的两列 ACID 格式」与现在的六列包装格式，缺失会被当成老格式误读。
+     */
+    private void writeAcidVersionFile(Path dir) throws IOException {
+        if (insertOnly) return;      // insert_only 的数据文件没有包装列，也不需要版本标记
+        Path version = new Path(dir, "_orc_acid_version");
+        if (fs.exists(version)) return;
+        try (FSDataOutputStream os = fs.create(version, false)) {
+            os.writeInt(0);
+        }
+    }
+
+    /**
+     * ACID 收尾：把临时目录里的 delta 目录 mv 到各分区目录 → 登记新分区 → 提交事务。
+     *
+     * <p><b>顺序不能反</b>：先落地文件、后提交事务。反过来的话「事务已提交、文件还没 mv」的窗口里
+     * 读者会看到一个已提交但没有任何文件的写 id（静默丢行）；而文件已落地、提交失败只留下一个
+     * 不可见（事务未提交 / 已回滚）的 delta 目录，不影响读，HMS 清道夫之后也会回收。</p>
+     */
+    private void commitAcid() throws IOException {
+        Path target = new Path(meta.location());
+        fs.mkdirs(target);
+        if (!meta.partitioned()) {
+            moveDeltaDirs(tempDir, target);
+        } else {
+            FileStatus[] sub = fs.listStatus(tempDir);
+            if (sub != null) {
+                for (FileStatus s : sub) {
+                    if (!s.isDirectory()) continue;
+                    Path dest = new Path(target, s.getPath().getName());
+                    fs.mkdirs(dest);
+                    moveDeltaDirs(s.getPath(), dest);
+                    registerPartition(s.getPath().getName(), dest);
+                }
+            }
+        }
+        fs.delete(tempDir, true);
+        metastore.commitTxn(txnId);
+    }
+
+    /** 把 {@code src} 下的 {@code delta_*} 子目录整体改名进 {@code dest}（同文件系统内 mv）。 */
+    private void moveDeltaDirs(Path src, Path dest) throws IOException {
+        FileStatus[] children = fs.listStatus(src);
+        if (children == null) return;
+        for (FileStatus c : children) {
+            if (!c.isDirectory() || !c.getPath().getName().startsWith(HiveAcidLayout.DELTA_PREFIX)) {
+                continue;
+            }
+            Path dst = new Path(dest, c.getPath().getName());
+            if (!fs.rename(c.getPath(), dst)) {
+                throw new IOException("移动 Hive ACID delta 目录失败: " + c.getPath() + " → " + dst
+                        + "（临时目录与表目录应在同一文件系统）");
+            }
+            placedDeltaDirs.add(dst);
+        }
+    }
+
+    /** 失败 / 取消收尾：回滚事务并清掉本次写出的 delta（已 mv 入位的也删，避免留垃圾）。 */
+    private void abortAcid() {
+        if (txnId >= 0) {
+            try { metastore.rollbackTxn(txnId); } catch (RuntimeException ignored) { }
+        }
+        try { fs.delete(tempDir, true); } catch (IOException ignored) { }
+        for (Path p : placedDeltaDirs) {
+            try { fs.delete(p, true); } catch (IOException ignored) { }
+        }
+        placedDeltaDirs.clear();
     }
 
     /**
