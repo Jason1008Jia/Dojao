@@ -342,6 +342,37 @@ public interface DojaoConnector extends DataSourceMetaService {
     }
 
     /**
+     * 「<b>引擎注册标量函数谓词</b>」能否由数据源求值 —— 返回<b>翻译成数据源方言后</b>的谓词文本；
+     * 空 = 数据源不认识，继续由引擎在扫描节点用 {@code FilterOperator} 求值。
+     *
+     * <p><b>为什么需要这个契约。</b>引擎规划期把
+     * {@code to_date(dt) = '2026-11-15'} 这类「已注册标量函数 + 字面量」的谓词一律划给引擎侧过滤
+     * （数据源默认不认识 Dojao 注册函数）。但 ClickHouse / Doris 等支持<b>用表达式做分区键</b>
+     * （{@code PARTITION BY toDate(data_insert_time)}），它们恰恰认识这类谓词 —— 只有把谓词真正写进
+     * 数据源 SQL 的 {@code WHERE}，才能触发数据源自己的分区裁剪；否则就是<b>全分区扫描</b>，谓词
+     * 在引擎侧白算。连接器在这里声明「我认识哪些函数、它们在方言里叫什么」。</p>
+     *
+     * <p><b>安全契约：返回非空即被下推，数据源必须逐行求值出与引擎<b>完全相同</b>的真假。</b></p>
+     * <ul>
+     *   <li>只翻译语义<b>严格等价</b>的函数；时区 / 周起始 / 参数顺序 / 返回类型不同的一律不映射
+     *       （返回空，继续引擎过滤）。例：{@code dayofweek} 在 Hive 口径是 1=周日，ClickHouse 的
+     *       {@code toDayOfWeek} 是 1=周一 —— 映射即错行。</li>
+     *   <li>谓词里出现<b>任何</b>不认识的函数名 → 返回空（不能只翻译一半）。</li>
+     *   <li>实现须<b>幂等</b>：对自己返回的文本再次调用须返回相同文本（扫描节点会拿已经翻译过的
+     *       {@code filterExpression} 再拆一次）。</li>
+     *   <li>拿不准一律返回空 —— 代价只是少一次下推；返回错了是<b>静默错行</b>（无异常、无日志）。</li>
+     * </ul>
+     *
+     * <p>默认空 = 不声明，既有行为完全不变。</p>
+     *
+     * @param conjunct 单个合取项原文（已剥掉限定符与整体外层括号）
+     * @return 翻译后的数据源方言谓词；空 = 数据源求值不了，留给引擎
+     */
+    default Optional<String> renderFunctionPredicate(String conjunct) {
+        return Optional.empty();
+    }
+
+    /**
      * 本次扫描里，哪些合取项<b>已被分区裁剪兑现</b> —— 即对<b>每个保留下来的分区的每一行</b>都必然成立。
      * 引擎据此免于在扫描之上再求值这些项（{@code ConnectorScanOperator.openWithEngineFilter}）。
      *

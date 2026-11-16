@@ -36,6 +36,19 @@ final class HiveConnectorFactorySupport {
         props.put("catalog.hive.compact.target.bytes", "可选。小文件合并目标大小（字节，可写 64M/1G），默认取 HDFS 块大小");
         props.put("catalog.hive.split.file.min.bytes", "可选。单文件大到该值才尝试文件内切割，默认 1G");
         props.put("catalog.hive.metastore.kerberos.principal", "可选。Kerberos 认证主体（HMS 开启 Kerberos 时需要）");
+        props.put("catalog.hive.hadoop.user.name", "可选。HDFS / HMS 访问身份，等价 HADOOP_USER_NAME（集群侧需存在该用户）");
+        props.put("catalog.hive.dfs.client.use.datanode.hostname",
+                "可选，默认 true。DataNode 回连用主机名；外网部署且只能解析 IP 时设为 false");
+
+        // ---- HDFS HA：fs.defaultFS 写成 hdfs://<nameservice>（无端口）时这四项必填 ----
+        props.put("catalog.hive.dfs.nameservices",
+                "HDFS HA 必填。nameservice 名，多个用逗号分隔，须与 fs.defaultFS 的 hdfs://<名> 一致");
+        props.put("catalog.hive.dfs.ha.namenodes.<nameservice>",
+                "HDFS HA 必填。该 nameservice 下的 NameNode 逻辑 id，如 nn1,nn2");
+        props.put("catalog.hive.dfs.namenode.rpc-address.<nameservice>.<nn>",
+                "HDFS HA 必填。NameNode RPC 地址，如 10.24.62.6:8020（端口映射时填映射后的地址）");
+        props.put("catalog.hive.dfs.client.failover.proxy.provider.<nameservice>",
+                "HDFS HA 必填。HDFS 用 org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider");
         DESCRIBE = Map.copyOf(props);
     }
 

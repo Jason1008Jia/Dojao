@@ -77,12 +77,24 @@ public final class HadoopEnvironment {
      * <p>可识别键（catalog 规范写法 {@code catalog.hive.<键>}，归一化后即这些裸键）：
      * {@code fs.defaultFS}、{@code hive.metastore.uris}，以及一批可覆盖的连接调优键
      * （{@code ipc.ping.interval} / {@code dfs.client.socket-timeout} …）。</p>
+     *
+     * <p><b>HDFS HA</b>：凡是 {@code fs.*} / {@code dfs.*} / {@code ipc.*} / {@code hadoop.*}
+     * 开头的键都会原样透传给 Hadoop 客户端。{@code fs.defaultFS} 写成
+     * {@code hdfs://<nameservice>}（无端口）时，必须同时提供
+     * {@code dfs.nameservices}、{@code dfs.ha.namenodes.<ns>}、
+     * {@code dfs.namenode.rpc-address.<ns>.<nn>} 与
+     * {@code dfs.client.failover.proxy.provider.<ns>} —— 否则客户端会拿 nameservice
+     * 当主机名去做 DNS 解析，直接 {@code UnknownHostException}。</p>
      */
     public static Configuration newConfiguration(Map<String, String> props) {
         Configuration conf = new Configuration();
+        // 通用透传：fs.* / dfs.* / ipc.* / hadoop.* 原样交给 Hadoop 客户端。
+        // HDFS HA 的整套键（dfs.nameservices / dfs.ha.namenodes.<ns> /
+        // dfs.namenode.rpc-address.<ns>.<nn> / dfs.client.failover.proxy.provider.<ns>）
+        // 都是 dfs.*，用户按 catalog 规范写 catalog.hive.dfs.xxx 或裸键 dfs.xxx 均可。
+        copyHadoopKeys(conf, props);
         copy(conf, props, "fs.defaultFS");
         copy(conf, props, "fs.default.name");
-        copy(conf, props, "dfs.nameservices");
         copy(conf, props, "hive.metastore.uris");
 
         // DataNode 返回主机名而非 IP：NAT 环境下必须按主机名回连（集群内网不适用时显式关掉）
@@ -105,6 +117,25 @@ public final class HadoopEnvironment {
         conf.setBoolean("hive.metastore.sasl.enabled",
                 boolProp(props, "hive.metastore.sasl.enabled", false));
         return conf;
+    }
+
+    /** 这些键属于 Dojao 自身的运行环境（不是 Hadoop Configuration 项），不透传。 */
+    private static boolean isDojaoOnlyKey(String key) {
+        return key.equals("hadoop.user.name") || key.equals("hadoop.home.dir");
+    }
+
+    private static void copyHadoopKeys(Configuration conf, Map<String, String> props) {
+        for (Map.Entry<String, String> e : props.entrySet()) {
+            String key = e.getKey();
+            String value = e.getValue();
+            if (key == null || value == null || value.isBlank()) continue;
+            key = key.trim();
+            if (isDojaoOnlyKey(key)) continue;
+            if (key.startsWith("fs.") || key.startsWith("dfs.")
+                    || key.startsWith("ipc.") || key.startsWith("hadoop.")) {
+                conf.set(key, value.trim());
+            }
+        }
     }
 
     private static void copy(Configuration conf, Map<String, String> props, String key) {

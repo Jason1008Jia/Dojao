@@ -2075,7 +2075,7 @@ public final class Planner {
         if (pushdownCapable(conns.get(0))) {
             rel.filter().ifPresent(f -> scan.pushdown(SqlTextUtil.stripQualifiers(f.text())));
             if (extraPredicate.isPresent()) {
-                ScanPredicate sp = splitScanPredicate(extraPredicate.get());
+                ScanPredicate sp = splitScanPredicate(extraPredicate.get(), conns.get(0));
                 if (sp.pushdown() != null) {
                     scan.pushdown(sp.pushdown());
                 }
@@ -2364,7 +2364,8 @@ public final class Planner {
      * <p>不成立 → 调用方须回退单机路径（本地会在扫描后包 {@code Filter}，结果正确，只是不分布式）。
      * 若照旧派发，连接器忽略过滤条件 → <b>静默多返回行</b>。</p>
      */
-    private static boolean distributedFilterSupported(LogicalPlan.ResolvedRelation rel) {
+    private static boolean distributedFilterSupported(LogicalPlan.ResolvedRelation rel,
+                                                      DojaoConnector probe) {
         if (rel.filter().isEmpty()) {
             return true;   // 无谓词可下推，与连接器能力无关
         }
@@ -2376,7 +2377,7 @@ public final class Planner {
         // 唯一仍须回退的情形：残留谓词 FilterOperator <b>编译不出</b>任何引用列（落 Form.UNKNOWN，
         // 会静默放行全部行 = 谓词失效）—— 那种形态宁可回退单机，由本地扫描后的 Filter 承接。
         String cond = SqlTextUtil.stripQualifiers(rel.filter().get().text());
-        for (String leaf : splitScanPredicate(cond).residualLeaves()) {
+        for (String leaf : splitScanPredicate(cond, probe).residualLeaves()) {
             if (FilterOperator.referencedColumnsOf(leaf).isEmpty()) {
                 return false;
             }
@@ -2401,8 +2402,8 @@ public final class Planner {
      * <p>拼回时给含顶层 {@code OR} 的叶子补回括号：{@code (a=1 or b=2) and c=3} 拆成两叶后若直接
      * 用 {@code AND} 拼接会丢掉括号、改变优先级。</p>
      */
-    private static ScanPredicate splitScanPredicate(String cond) {
-        SqlTextUtil.PredicateSplit sp = SqlTextUtil.splitByConnectorCapability(cond);
+    private static ScanPredicate splitScanPredicate(String cond, DojaoConnector conn) {
+        SqlTextUtil.PredicateSplit sp = SqlTextUtil.splitByConnectorCapability(cond, conn);
         return new ScanPredicate(sp.pushdown(), sp.residual(), sp.residualLeaves());
     }
 
@@ -2484,13 +2485,14 @@ public final class Planner {
         if (pushdownCapable(probeConn)) {
             rel.filter().ifPresent(f -> scan.pushdown(SqlTextUtil.stripQualifiers(f.text())));
             if (extraPredicate.isPresent()) {
-                ScanPredicate sp = splitScanPredicate(extraPredicate.get());
+                ScanPredicate sp = splitScanPredicate(extraPredicate.get(), probeConn);
                 if (sp.pushdown() != null) {
                     scan.pushdown(sp.pushdown());
                 }
                 if (sp.residual() != null) {
-                    // 谓词含引擎注册函数：数据源求不了值，且不能当过滤条件交给它 → 只能本侧 Filter。
-                    // 这是「引擎函数参与过滤」的固有边界，与连接器能力无关。
+                    // 谓词含引擎注册函数且连接器未认领（renderFunctionPredicate 返回空）→ 数据源
+                    // 求不了值，只能本侧 Filter。能翻译成数据源方言的（如 CK 的 to_date→toDate）
+                    // 已在上面的 pushdown 里交给数据源。
                     localParts.add(sp.residual());
                 }
             }
@@ -3223,7 +3225,8 @@ public final class Planner {
         DojaoConnector rightProbe = connectorFor(rightRel.catalog());
         // 单表 WHERE 下推进 Worker 扫描：两侧过滤在扫描端执行，join 输入 / 回传数据量骤减。
         // 含数据源不认识的函数谓词 → 回退单机，由本地扫描后的 Filter 承接。
-        if (!distributedFilterSupported(leftRel) || !distributedFilterSupported(rightRel)) {
+        if (!distributedFilterSupported(leftRel, leftProbe)
+                || !distributedFilterSupported(rightRel, rightProbe)) {
             return null;
         }
         String leftFilter = relScanFilter(leftRel);
@@ -3337,7 +3340,7 @@ public final class Planner {
         }
         DojaoConnector innerProbe = connectorFor(dp.innerRequest().catalog());
         DojaoConnector peerProbe = connectorFor(peerRel.catalog());
-        if (!distributedFilterSupported(peerRel)) {
+        if (!distributedFilterSupported(peerRel, peerProbe)) {
             return null;   // peer 侧过滤含引擎函数 → 回退单机（本地 Filter 承接，结果正确）
         }
 
@@ -3645,7 +3648,7 @@ public final class Planner {
             // 响亮报错（或旧版静默 0 行）；数据源自己会过滤的部分不必多读（列裁剪保持最紧）。
             innerFilter = merged;
             String enginePart = pushdownCapable(innerProbe)
-                    ? splitScanPredicate(merged).residual()
+                    ? splitScanPredicate(merged, innerProbe).residual()
                     : merged;
             if (enginePart != null) {
                 for (String c : engineFilterColumns(List.of(enginePart))) {
@@ -4134,7 +4137,9 @@ public final class Planner {
         if (!whereParts.isEmpty()) {
             String merged = String.join(" AND ", whereParts);
             innerFilter = merged;
-            String enginePart = pushdownCapable(probe) ? splitScanPredicate(merged).residual() : merged;
+            String enginePart = pushdownCapable(probe)
+                    ? splitScanPredicate(merged, probe).residual()
+                    : merged;
             if (enginePart != null) {
                 for (String c : engineFilterColumns(List.of(enginePart))) {
                     if (!containsIgnoreCase(needed, c)) {
@@ -4342,7 +4347,9 @@ public final class Planner {
         if (!whereParts.isEmpty()) {
             String merged = String.join(" AND ", whereParts);
             innerFilter = merged;
-            String enginePart = pushdownCapable(probe) ? splitScanPredicate(merged).residual() : merged;
+            String enginePart = pushdownCapable(probe)
+                    ? splitScanPredicate(merged, probe).residual()
+                    : merged;
             if (enginePart != null) {
                 for (String c : engineFilterColumns(List.of(enginePart))) {
                     if (!containsIgnoreCase(needed, c)) {
@@ -4640,7 +4647,7 @@ public final class Planner {
                     // 且只有 0 号桶消费得到 REPLICATE 的 build 侧 ⇒ 其余分区的左行 join 不上、丢行）。
                     firstLeftKeys = cross ? new ArrayList<>(accumCols) : keys.leftKeys();
                 }
-                if (rightPlan == null && !distributedFilterSupported(rightRel)) {
+                if (rightPlan == null && !distributedFilterSupported(rightRel, null)) {
                     return null;   // 含引擎函数谓词 → 回退单机（本地 Filter 承接，结果正确）
                 }
                 // 单表 WHERE 下推进 Worker 扫描：各基表过滤在扫描端执行，join 输入 / 回传数据量骤减
@@ -4708,7 +4715,7 @@ public final class Planner {
         if (firstPlan != null && !links.get(0).leftComputed().isEmpty()) {
             return null;
         }
-        if (firstPlan == null && !distributedFilterSupported(firstLeft)) {
+        if (firstPlan == null && !distributedFilterSupported(firstLeft, firstProbe)) {
             return null;   // 含引擎函数谓词 → 回退单机（本地 Filter 承接，结果正确）
         }
         // 首表（T0）同样按语法层裁剪后的列集扫描；各层右表列集已随 JoinLink.rightColumns() 带上。
@@ -10354,7 +10361,7 @@ public final class Planner {
         // 引擎侧真正要<b>求值</b>的那部分谓词：不兑现下推的连接器 → 整串；兑现的连接器 → 只剩
         // 引擎注册函数谓词（数据源求不了，扫描节点补 Filter，见 ConnectorScanOperator.openWithEngineFilter）。
         String enginePart = probe.supportsPredicatePushdown()
-                ? splitScanPredicate(filter).residual()
+                ? splitScanPredicate(filter, probe).residual()
                 : filter;
         if (enginePart == null || enginePart.isBlank()) {
             return columns;   // 数据源全包了 → 无需为过滤多读列（列裁剪保持最紧）

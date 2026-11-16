@@ -9,6 +9,7 @@ import com.dojao.spi.service.OverwriteEnable;
 import com.dojao.spi.util.ArrowJdbcValues;
 import com.dojao.spi.util.JdbcArrowConverter;
 import com.dojao.spi.util.JdbcSizeEstimator;
+import com.dojao.spi.util.SqlFunctionRenames;
 import com.dojao.spi.util.SqlIdentifiers;
 import com.dojao.spi.util.VarcharMapping;
 import org.apache.arrow.memory.BufferAllocator;
@@ -762,6 +763,33 @@ public class DorisConnector implements DojaoConnector, OverwriteEnable {
     public boolean supportsPredicatePushdown() {
         // buildReadSql 把 filterExpression 直接拼进 WHERE → 过滤真的执行了，引擎可以不下推就不过滤
         return true;
+    }
+
+    /**
+     * 引擎标量函数 → Doris 函数名（<b>只收语义严格等价者</b>）。
+     *
+     * <p>Doris 支持表达式分区（{@code PARTITION BY date_trunc('day', dt)} / {@code to_date(dt)} 等）。
+     * 把 {@code to_date(dt) = '2026-11-15'} 写进 WHERE 后，Doris 自己的分区裁剪才会生效，
+     * 否则全分区扫描、谓词只能回引擎侧求值。</p>
+     *
+     * <p><b>刻意不映射</b>：{@code dayofweek}（Hive 1=周日 vs MySQL/Doris 1=周一）、{@code datediff}
+     * （参数顺序 / 语义差异）、{@code date_format}（格式串方言差异）、{@code trunc} 等 —— 映射即错行。
+     * 这里只放 Doris/MySQL 原生同名且口径一致、或等价改名（{@code to_date} → {@code to_date}）的函数。</p>
+     */
+    private static final Map<String, String> PREDICATE_FUNCTIONS = Map.of(
+            "to_date", "to_date",
+            "hour", "hour",
+            "minute", "minute",
+            "second", "second",
+            "dayofmonth", "dayofmonth");
+
+    /**
+     * 认领「引擎注册标量函数谓词」：翻译成 Doris 方言后交给数据源求值（触发表达式分区裁剪）。
+     * 谓词里出现任何未映射函数 → 返回空（继续引擎过滤）。
+     */
+    @Override
+    public Optional<String> renderFunctionPredicate(String conjunct) {
+        return SqlFunctionRenames.rewrite(conjunct, PREDICATE_FUNCTIONS);
     }
 
     /** 构建 SELECT SQL。包级可见：离线探针直接断言拼装结果。 */

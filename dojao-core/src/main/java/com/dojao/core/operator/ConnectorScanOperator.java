@@ -58,9 +58,11 @@ public final class ConnectorScanOperator extends AbstractMeasurableOperator {
      * <ul>
      *   <li><b>连接器兑现下推</b>（{@link DojaoConnector#supportsPredicatePushdown()}）→ 数据源
      *       认识的合取项（列比较 / 数据源内建函数）留在请求里交给数据源在扫描时过滤；<b>引擎注册
-     *       标量函数谓词</b>（如 {@code is_high(rating) = 1}）数据源不认识，从请求里<b>摘掉</b>，
-     *       改由本节点的 {@link FilterOperator} 求值。摘掉这一步是必须的 —— 原样发给数据源会
-     *       报「不认识该函数」或静默忽略（多返回行）。</li>
+     *       标量函数谓词</b>（如 {@code to_date(dt) = '2026-11-15'}）先问连接器
+     *       {@link DojaoConnector#renderFunctionPredicate(String)}：它能翻译（如 ClickHouse 的
+     *       {@code toDate(dt)}）就留在请求里交给数据源（从而触发数据源分区裁剪），翻译不了才从请求里
+     *       <b>摘掉</b>、改由本节点的 {@link FilterOperator} 求值。摘掉这一步是必须的 —— 原样发给
+     *       数据源会报「不认识该函数」或静默忽略（多返回行）。</li>
      *   <li><b>连接器不兑现</b>（如 Hive：只按切片读文件、不求值 {@code filterExpression}）→ 整串
      *       都留给本节点的 {@link FilterOperator}（它支持引擎标量函数：{@code Form.FUNC_COMPARE} /
      *       {@code FUNC_IS_NULL}）。</li>
@@ -86,7 +88,7 @@ public final class ConnectorScanOperator extends AbstractMeasurableOperator {
         if (conn != null && request != null) {
             String expr = request.filterExpression().orElse(null);
             if (expr != null && !expr.isBlank()) {
-                SqlTextUtil.PredicateSplit sp = SqlTextUtil.splitByConnectorCapability(expr);
+                SqlTextUtil.PredicateSplit sp = SqlTextUtil.splitByConnectorCapability(expr, conn);
                 if (conn.supportsPredicatePushdown()) {
                     engineConds = sp.residualLeaves();          // 只有引擎函数谓词留在引擎侧
                     connRequest = request.withFilter(sp.pushdown());   // 数据源只拿它认识的

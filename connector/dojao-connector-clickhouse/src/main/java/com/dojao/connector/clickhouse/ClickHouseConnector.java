@@ -10,6 +10,7 @@ import com.dojao.spi.util.ArrowJdbcValues;
 import com.dojao.spi.util.JdbcArrowConverter;
 import com.dojao.spi.util.JdbcSizeEstimator;
 import com.dojao.spi.util.NestedTypeSupport;
+import com.dojao.spi.util.SqlFunctionRenames;
 import com.dojao.spi.util.SqlIdentifiers;
 import com.dojao.spi.util.VarcharMapping;
 import org.apache.arrow.memory.BufferAllocator;
@@ -752,6 +753,40 @@ public class ClickHouseConnector implements DojaoConnector, OverwriteEnable {
     @Override
     public boolean supportsPredicatePushdown() {
         return true;
+    }
+
+    /**
+     * 引擎标量函数 → ClickHouse 函数名（<b>只收语义严格等价者</b>）。
+     *
+     * <p>ClickHouse 常用表达式做分区键（{@code PARTITION BY toDate(data_insert_time)}）。只有把
+     * {@code to_date(data_insert_time) = '2026-11-15'} 真正写进 WHERE（翻译成 {@code toDate(...)}），
+     * CK 自己的分区裁剪才会只读命中分区；否则整表所有分区都扫一遍。</p>
+     *
+     * <p><b>刻意不映射</b>：{@code dayofweek}（Hive 口径 1=周日，CK {@code toDayOfWeek} 是 1=周一）、
+     * {@code datediff}/{@code date_add}（参数顺序 / 单位不同）、{@code date_format}（格式串方言差异）、
+     * {@code trunc}、{@code months_between} 等 —— 映射即静默错行。上游 ClickHouse 也没有
+     * {@code to_date} 这个名字，必须翻译成 {@code toDate}，原样发过去会报未知函数。</p>
+     *
+     * <p><b>时区前提</b>：{@code to_date} 按引擎 UTC 口径取日期，CK 的 {@code toDate(DateTime)}
+     * 按列/会话时区取日期。两者一致时结果相同；不一致时跨零点附近会差一天 —— 这也是只收
+     * 「分区表达式就是 {@code toDate(列)}」这类场景的理由（此时以 CK 分区定义为唯一口径）。</p>
+     */
+    private static final Map<String, String> PREDICATE_FUNCTIONS = Map.of(
+            "to_date", "toDate",
+            "todate", "toDate",          // 幂等：扫描节点会对已翻译的 filterExpression 再拆一次
+            "hour", "hour",
+            "minute", "minute",
+            "second", "second",
+            "dayofmonth", "toDayOfMonth",
+            "weekofyear", "toISOWeek");
+
+    /**
+     * 认领「引擎注册标量函数谓词」：把函数名翻译成 ClickHouse 方言后交给数据源求值，
+     * 从而把谓词写进 WHERE、触发分区裁剪。谓词里出现任何未映射函数 → 返回空（继续引擎过滤）。
+     */
+    @Override
+    public Optional<String> renderFunctionPredicate(String conjunct) {
+        return SqlFunctionRenames.rewrite(conjunct, PREDICATE_FUNCTIONS);
     }
 
     /** 构建 SELECT SQL。 */

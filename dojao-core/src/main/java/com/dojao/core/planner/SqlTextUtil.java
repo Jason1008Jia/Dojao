@@ -2,6 +2,7 @@ package com.dojao.core.planner;
 
 import com.dojao.spi.function.AggregateFunctionRegistry;
 import com.dojao.spi.function.CollectAggregateRegistry;
+import com.dojao.spi.service.DojaoConnector;
 
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -153,18 +154,27 @@ public final class SqlTextUtil {
 
     /**
      * 把一条 {@code WHERE} 谓词按「数据源能否求值」拆成<b>下推部分</b>与<b>引擎残留部分</b> ——
-     * 含<b>引擎注册标量函数</b>的合取项（如 {@code is_high(rating) = 1}）数据源不认识，
-     * 只能由引擎自己的 {@code FilterOperator} 在数据所在地求值。
+     * 含<b>引擎注册标量函数</b>的合取项（如 {@code is_high(rating) = 1}）默认数据源不认识，
+     * 由引擎自己的 {@code FilterOperator} 在数据所在地求值。
      *
-     * <p><b>★Master 与 Worker 必须共用这一份实现</b>：规划期用它决定「要不要回退单机 / 别名该并进扫描列」，
-     * 扫描节点用它决定「请求里的哪几项要在本节点补 {@code Filter}、哪几项留给连接器」。两边口径一旦
-     * 分叉，就会出现「规划期以为数据源会过滤、实际没人过滤」的静默多返回行。</p>
+     * <p><b>连接器可以「认领」这类谓词</b>：先问
+     * {@link DojaoConnector#renderFunctionPredicate(String)} —— 返回非空表示数据源认识它（文本已翻译成
+     * 数据源方言），进<b>下推部分</b>；返回空才进残留。ClickHouse / Doris 这类用表达式做分区键的引擎
+     * 靠这一条把 {@code to_date(dt)='...'} 写进数据源 WHERE，从而触发数据源自己的分区裁剪。</p>
+     *
+     * <p><b>★Master 与 Worker 必须共用这一份实现，且必须传同一份连接器能力</b>：规划期用它决定
+     * 「要不要回退单机 / 别名该并进扫描列」，扫描节点用它决定「请求里的哪几项要在本节点补
+     * {@code Filter}、哪几项留给连接器」。两边口径一旦分叉，就会出现「规划期以为数据源会过滤、
+     * 实际没人过滤」的静默多返回行。</p>
      *
      * <p>切分口径 = {@link #splitConjuncts}（先剥外层括号再切顶层 AND，见该方法的括号陷阱说明）；
      * 叶子含<b>顶层 OR</b> 时拼回必须补回括号，否则 {@code (a=1 or b=2) and c=3} 拆后再 AND 拼接会
      * 丢掉括号、改变优先级。</p>
+     *
+     * @param cond 谓词原文；null / 空 → 两侧皆空
+     * @param conn 本次扫描使用的连接器（决定函数谓词能否下推）；null = 一律按「数据源不认识」处理
      */
-    public static PredicateSplit splitByConnectorCapability(String cond) {
+    public static PredicateSplit splitByConnectorCapability(String cond, DojaoConnector conn) {
         List<String> pushable = new ArrayList<>(4);
         List<String> residual = new ArrayList<>(2);
         for (String part : splitConjuncts(cond)) {
@@ -173,7 +183,13 @@ public final class SqlTextUtil {
             }
             String leaf = splitTopLevelKeyword(part, "OR").size() > 1 ? "(" + part + ")" : part;
             if (com.dojao.core.function.scalar.ScalarExpr.isFunctionPredicate(part)) {
-                residual.add(leaf);
+                String rendered = conn == null ? null
+                        : conn.renderFunctionPredicate(part).orElse(null);
+                if (rendered == null || rendered.isBlank()) {
+                    residual.add(leaf);
+                } else {
+                    pushable.add(rendered);
+                }
             } else {
                 pushable.add(leaf);
             }
