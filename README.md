@@ -34,18 +34,34 @@ Hive / ClickHouse / Excel 里的数据，让数据科学家不写一行 JVM 语�
 
 ## 为什么是 Dojao（核心差异化）
 
-1. **确定性优先于峰值性能** —— 大表 Join 场景下，「能跑完」比「跑得快」重要。
-2. **磁盘辅助是一等公民** —— 统一的溢写管线（P1 攒 + 溢写 / P1.5 归并 / P2 输出），由
-   GroupBy / Window / Sort / SortMergeJoin 四类算子共享（HashJoin 为内存驻留，见「已知边界」）；
-   **溢写是「减量」的**：窗口 `rn=1` 溢写时即按组裁到 N 行，高基数 GROUP BY 用 K 路归并（峰值内存与 key 总数无关）。
-3. **跨源向量计算** —— 向量列（如 pgvector）映射为 Arrow `FixedSizeList<Float32>`，
-   `cosine_similarity / l2_distance / inner_product` 一条 SQL 完成，数据不动。
-4. **Python UDF + Arrow 零拷贝** —— 数据科学家用 NumPy / Polars 直接向量化执行，无跨语言逐行序列化；
-   协议（DFP）**语言中立**，任何会说 Arrow 的语言都能作为函数运行时。
-5. **AI 原生集成** —— 内置流式 ReAct Agent：一条自然语言完成跨源取数、SQL 执行与图表展示；
-   工具按角色授权，DDL 执行前必须人工确认。
-6. **单进程即用 + 可集群部署** —— 默认 `system.role = both` 一个进程同时跑 Master 与 Worker，也能拆成多机集群。
-7. **算子自观测** —— `AbstractMeasurableOperator` + 零注入统计，为 Web 控制台与可解释排障提供数据。
+> **Dojao 站在「小集群 + 跨源 + 内存紧张 + 必须跑完」这个交叉区间当正解** ——
+> 这正是 Trino / Spark 最难受的区间。
+
+**① 溢写是「减量」的，内存线不是悬崖**
+聚合 / 窗口 / 排序 / 排序归并 Join 在触线前自动落盘，而且**落盘时先把数据变小**：窗口 `rn=1` 按组裁到 N 行，
+高基数 GROUP BY 用按 key 的 K 路归并（峰值内存与 key 总数无关）。
+*对比：Trino 官方把溢写标为 legacy，被迫溢写时可能慢几个数量级；Spark 的 spill 是「保量」的，数据规模不缩小。*
+
+**② 一条 SQL 跨源联邦，并且自带向量检索**
+MySQL / TiDB / Doris / PostgreSQL / SQL Server / Oracle / Hive / ClickHouse / Excel 用三段名直接 join；
+pgvector 向量列映射 `FixedSizeList<Float32>`，相似度函数在 SQL 里直接算。
+*对比：数据不用搬进数仓，也不必为向量检索额外维护一个专用向量库。*
+
+**③ Python 直接当 SQL 函数，不写 JVM、不打 jar**
+函数跑在独立 sidecar 进程，与引擎用 Arrow Flight 交换列式数据；协议（DFP）语言中立，Python 只是参考实现。
+*对比：Trino 的函数只能写 Java 插件；Spark 的 pandas UDF 虽然也走 Arrow，但要跑在 Spark 集群上、受其生态约束。*
+
+**④ 控制台内置 AI Agent，权限与引擎同一套**
+一条自然语言完成跨源取数、SQL 执行、图表与导出；工具按角色授权，DDL 必须人工确认。
+*对比：通常要另接一套问数产品，数据权限还得再对齐一遍。* 细节见 [AI 控制台](#ai-控制台智能问数)。
+
+**⑤ 单进程即用，也能组集群**
+默认一个进程同时跑 Master 与 Worker，解压即用；扩容时加机器、改两行 `conf`，Worker 自动注册到 Master。
+*对比：Trino 要 coordinator + worker + 服务发现，Spark 要 driver + 集群管理器。*
+
+**⑥ 慢在哪，看得见**
+执行计划 DAG 与算子级下钻、内存与溢写遥测、查询快照 —— 不用翻日志猜瓶颈。
+这也是让 ①–⑤ 的取舍**可验证**的前提：溢写了多少、卡在哪一步，控制台里直接读，不用信宣传。
 
 ---
 
@@ -379,8 +395,8 @@ SQL / 元数据 / 监控接口完成工作。分两层实现：
 
 ## 与 Trino / Spark 的定位
 
-**Dojao 的护城河是设计上的取舍，不是性能上的堆料。** 它主动站在 Trino / Spark **最难受的区间**
-（小内存 + 跨源 + 溢写必发 + 不可失败）当正解：
+第一条差异化（减量溢写）是三引擎对比里最该被读出来的东西，但**读数必须带上「是否跨过溢写线」这个前提** ——
+只报内存态耗时，会得出误导性结论：
 
 - Trino 官方把溢写标注为 **legacy functionality**（"The spill to disk feature and implementation are a legacy
   functionality"），建议转向 fault-tolerant execution；被迫溢写时耗时可能 **by orders of magnitude** 劣于纯内存，
