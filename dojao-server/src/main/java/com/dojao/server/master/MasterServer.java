@@ -157,10 +157,13 @@ public class MasterServer {
         // 查询并行分区数：扫描 / hash 分区 / 分布式聚合共用（MasterConfig.parallelism，默认 4）
         ctxBuilder.parallelism(config.parallelism());
         // 算子内存预算统一在 ResourceConfig.query.slot.memory 管理（配置 > 内置默认 2G）。
-        // ★按 <b>Worker</b> 口径派生：预算随片段下发到 Worker 执行，用 Master 自己的内存口径
-        //   会把小 Master（随包默认 2g → slot 32M 下限）的预算套到 5g 的 Worker 上，
-        //   既让 JoinDecider 失真（大表 join 全退 sort_merge），也让 Worker 按 32M 溢写。
-        ctxBuilder.memoryLimit(ResourceConfig.slotMemoryBytes(ResourceConfig.Role.WORKER));
+        // ★cluster：按 <b>Worker</b> 口径派生 —— 预算随片段下发到 Worker 执行，用 Master 自己的内存
+        //   口径会把小 Master（随包默认 2g → slot 32M 下限）的预算套到 5g 的 Worker 上，既让
+        //   JoinDecider 失真（大表 join 全退 sort_merge），也让 Worker 按 32M 溢写。
+        // ★standalone：算子就在本进程，按 <b>本机</b>（standalone 派生后的 Master 口径）给预算。
+        ctxBuilder.memoryLimit(ResourceConfig.standalone()
+                ? ResourceConfig.slotMemoryBytes(ResourceConfig.Role.MASTER)
+                : ResourceConfig.slotMemoryBytes(ResourceConfig.Role.WORKER));
         if (workerGateway != null) {
             ctxBuilder.workerGateway(workerGateway);
             logger.info("Master 已启用分布式扫描（WorkerGateway 已注入）");

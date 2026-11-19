@@ -60,6 +60,14 @@ public final class ClusterMain {
             return;
         }
 
+        // standalone：单 JVM 即全部 —— 不起子进程，直接在本进程跑 Master（含 Web 控制台、元数据库、
+        // 本机物理算子）。--print-launch 已在上方按 master 返回，启动脚本会直接 exec DojaoMaster。
+        if (ResourceConfig.standalone()) {
+            System.err.println("========== Dojao 启动（deploy.mode=standalone，单 JVM） ==========");
+            com.dojao.server.master.DojaoMaster.main(args);
+            return;
+        }
+
         System.err.println("========== Dojao 启动（角色=" + role.prefix() + "） ==========");
 
         // ===== ① 定位 java 可执行文件 + 当前 classpath（IntelliJ 下含本模块与全部依赖模块输出） =====

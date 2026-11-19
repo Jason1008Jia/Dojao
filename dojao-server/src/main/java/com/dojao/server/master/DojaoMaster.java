@@ -96,9 +96,13 @@ public final class DojaoMaster {
         // ===== ② 结果路由表 + 集群注册表：派发端与接收端共享同一实例 =====
         // NetworkWorkerGateway（派发时注册 taskId→结果汇）与 MasterControlFlightProducer
         // （doExchange 查表路由 Worker 回传）必须看到同一张路由表，经 setResultRouter 注入。
+        //
+        // ★standalone（单 JVM）不注入 gateway、不开启分布式下沉：扫描走 ParallelTableScanOperator，
+        //   join / 聚合 / 窗口走本机物理算子（最初设计的形态），既没有 Worker 进程也没有网络派发。
+        boolean standalone = ResourceConfig.standalone();
         ResultRouter router = new ResultRouter();
         WorkerRegistry registry = WorkerRegistry.get();
-        NetworkWorkerGateway workerGw = new NetworkWorkerGateway(router, registry, metaStore);
+        NetworkWorkerGateway workerGw = standalone ? null : new NetworkWorkerGateway(router, registry, metaStore);
 
         // ===== ②b Python 后端（type=python：sidecar 进程池 + BackendRegistry 注册）=====
         // 无 python 环境 → 打印 SKIP 提示，集群照常服务（Java 函数不受影响）。
@@ -109,17 +113,21 @@ public final class DojaoMaster {
         // 返回类型 = ExternalServiceManager：Master 不关心具体语言，shutdown 只调 close()。
         final ExternalServiceManager externalService = PythonBackendBootstrap.install("Master", extRegistry);
 
-        // ===== ③ Master 服务器：注入网络派发网关 + 开启分布式执行 =====
+        // ===== ③ Master 服务器：cluster 注入网络派发网关 + 开启分布式执行；standalone 全本机 =====
         MasterConfig config = new MasterConfig(host, port);
         MasterServer master = new MasterServer(config, metaStore);
-        master.setWorkerGateway(workerGw);
-        master.setResultRouter(router);
-        master.setDistributedExecution(true);
+        if (!standalone) {
+            master.setWorkerGateway(workerGw);
+            master.setResultRouter(router);
+            master.setDistributedExecution(true);
+        }
         // Web 控制台（监控 + SQL 页）：MasterServer.start() 会为它 bind UiQueryMonitor。
         // 默认 2380：避开工 4007-4009 与 master Flight 6530（多进程一键集群 DevClusterMain 用）。
         master.addModule(new com.dojao.ui.WebUiModule(ResourceConfig.uiPort()));
         master.start();
-        System.err.printf(">>> Master 就绪: %s:%d（分布式执行已开启，等待 Worker 注册并提交 SQL）%n", host, port);
+        System.err.printf(">>> Master 就绪: %s:%d（部署形态=%s，%s）%n", host, port,
+                ResourceConfig.deployMode().value(),
+                standalone ? "单 JVM 本机算子" : "分布式执行已开启，等待 Worker 注册并提交 SQL");
 
         // ===== ④ 收尾：进程被终止（Ctrl+C / kill）时优雅关闭 =====
         // 顺序：先 kill 全部外部进程，再关 python 进程池（sidecar 已死，close 幂等 no-op）、停服务。
@@ -140,7 +148,9 @@ public final class DojaoMaster {
             } catch (Throwable ignored) {
             }
             try {
-                workerGw.close();
+                if (workerGw != null) {
+                    workerGw.close();
+                }
             } catch (Throwable ignored) {
             }
         }));

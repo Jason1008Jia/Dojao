@@ -7746,20 +7746,26 @@ public final class Planner {
      * 结果值支持数值字面量、NULL 或<b>列引用</b>（列须存在于上游）。
      */
     private CaseProjection parseConditionalArg(String text, String derived, PhysicalNode upstream, String fnName) {
-        String t = text.trim();
+        // 先归一引号外的空白：CASE 的切分是按「空格分隔的关键字」做的（WHEN / THEN / ELSE / END），
+        // 而用户从控制台贴进来的 SQL 必然跨行 —— "WHEN" 后直接换行会让 "WHEN " / " END" 全部匹配失败，
+        // 整条聚合被拒（报 "SUM CASE 参数"）。归一后的文本仍是等价 SQL，不影响后续表达式求值。
+        String t = SqlTextUtil.normalizeWhitespaceOutsideQuotes(text.trim());
         String upper = t.toUpperCase(Locale.ROOT);
         if (upper.startsWith("CASE ") && upper.endsWith(" END")) {
             return parseCaseBranches(t, derived, upstream, fnName);
         }
-        if (upper.startsWith("IF(") && t.endsWith(")")) {
+        // IF 允许 "IF(" 与 "IF ("，但必须排除 IFNULL(...) 之类同前缀函数。
+        if (upper.startsWith("IF") && t.endsWith(")")) {
             int paren = t.indexOf('(');
-            int close = SqlTextUtil.findMatchingParen(t, paren);
-            if (close == t.length() - 1) {
-                List<String> args = ScalarExpr.splitTopLevelComma(t.substring(paren + 1, close).trim());
-                if (args.size() == 3) {
-                    return buildConditionalProjection(List.of(
-                                    new CaseProjection.CaseBranch(args.get(0).trim(), normalizeNull(args.get(1)))),
-                            normalizeNull(args.get(2)), derived, upstream, fnName);
+            if (paren > 0 && t.substring(0, paren).trim().equalsIgnoreCase("IF")) {
+                int close = SqlTextUtil.findMatchingParen(t, paren);
+                if (close == t.length() - 1) {
+                    List<String> args = ScalarExpr.splitTopLevelComma(t.substring(paren + 1, close).trim());
+                    if (args.size() == 3) {
+                        return buildConditionalProjection(List.of(
+                                        new CaseProjection.CaseBranch(args.get(0).trim(), normalizeNull(args.get(1)))),
+                                normalizeNull(args.get(2)), derived, upstream, fnName);
+                    }
                 }
             }
         }

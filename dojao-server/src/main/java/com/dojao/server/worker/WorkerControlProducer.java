@@ -341,8 +341,10 @@ public final class WorkerControlProducer implements FlightProducer {
         } catch (Throwable t) {
             // queue.put 的 InterruptedException 会清掉中断标记 —— 认标记优先，取消同样静默退出。
             if (Thread.currentThread().isInterrupted()) return;
+            // 本方法自行吞掉了异常：不在这里打栈，Worker 日志里就只剩一句回传串，排障无路可走
+            log.error("扫描任务 {} 失败（{}）", taskId, catalog, t);
             // 显式失败回传（尽力送达）：Master 收到即 fail-fast；万一丢失，Master 侧看门狗兜底判 LOST
-            queue.offer(new ScanEvent.ScanFailed(taskId, String.valueOf(t)), 3, TimeUnit.SECONDS);
+            queue.offer(new ScanEvent.ScanFailed(taskId, failureCause(t)), 3, TimeUnit.SECONDS);
         } finally {
             if (op != null) {
                 try {
@@ -488,5 +490,22 @@ public final class WorkerControlProducer implements FlightProducer {
     @Override
     public void listActions(CallContext context, StreamListener<ActionType> listener) {
         listener.onCompleted();
+    }
+
+    /**
+     * 失败回传串：把 cause 链一并带上。Master 侧（含 WebUI）只拿得到这个字符串，
+     * 只回 {@code String.valueOf(t)} 会把「真正原因」永远留在 Worker 堆栈里。
+     */
+    private static String failureCause(Throwable t) {
+        StringBuilder sb = new StringBuilder(String.valueOf(t));
+        Throwable c = t.getCause();
+        while (c != null && c != t && c != c.getCause()) {
+            sb.append(" <- ").append(c);
+            if (sb.length() > 4096) {
+                break;
+            }
+            c = c.getCause();
+        }
+        return sb.toString();
     }
 }

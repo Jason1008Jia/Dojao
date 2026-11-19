@@ -133,11 +133,11 @@ public final class NetworkWorkerGateway implements WorkerGateway {
     public void dispatchFragment(String workerId, String jobId, String taskId,
                                  FragmentSpec spec, BlockingQueue<FragmentEvent> resultQueue,
                                  BlockingQueue<FragmentEvent> controlQueue) {
-        // Producer 片段从不经 doExchange 回传 Master（数据走 exchange 直连下一层），注册 sink 只会
-        // 因 Worker 侧惰性建流（见 ResultStream）而永不 unregister → 泄漏。Consumer 才需要路由。
-        if (!spec.isProducer()) {
-            router.register(taskId, new FragmentSink(taskId, resultQueue, controlQueue));
-        }
+        // 所有片段都注册结果汇：Producer 虽不回传数据页（走 exchange 直连下一层），但<b>失败时</b>
+        // 会经 doExchange 回传 FAILED —— 不注册就是「FAILED 无对应结果汇，失败原因将丢失」，
+        // 查询只能干等结果看门狗直到用户手动取消（线上 CH 读截断 → 挂 2 分钟返回 0 行）。
+        // 成功路径从不建流（ResultStream 惰性建流），汇由查询收尾的 cancelTask 统一摘除（见该方法）。
+        router.register(taskId, new FragmentSink(taskId, resultQueue, controlQueue));
         DispatchFragmentRequest req = DispatchFragmentRequest.newBuilder()
                 .setWorkerId(workerId)
                 .setJobId(jobId)
@@ -160,9 +160,13 @@ public final class NetworkWorkerGateway implements WorkerGateway {
 
     @Override
     public void cancelTask(String workerId, String taskId) {
-        // 先标记：取消后 Worker 侧片段通常「静默退出」（中断 ≠ 失败，不回传终止事件），
-        // 结果流随之半关闭 —— 接收端不得把它当成「终止事件丢失」上报失败。
-        router.markCancelled(taskId);
+        // 取消 = 调用方已放弃该任务的结果：先摘汇再标记没用 —— 摘掉后 isCancelled 也查不到，
+        // 迟到的 FAILED / 无终止事件的半关闭都只会撞 sink==null 被忽略，正好是取消语义。
+        // 这里必须摘：Producer 成功路径<b>从不建流</b>（ResultStream 惰性建流），doExchange 的
+        // finally 永远走不到，不摘的话 sink 表会按「生产者片段数 × 查询数」无限增长。
+        // 查询收尾（AbstractDistributedOperator.doClose）会把所有已派发片段都 cancel 一遍，
+        // 因此成功 / 失败 / 取消三条路径的残留汇都在这里统一清理。
+        router.unregister(taskId);
         CancelTaskRequest req = CancelTaskRequest.newBuilder()
                 .setWorkerId(workerId).setTaskId(taskId).build();
         dispatch(workerId, ControlActions.CANCEL_TASK, req);

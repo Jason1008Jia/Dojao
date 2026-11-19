@@ -33,6 +33,53 @@ public final class SqlTextUtil {
     /** ORDER BY 项解析结果。 */
     public record OrderKey(String column, boolean ascending) {}
 
+    // ==================== 文本归一 ====================
+
+    /**
+     * 把<b>引号外</b>的连续空白（含换行 / 制表符 / 多空格）压成单个空格；字符串字面量与
+     * 引号标识符内部原样保留（{@code ''} 转义对也算在内）。
+     *
+     * <p>用途：CASE / IF 等按「空格分隔的关键字」做文本切分的场景。用户从控制台粘贴的 SQL
+     * 几乎必然跨行书写（{@code WHEN} 后直接换行），不归一就会把 {@code "\n"} 当成关键字分隔符以外
+     * 的字符而整体拒绝。归一后的文本仍是等价 SQL，后续交给表达式解析器求值不受影响。</p>
+     */
+    public static String normalizeWhitespaceOutsideQuotes(String s) {
+        StringBuilder b = new StringBuilder(s.length());
+        char quote = 0;
+        boolean pendingSpace = false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (quote != 0) {
+                b.append(c);
+                if (c == quote) {
+                    // '' / "" / `` 是转义，仍处于引号内（与 findTopLevelKeyword 的扫描口径一致）
+                    if (i + 1 < s.length() && s.charAt(i + 1) == quote) {
+                        b.append(quote);
+                        i++;
+                    } else {
+                        quote = 0;
+                    }
+                }
+                continue;
+            }
+            if (c == '\'' || c == '"' || c == '`') {
+                if (pendingSpace && b.length() > 0) b.append(' ');
+                pendingSpace = false;
+                quote = c;
+                b.append(c);
+                continue;
+            }
+            if (Character.isWhitespace(c)) {
+                pendingSpace = true;
+                continue;
+            }
+            if (pendingSpace && b.length() > 0) b.append(' ');
+            pendingSpace = false;
+            b.append(c);
+        }
+        return b.toString();
+    }
+
     // ==================== 顶层切分 ====================
 
     /** 在顶层（括号深度 0、字符串外）按关键字（如 AND / OR）切分。 */

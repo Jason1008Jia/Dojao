@@ -148,7 +148,7 @@ public class HiveMetastore implements AutoCloseable {
             Collections.sort(dbs);
             return dbs;
         } catch (Exception e) {
-            throw new RuntimeException("列出 Hive 数据库失败 (" + uris + ")", e);
+            throw new RuntimeException("列出 Hive 数据库失败 (" + uris + "): " + rootCause(e), e);
         }
     }
 
@@ -162,7 +162,7 @@ public class HiveMetastore implements AutoCloseable {
         } catch (Exception e) {
             // 老版本 HMS 抛 InvalidObjectException / MetaException 表示不存在
             if (isNotFound(e)) return false;
-            throw new RuntimeException("探查 Hive 数据库失败: " + database, e);
+            throw new RuntimeException("探查 Hive 数据库失败: " + database + ": " + rootCause(e), e);
         }
     }
 
@@ -173,7 +173,7 @@ public class HiveMetastore implements AutoCloseable {
             return Optional.empty();
         } catch (Exception e) {
             if (isNotFound(e)) return Optional.empty();
-            throw new RuntimeException("探查 Hive 数据库失败: " + database, e);
+            throw new RuntimeException("探查 Hive 数据库失败: " + database + ": " + rootCause(e), e);
         }
     }
 
@@ -184,7 +184,7 @@ public class HiveMetastore implements AutoCloseable {
             Collections.sort(tables);
             return tables;
         } catch (Exception e) {
-            throw new RuntimeException("列出 Hive 表失败: " + database, e);
+            throw new RuntimeException("列出 Hive 表失败: " + database + ": " + rootCause(e), e);
         }
     }
 
@@ -203,7 +203,7 @@ public class HiveMetastore implements AutoCloseable {
             return Optional.empty();
         } catch (Exception e) {
             if (isNotFound(e)) return Optional.empty();
-            throw new RuntimeException("探查 Hive 表失败: " + key, e);
+            throw new RuntimeException("探查 Hive 表失败: " + key + ": " + rootCause(e), e);
         }
         HiveTableMeta meta = translate(database, table, t);
         tableCache.put(key, meta);
@@ -628,6 +628,21 @@ public class HiveMetastore implements AutoCloseable {
     }
 
     /** 把 HMS 的「对象不存在」异常族归一（不同版本抛的类型不一样）。 */
+    /**
+     * 把根因写进异常消息 —— HMS 的 Thrift 异常常是「外层一句话 + 内层真正原因」，
+     * 只报外层时 WebUI 上只剩「探查 Hive 表失败」这种无信息量的提示。
+     */
+    private static String rootCause(Exception e) {
+        Throwable root = e;
+        while (root.getCause() != null && root.getCause() != root) {
+            root = root.getCause();
+        }
+        String msg = root.getMessage();
+        return msg == null || msg.isBlank()
+                ? root.getClass().getSimpleName()
+                : root.getClass().getSimpleName() + ": " + msg;
+    }
+
     private static boolean isNotFound(Exception e) {
         String name = e.getClass().getSimpleName().toLowerCase(Locale.ROOT);
         if (name.contains("nosuch") || name.contains("invalid")) return true;

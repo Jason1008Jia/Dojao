@@ -63,6 +63,18 @@ public final class ResourceConfig {
 
     /** 本节点角色（{@code system.role}）：{@code master} / {@code worker} / {@code both}。 */
     public static final String SYSTEM_ROLE = "system.role";
+    /**
+     * 部署形态（{@code system.deploy.mode}）：{@code cluster}（默认，Master / Worker 分 JVM，可跨机扩容）
+     * 或 {@code standalone}（<b>单 JVM</b>：Master + 本机算子，不 fork Worker、不做网络派发）。
+     *
+     * <p>{@code standalone} 下 {@code system.role} 只允许 {@code master} / {@code both}（默认 both 即视为
+     * master）；配 {@code worker} 属于自相矛盾，启动期直接报错。</p>
+     */
+    public static final String SYSTEM_DEPLOY_MODE = "system.deploy.mode";
+    /** standalone 单进程节点内存总量（{@code system.standalone.memory}）；缺省沿用 {@code system.worker.memory}。 */
+    public static final String SYSTEM_STANDALONE_MEMORY = "system.standalone.memory";
+    /** standalone 单进程查询并行度（{@code system.standalone.parallelism}）；缺省沿用 {@code system.worker.parallelism}。 */
+    public static final String SYSTEM_STANDALONE_PARALLELISM = "system.standalone.parallelism";
     /** Master Flight 绑定地址（Master 进程）/ 连接地址（Worker 进程）—— 靠角色前缀区分，不拆键。 */
     public static final String SYSTEM_MASTER_HOST = "system.master.host";
     /** Master Flight 交互端口，默认 {@code 6530}。 */
@@ -371,8 +383,27 @@ public final class ResourceConfig {
     /** 配置文件内容（类初始化读一次；找不到文件时为空，仅系统属性 + 默认生效）。 */
     private static final Properties FILE_PROPS = loadFileProps();
 
-    /** 进程生效角色（类初始化解析一次，见 {@link #SYSTEM_ROLE}）。 */
-    private static final Role ROLE = resolveRole();
+    /**
+     * 部署形态 / 角色的解析结果。
+     *
+     * <p><b>不合法时不在类初始化里抛</b>：那只会得到一个 {@code ExceptionInInitializerError}，
+     * 真正的「system.deploy.mode 取值非法: 'singleton'」被埋进 {@code Caused by} 里，运维看不到。
+     * 这里先把错误存下来，由 {@link #init()}（各启动入口第一行）与 {@link #deployMode()} /
+     * {@link #role()} / {@link #standalone()} 抛出 — 启动即一行清晰报错退出，且任何访问点都不会静默拿默认值。</p>
+     */
+    private record ResolvedConfig(DeployMode mode, Role role, RuntimeException error) {
+    }
+
+    private static final ResolvedConfig RESOLVED = resolveConfig();
+
+    /** 进程生效部署形态（类初始化解析一次，见 {@link #SYSTEM_DEPLOY_MODE}）。 */
+    private static final DeployMode DEPLOY_MODE = RESOLVED.mode();
+
+    /**
+     * 进程生效角色（类初始化解析一次，见 {@link #SYSTEM_ROLE}）。
+     * standalone 下恒为 {@link Role#MASTER} —— 单进程即全部，不区分 Master / Worker。
+     */
+    private static final Role ROLE = RESOLVED.role();
 
     /** 类初始化前就已存在的系统属性（来自 {@code -D}）：回填时一律不覆盖，保证 {@code -D} > 文件。 */
     private static final java.util.Set<String> PRESET_KEYS =
@@ -428,11 +459,24 @@ public final class ResourceConfig {
      * （{@code dojao-metastore} / {@code dojao-ui} 看不到本类，只能走这条路）。</p>
      */
     public static void init() {
-        log.info("[ResourceConfig] 角色={} 配置={} 文件键={} 项",
-                ROLE.prefix(), confPathDescription(), FILE_PROPS.size());
+        requireValidConfig();
+        log.info("[ResourceConfig] 部署={} 角色={} 配置={} 文件键={} 项",
+                DEPLOY_MODE.value(), ROLE.prefix(), confPathDescription(), FILE_PROPS.size());
     }
 
     // ==================== 角色 ====================
+
+    /** 部署形态（{@code system.deploy.mode}）：决定是「分进程集群」还是「单 JVM 单机」。 */
+    public enum DeployMode {
+        /** Master / Worker 分 JVM（可跨机扩容；现有行为的默认值）。 */
+        CLUSTER,
+        /** 单 JVM：Master + 本机算子，不 fork Worker、不建网络派发网关、不做分布式下沉。 */
+        STANDALONE;
+
+        public String value() {
+            return name().toLowerCase();
+        }
+    }
 
     /** 本节点角色（{@code system.role}）：决定角色前缀查找与启动拓扑。 */
     public enum Role {
@@ -444,25 +488,77 @@ public final class ResourceConfig {
         }
     }
 
+    /** 解析部署形态 + 角色；失败时把异常存进 {@link ResolvedConfig}，不抛（见其注释）。 */
+    private static ResolvedConfig resolveConfig() {
+        try {
+            DeployMode mode = resolveDeployMode();
+            return new ResolvedConfig(mode, resolveRole(mode), null);
+        } catch (RuntimeException e) {
+            return new ResolvedConfig(DeployMode.CLUSTER, Role.BOTH, e);
+        }
+    }
+
+    /** 配置不合法时抛出启动期错误（保留原始信息与栈）。 */
+    private static void requireValidConfig() {
+        RuntimeException error = RESOLVED.error();
+        if (error != null) {
+            throw new IllegalStateException(error.getMessage(), error);
+        }
+    }
+
+    /**
+     * 解析部署形态：{@code -Dsystem.deploy.mode} &gt; 文件 {@code system.deploy.mode} &gt; {@code cluster}。
+     * 显式写了但认不出来直接抛错 —— 部署形态决定起几个进程，写错不能静默兜底。
+     */
+    private static DeployMode resolveDeployMode() {
+        String v = System.getProperty(SYSTEM_DEPLOY_MODE);
+        if (v == null || v.isBlank()) {
+            v = FILE_PROPS.getProperty(SYSTEM_DEPLOY_MODE);
+        }
+        if (v == null || v.isBlank()) {
+            return DeployMode.CLUSTER;
+        }
+        return switch (v.trim().toLowerCase()) {
+            case "cluster" -> DeployMode.CLUSTER;
+            case "standalone" -> DeployMode.STANDALONE;
+            default -> throw new IllegalStateException(
+                    "system.deploy.mode 取值非法: '" + v + "'（只能是 cluster / standalone）");
+        };
+    }
+
     /**
      * 解析生效角色：{@code -Dsystem.role} &gt; 文件 {@code system.role} &gt; {@link #DEFAULT_ROLE}（both）。
      * 显式写了但认不出来（如 {@code mater} 笔误）直接抛错 —— 角色错会让整台机器起错进程，不能静默兜底。
+     *
+     * <p>{@code standalone} 下单进程即全部，角色恒为 {@link Role#MASTER}；此时显式写 {@code worker}
+     * 自相矛盾（单机模式没有独立的 Worker 进程），启动期直接报错。</p>
      */
-    private static Role resolveRole() {
+    private static Role resolveRole(DeployMode mode) {
         String v = System.getProperty(SYSTEM_ROLE);
         if (v == null || v.isBlank()) {
             v = FILE_PROPS.getProperty(SYSTEM_ROLE);
         }
+        Role role;
         if (v == null || v.isBlank()) {
-            return Role.BOTH;
+            role = Role.BOTH;
+        } else {
+            role = switch (v.trim().toLowerCase()) {
+                case "master" -> Role.MASTER;
+                case "worker" -> Role.WORKER;
+                case "both" -> Role.BOTH;
+                default -> throw new IllegalStateException(
+                        "system.role 取值非法: '" + v + "'（只能是 master / worker / both）");
+            };
         }
-        return switch (v.trim().toLowerCase()) {
-            case "master" -> Role.MASTER;
-            case "worker" -> Role.WORKER;
-            case "both" -> Role.BOTH;
-            default -> throw new IllegalStateException(
-                    "system.role 取值非法: '" + v + "'（只能是 master / worker / both）");
-        };
+        if (mode == DeployMode.STANDALONE) {
+            if (role == Role.WORKER) {
+                throw new IllegalStateException(
+                        "system.deploy.mode=standalone 与 system.role=worker 冲突：单进程模式没有独立 Worker 进程，"
+                                + "请改 system.role=master（或删除 system.role，默认 both）。");
+            }
+            return Role.MASTER;
+        }
+        return role;
     }
 
     /**
@@ -532,8 +628,24 @@ public final class ResourceConfig {
 
     // ==================== 访问器 ====================
 
-    /** Master 查询并行分区数（{@code system.master.parallelism}，≥ 1）。 */
+    /**
+     * 查询并行分区数（扫描 / hash 分区 / 分布式聚合共用）。
+     *
+     * <p>{@code cluster} 取 {@code system.master.parallelism}；{@code standalone} 单进程承担原本的
+     * 计算角色，优先 {@code system.standalone.parallelism} → {@code system.worker.parallelism}
+     * → {@code system.master.parallelism}（存量 conf 不改也能按 Worker 口径跑满）。</p>
+     */
     public static int masterParallelism() {
+        if (DEPLOY_MODE == DeployMode.STANDALONE) {
+            int v = intValue(SYSTEM_STANDALONE_PARALLELISM, 0);
+            if (v > 0) {
+                return v;
+            }
+            int w = intValue(SYSTEM_WORKER_PARALLELISM, 0);
+            if (w > 0) {
+                return w;
+            }
+        }
         return Math.max(1, intValue(SYSTEM_MASTER_PARALLELISM, DEFAULT_MASTER_PARALLELISM));
     }
 
@@ -578,9 +690,29 @@ public final class ResourceConfig {
     }
 
     private static boolean nodeMemoryConfigured(Role role) {
-        return sizeValue(nodeMemoryKey(role), 0L) > 0
+        return nodeTotalValue(role) > 0
                 || sizeValue(nodeHeapKey(role), 0L) > 0
                 || sizeValue(nodeDirectKey(role), 0L) > 0;
+    }
+
+    /**
+     * 指定角色的节点内存总量（0 = 未声明）—— 派生链的入口。
+     *
+     * <p>{@code standalone} 的 Master 就是整台机器：优先 {@code system.standalone.memory}，
+     * 其次 {@code system.worker.memory}（存量 conf 的「计算侧预算」），最后 {@code system.master.memory}。</p>
+     */
+    private static long nodeTotalValue(Role role) {
+        if (DEPLOY_MODE == DeployMode.STANDALONE && role == Role.MASTER) {
+            long v = sizeValue(SYSTEM_STANDALONE_MEMORY, 0L);
+            if (v > 0) {
+                return v;
+            }
+            long w = sizeValue(SYSTEM_WORKER_MEMORY, 0L);
+            if (w > 0) {
+                return w;
+            }
+        }
+        return sizeValue(nodeMemoryKey(role), 0L);
     }
 
     /** {@code query.memory.max} 是否显式配置。 */
@@ -590,9 +722,9 @@ public final class ResourceConfig {
 
     /** 指定角色的进程内存总量（{@code system.master.memory} / {@code system.worker.memory}）。 */
     public static long nodeMemoryBytes(Role role) {
-        String key = role == Role.MASTER ? SYSTEM_MASTER_MEMORY : SYSTEM_WORKER_MEMORY;
         long def = role == Role.MASTER ? DEFAULT_MASTER_MEMORY_BYTES : DEFAULT_WORKER_MEMORY_BYTES;
-        return Math.max(1L, sizeValue(key, def));
+        long v = nodeTotalValue(role);
+        return Math.max(1L, v > 0 ? v : def);
     }
 
     /**
@@ -605,8 +737,7 @@ public final class ResourceConfig {
         if (explicit > 0) {
             return explicit;
         }
-        String memKey = role == Role.MASTER ? SYSTEM_MASTER_MEMORY : SYSTEM_WORKER_MEMORY;
-        long total = sizeValue(memKey, 0L);
+        long total = nodeTotalValue(role);
         if (total > 0) {
             return Math.max(1L, (long) (total * memoryHeapRatio()));
         }
@@ -623,8 +754,7 @@ public final class ResourceConfig {
         if (explicit > 0) {
             return explicit;
         }
-        String memKey = role == Role.MASTER ? SYSTEM_MASTER_MEMORY : SYSTEM_WORKER_MEMORY;
-        long total = sizeValue(memKey, 0L);
+        long total = nodeTotalValue(role);
         if (total > 0) {
             return Math.max(1L, (long) (total * (1.0 - memoryHeapRatio())));
         }
@@ -1136,14 +1266,36 @@ public final class ResourceConfig {
      * 提前溢写（磁盘）替代内存爆掉；Worker 侧算子内存不受影响（仍按 {@code query.slot.memory} 传）。</p>
      */
     public static long masterAggregationMemoryBytes() {
+        long explicit = sizeValue(SYSTEM_MASTER_AGG_MEMORY, 0L);
+        if (explicit > 0) {
+            return explicit;
+        }
+        // standalone 的「Master」就是计算节点：聚合不再是小内存进程里的例外路径，
+        // 按本机算子卡槽预算给，否则整条查询被 256M 下限压成频繁溢写。
+        if (DEPLOY_MODE == DeployMode.STANDALONE) {
+            return slotMemoryBytes(Role.MASTER);
+        }
         return Math.max(1L, sizeValue(SYSTEM_MASTER_AGG_MEMORY, DEFAULT_MASTER_AGG_MEMORY_BYTES));
     }
 
     // ==================== 部署拓扑访问器 ====================
 
-    /** 本节点角色（{@code system.role}）。 */
+    /** 本节点角色（{@code system.role}）；standalone 下恒为 {@link Role#MASTER}。 */
     public static Role role() {
+        requireValidConfig();
         return ROLE;
+    }
+
+    /** 部署形态（{@code system.deploy.mode}）。 */
+    public static DeployMode deployMode() {
+        requireValidConfig();
+        return DEPLOY_MODE;
+    }
+
+    /** 是否单 JVM 单机部署（{@code system.deploy.mode=standalone}）。 */
+    public static boolean standalone() {
+        requireValidConfig();
+        return DEPLOY_MODE == DeployMode.STANDALONE;
     }
 
     /** Master Flight 绑定 / 连接地址（{@code system.master.host}）。 */
@@ -1280,15 +1432,21 @@ public final class ResourceConfig {
         }
     }
 
-    /** 依次加载 -D 指定路径 / 当前目录 conf / classpath 根，先到先用（同一文件内前值优先）。 */
+    /**
+     * 按优先级加载：当前目录 {@code conf/dojao.conf} → classpath 根 → {@code -Ddoja.conf} 指定路径。
+     *
+     * <p>{@link Properties#load} 是<b>覆盖</b>语义（后加载的键赢），故显式路径必须<b>最后</b>加载 ——
+     * 否则从安装目录（工作目录自带 conf/dojao.conf）启动并指定 {@code -Ddoja.conf=<别的文件>} 时，
+     * 工作目录那份会静默盖掉用户显式指定的配置，与「-D 指定路径优先」的约定相反。</p>
+     */
     private static Properties loadFileProps() {
         Properties p = new Properties();
+        loadFile(p, Path.of("conf", "dojao.conf"));
+        loadFileFromClasspath(p, "/dojao.conf");
         String explicit = System.getProperty(CONF_FILE_KEY);
         if (explicit != null && !explicit.isBlank()) {
             loadFile(p, Path.of(explicit));
         }
-        loadFile(p, Path.of("conf", "dojao.conf"));
-        loadFileFromClasspath(p, "/dojao.conf");
         return p;
     }
 
