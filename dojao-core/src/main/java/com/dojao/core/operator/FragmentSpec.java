@@ -361,13 +361,23 @@ public sealed interface FragmentSpec
     record JoinAlias(String sourceName, int occurrence, String aliasName) {
     }
 
-    /** 聚合函数的传输 DTO —— 用 {@code aggregateName} 替代运行期聚合函数实例（FragmentSpec 不得引用运行期算子）。 */
+    /**
+     * 聚合函数的传输 DTO —— 用 {@code aggregateName} 替代运行期聚合函数实例（FragmentSpec 不得引用运行期算子）。
+     *
+     * <p>{@code valueColumn} / {@code mapAppend} 只对 {@code collect_map}（key, value 双输入）有意义。</p>
+     */
     record AggregationDto(String inputColumn, String outputColumn, String aggregateName,
-                          List<String> collectInputColumns) {
+                          List<String> collectInputColumns, String valueColumn, boolean mapAppend) {
 
-        /** 增量型 / 旧调用点：无 collect 输入列。 */
+        /** 增量型 / 旧调用点：无 collect 输入列、无第二输入列。 */
         public AggregationDto(String inputColumn, String outputColumn, String aggregateName) {
-            this(inputColumn, outputColumn, aggregateName, List.of());
+            this(inputColumn, outputColumn, aggregateName, List.of(), null, false);
+        }
+
+        /** collect-evaluate 型（单输入）兼容构造。 */
+        public AggregationDto(String inputColumn, String outputColumn, String aggregateName,
+                              List<String> collectInputColumns) {
+            this(inputColumn, outputColumn, aggregateName, collectInputColumns, null, false);
         }
 
         /**
@@ -382,7 +392,7 @@ public sealed interface FragmentSpec
                     ? spec.collect().functionName()
                     : spec.aggregate().functionName();
             return new AggregationDto(spec.inputColumn(), spec.outputColumn(), name,
-                    spec.collectInputColumns());
+                    spec.collectInputColumns(), spec.valueColumn(), spec.mapAppend());
         }
     }
 

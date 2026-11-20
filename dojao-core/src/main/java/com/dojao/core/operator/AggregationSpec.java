@@ -22,6 +22,9 @@ import java.util.List;
  * </ul>
  * 本轮单 GROUP BY 内只支持其一（不混用），且 collect 型每查询一个。</p>
  *
+ * <p>{@code collect_map} / {@code map_agg} 是增量型里的双输入特例：{@code inputColumn} = key 列、
+ * {@code valueColumn} = value 列、{@code mapAppend} = 同 key 值是否追加为列表。</p>
+ *
  * @author jiaxin
  * @version 2.0
  * @date 2026/7/15
@@ -31,11 +34,19 @@ public record AggregationSpec(
         String outputColumn,
         AggregateFunction<?> aggregate,
         CollectAggregateFunction collect,
-        List<String> collectInputColumns) {
+        List<String> collectInputColumns,
+        String valueColumn,
+        boolean mapAppend) {
 
     /** 增量型构造（collect 留空）。 */
     public AggregationSpec(String inputColumn, String outputColumn, AggregateFunction<?> aggregate) {
-        this(inputColumn, outputColumn, aggregate, null, List.of());
+        this(inputColumn, outputColumn, aggregate, null, List.of(), null, false);
+    }
+
+    /** collect-evaluate 型 / 单输入增量型构造（无第二输入列）。 */
+    public AggregationSpec(String inputColumn, String outputColumn, AggregateFunction<?> aggregate,
+                           CollectAggregateFunction collect, List<String> collectInputColumns) {
+        this(inputColumn, outputColumn, aggregate, collect, collectInputColumns, null, false);
     }
 
     /** 是否 collect-evaluate 型。 */
@@ -49,6 +60,7 @@ public record AggregationSpec(
     private static final ArrowType INT64 = new ArrowType.Int(64, true);
     private static final ArrowType FLOAT64 = new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE);
     private static final ArrowType LIST = new ArrowType.List();
+    private static final ArrowType MAP = new ArrowType.Map(false);
 
     /** 获取该聚合的输出 Arrow 类型 */
     public ArrowType outputArrowType() {
@@ -60,6 +72,8 @@ public record AggregationSpec(
             // collect_list / collect_set：元素类型来自输入列，ArrowType 本身不含子字段，
             // 声明完整 schema 请用 outputField(...)
             case "collect_list", "collect_set" -> LIST;
+            // collect_map：key/value 类型来自输入列，完整声明同样走 outputField(...)
+            case "collect_map" -> MAP;
             default -> FLOAT64; // 自定义聚合默认 double
         };
     }
@@ -69,6 +83,16 @@ public record AggregationSpec(
         if (aggregate == null) return false;
         String name = aggregate.functionName();
         return "collect_list".equals(name) || "collect_set".equals(name);
+    }
+
+    /** 是否 collect_map / map_agg（输出嵌套 Map，双输入列：key + value）。 */
+    public boolean isCollectMap() {
+        return aggregate != null && "collect_map".equals(aggregate.functionName());
+    }
+
+    /** 状态是否走「逐值溢写流」（collect_list / collect_set / collect_map）：标量流里不占列。 */
+    public boolean usesCollectSpill() {
+        return isCollectArray() || isCollectMap();
     }
 
     /**
@@ -82,13 +106,55 @@ public record AggregationSpec(
      *                   {@code list<Utf8>}，仅用于空输入兜底
      */
     public Field outputField(String name, Field inputField) {
+        return outputField(name, inputField, null);
+    }
+
+    /**
+     * 结果列 Field（collect_map 的双输入变体）：{@code keyInputField} = key 列、
+     * {@code valueInputField} = value 列；输入未知时回退 {@code map<Utf8, Utf8>}（追加模式为
+     * {@code map<Utf8, list<Utf8>>}），仅用于空输入兜底。
+     */
+    public Field outputField(String name, Field keyInputField, Field valueInputField) {
         if (isCollectArray()) {
-            Field child = inputField != null
-                    ? new Field("item", inputField.getFieldType(), inputField.getChildren())
+            Field child = keyInputField != null
+                    ? new Field("item", keyInputField.getFieldType(), keyInputField.getChildren())
                     : new Field("item", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
             return new Field(name, FieldType.nullable(LIST), List.of(child));
         }
-        return new Field(name, FieldType.nullable(outputArrowType(inputField)), null);
+        if (isCollectMap()) {
+            return mapField(name, keyInputField, valueInputField, mapAppend);
+        }
+        return new Field(name, FieldType.nullable(outputArrowType(keyInputField)), null);
+    }
+
+    /**
+     * 构造 Arrow Map 结果 Field。
+     *
+     * <p>结构固定为 {@code map<key, value>}（entries 为非空 struct，key 非空、value 可空）；
+     * 追加模式下 value = {@code list<元素类型>}。所有「声明输出 schema」的地方
+     * （单机 buildOutput / 分布式 CTAS 声明 / DTO 重建）都必须走本方法 ——
+     * 直接 {@code new Field(name, ArrowType.Map, null)} 建不出可写的 MapVector。</p>
+     */
+    public static Field mapField(String name, Field keyInput, Field valueInput, boolean appendValues) {
+        FieldType keyType = keyInput != null
+                ? FieldType.notNullable(keyInput.getType())
+                : FieldType.notNullable(ArrowType.Utf8.INSTANCE);
+        Field key = new Field("key", keyType, keyInput != null ? keyInput.getChildren() : null);
+        Field value;
+        if (appendValues) {
+            Field elem = valueInput != null
+                    ? new Field("item", valueInput.getFieldType(), valueInput.getChildren())
+                    : new Field("item", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+            value = new Field("value", FieldType.nullable(LIST), List.of(elem));
+        } else {
+            value = new Field("value",
+                    valueInput != null ? FieldType.nullable(valueInput.getType())
+                            : FieldType.nullable(ArrowType.Utf8.INSTANCE),
+                    valueInput != null ? valueInput.getChildren() : null);
+        }
+        Field entries = new Field("entries", FieldType.notNullable(new ArrowType.Struct()),
+                List.of(key, value));
+        return new Field(name, FieldType.nullable(MAP), List.of(entries));
     }
 
     /**
@@ -177,6 +243,18 @@ public record AggregationSpec(
     /** COLLECT_SET：去重收集为 {@code list<输入类型>}（NULL 跳过，空组 → NULL）。 */
     public static AggregationSpec collectSet(String inputColumn, String outputColumn) {
         return new AggregationSpec(inputColumn, outputColumn, CollectSetAggregateFunction.INSTANCE);
+    }
+
+    /**
+     * COLLECT_MAP / MAP_AGG：把 {@code (key, value)} 对收集为 {@code map<key, value>}。
+     * {@code append = true} 时同 key 的值追加为列表（{@code map<key, list<value>>}）；
+     * 默认后者覆盖（NULL key / NULL value 跳过，空组 → NULL）。
+     */
+    public static AggregationSpec collectMap(String keyColumn, String valueColumn,
+                                             String outputColumn, boolean append) {
+        return new AggregationSpec(keyColumn, outputColumn,
+                append ? CollectMapAggregateFunction.APPEND : CollectMapAggregateFunction.OVERWRITE,
+                null, List.of(), valueColumn, append);
     }
 
     /** 注册自定义聚合函数（增量型） */

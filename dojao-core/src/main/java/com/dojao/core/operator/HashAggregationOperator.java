@@ -53,8 +53,11 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
             return "collect(" + spec.collectInputColumns() + ") AS " + spec.outputColumn();
         }
         String fn = spec.aggregate() == null ? "aggregate" : spec.aggregate().functionName();
-        return fn + "(" + (spec.inputColumn() == null ? "*" : spec.inputColumn()) + ") AS "
-                + spec.outputColumn();
+        String args = spec.inputColumn() == null ? "*" : spec.inputColumn();
+        if (spec.isCollectMap()) {
+            args += ", " + spec.valueColumn() + (spec.mapAppend() ? ", TRUE" : "");
+        }
+        return fn + "(" + args + ") AS " + spec.outputColumn();
     }
 
     private final List<String> keyColumns;
@@ -74,6 +77,16 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
     private final int[] distinctSpecs;
     /** {@code specs} 下标是否 count_distinct（避免每条 key 线性查找）。 */
     private final boolean[] distinctSpecFlag;
+
+    /**
+     * 内建 {@code collect_list} / {@code collect_set}：溢写同样拆成「标量流（每组一行，不含 collect 列）
+     * + 逐值流（每值一行 {@code [key..., value]}，按键有序）」，Phase 2 与去重流共用统一 K 路归并后
+     * 把同键的值拼回状态。规避旧格式「一格 = 整组」在低基数分组下的 O(单组值数) 放大。
+     */
+    private final int[] collectSpecs;
+    /** {@code specs} 下标是否内建 collect（避免每条 key 线性查找）。 */
+    private final boolean[] collectSpecFlag;
+    private final boolean collectSpillMode;
 
     /** 去重流归并的最大并行路数（与 Window 的 MAX_MERGE_K 同口径）。 */
     private static final int MAX_DISTINCT_MERGE_K = 16;
@@ -143,6 +156,20 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
             this.distinctSpecs = new int[0];
         }
         this.distinctMode = distinctSpecs.length > 0;
+
+        int[] tmpc = new int[aggregations.size()];
+        int cc = 0;
+        this.collectSpecFlag = new boolean[aggregations.size()];
+        if (!collectMode) {
+            for (int i = 0; i < aggregations.size(); i++) {
+                if (aggregations.get(i).usesCollectSpill()) {
+                    tmpc[cc++] = i;
+                    collectSpecFlag[i] = true;
+                }
+            }
+        }
+        this.collectSpecs = Arrays.copyOf(tmpc, cc);
+        this.collectSpillMode = collectSpecs.length > 0;
     }
 
     public void setHavingConfig(AggregationHavingConfig havingConfig) {
@@ -198,28 +225,39 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
     }
 
     /**
-     * 溢写一个槽位。{@code distinctMode} 下拆成两条流写：
+     * 溢写一个槽位。含 {@code count_distinct} 或内建 collect 时拆成多条流写：
      * <ul>
      *   <li><b>标量流</b>（{@code p<pid>_b<idx>.arrow}）：每组一行，含 count/sum/min/max/avg 状态 ——
-     *       与旧布局相同，只是不含 count_distinct 列；</li>
+     *       与旧布局相同，只是不含 count_distinct 与 collect 列；</li>
      *   <li><b>去重流</b>（{@code p<pid>_b<idx>_d<ord>.arrow}）：每个去重值一行 {@code [key..., value]}，
-     *       按 {@code (key, value)} 有序，登记到 {@link PartitionState#distinctFiles}。</li>
+     *       按 {@code (key, value)} 有序，登记到 {@link PartitionState#distinctFiles}；</li>
+     *   <li><b>collect 值流</b>（{@code p<pid>_b<idx>_c<ord>.arrow}）：每个收集值一行 {@code [key..., value]}，
+     *       按键有序（组内保持累加顺序），登记到 {@link PartitionState#collectFiles}。</li>
      * </ul>
-     * 其余算子（collect 型 / 纯标量聚合）走基类原实现。
+     * 其余算子（collect-evaluate 型 / 纯标量聚合）走基类原实现。
      */
     @Override
     protected void spillSlotSync(PartitionState<Slot> pa, int slotIdx, Slot slot, int pid) {
-        if (!distinctMode || !(slot instanceof AggregationHashTable ht) || !ht.hasDistinct()) {
+        if ((!distinctMode && !collectSpillMode) || !(slot instanceof AggregationHashTable ht)) {
             super.spillSlotSync(pa, slotIdx, slot, pid);
             return;
         }
         if (slot.isEmpty()) return;
+        if (closed || pa.cancelled) return;   // 已关闭：槽位由 PartitionState.close() 统一释放
         VectorSchemaRoot scalar = null;
+        long t0 = System.currentTimeMillis();
         try {
+            checkSpillCancelled();
             scalar = ht.buildSortedScalarSpillRoot();
+            long t1 = System.currentTimeMillis();
+            checkSpillCancelled();
             BatchWrite written = writeBatchToArrow(pa, scalar, pid);
+            long t2 = System.currentTimeMillis();
             accountSpilledBytes(written.bytes());
+            log.info("[溢写] {} 分区 {} 槽位 {} 标量流落盘完成：{} 行，排序 {}ms，写盘 {}ms",
+                    getStats().getOperatorId(), pid, slotIdx, scalar.getRowCount(), t1 - t0, t2 - t1);
             for (int ord = 0; ord < ht.distinctSpecCount(); ord++) {
+                checkSpillCancelled();
                 VectorSchemaRoot droot = null;
                 try {
                     droot = ht.buildDistinctSpillRoot(ord);
@@ -236,8 +274,25 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                     if (droot != null) droot.close();
                 }
             }
+            for (int ord = 0; ord < ht.collectSpecCount(); ord++) {
+                checkSpillCancelled();
+                VectorSchemaRoot croot = null;
+                try {
+                    croot = ht.buildCollectSpillRoot(ord);
+                    if (croot == null || croot.getRowCount() == 0) continue;
+                    Path file = spillDirForWrite().resolve(
+                            "p" + pid + "_b" + written.batchIndex() + "_c" + ord + ".arrow");
+                    long bytes = writeArrowFile(file, croot);
+                    noteSpillFile();
+                    pa.collectFilesFor(ord).add(file);
+                    synchronized (pa) { pa.dataFileSize += bytes; }
+                    accountSpilledBytes(bytes);
+                } finally {
+                    if (croot != null) croot.close();
+                }
+            }
         } catch (IOException e) {
-            throw new RuntimeException("Failed to write distinct spill for partition " + pid, e);
+            throw new RuntimeException("Failed to write distinct/collect spill for partition " + pid, e);
         } finally {
             if (scalar != null) scalar.close();
             try { slot.close(); } catch (Exception ignored) {}
@@ -342,8 +397,8 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
             mergeAndOutputCollect(pa, pid);
             return;
         }
-        if (distinctMode) {
-            mergeAndOutputDistinct(pa, pid);
+        if (distinctMode || collectSpillMode) {
+            mergeAndOutputAuxStreams(pa, pid);
             return;
         }
         int fileCount = pa.batchFiles.size();
@@ -604,7 +659,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                     //     否则后续聚合列整体错位（旧实现还会写出 outVectors 越界）。
                     int outCol = keyColumns.size();
                     for (int si = 0; si < aggregations.size(); si++) {
-                        if (distinctSpecFlag[si]) continue;
+                        if (distinctSpecFlag[si] || collectSpecFlag[si]) continue;
                         Object state = mergedStates[si];
                         switch (aggregations.get(si).aggregate().functionName()) {
                             case "avg" -> {
@@ -615,14 +670,6 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                             case "count", "sum_int64" -> {
                                 long[] longs = (long[]) state;
                                 setVectorValue(outVectors.get(outCol), outRows, longs[0]);
-                            }
-                            case "collect_list", "collect_set" -> {
-                                // 状态 = Collection：整组写成一格 List（空组 → NULL，与唯一输出语义一致）
-                                if (state instanceof Collection<?> c && !c.isEmpty()) {
-                                    setVectorValue(outVectors.get(outCol), outRows, c);
-                                } else {
-                                    setVectorValue(outVectors.get(outCol), outRows, null);
-                                }
                             }
                             default -> {
                                 // sum / min / max：Object[]{原始状态值}
@@ -676,22 +723,26 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
         int stateCol = keyColumns.size();
         for (int si = 0; si < aggregations.size(); si++) {
             AggregationSpec spec = aggregations.get(si);
+            if (spec.isCollectMap()) {
+                // COLLECT_MAP / MAP_AGG：map<key, value>（追加模式 value = list<value>）。子字段取
+                // key / value 输入列；状态走独立逐条目流，标量流里不占列。
+                Field keyIn = spec.inputColumn() == null
+                        ? null : inputSchema.findField(spec.inputColumn());
+                Field valIn = spec.valueColumn() == null
+                        ? null : inputSchema.findField(spec.valueColumn());
+                outFields.add(spec.outputField(spec.outputColumn(), keyIn, valIn));
+                stateCol += stateColCount[si];
+                continue;
+            }
             if (spec.isCollectArray()) {
-                // COLLECT_LIST / COLLECT_SET：结果列是 list<元素类型>。溢写路径取状态列的子字段，
-                // 未溢写（纯内存）取输入列字段 —— 都必须在 Field 层级带上子字段，ArrowType.List 不够。
+                // COLLECT_LIST / COLLECT_SET：结果列是 list<元素类型>。collect 状态走独立逐值流、
+                // 不出现在标量溢写流里，故子字段一律取输入列（Field 层级必须带子字段，
+                // 光 ArrowType.List 不够）。
                 Field child = null;
-                Field spilled = (!distinctSpecFlag[si] && spillFields != null
-                        && stateCol < spillFields.size()) ? spillFields.get(stateCol) : null;
-                if (spilled != null && !spilled.getChildren().isEmpty()) {
-                    child = spilled.getChildren().get(0);
-                } else {
-                    Field in = spec.inputColumn() == null
-                            ? null : inputSchema.findField(spec.inputColumn());
-                    if (in != null) child = new Field("item", in.getFieldType(), in.getChildren());
-                }
-                FieldType ft = spilled != null ? spilled.getFieldType()
-                        : FieldType.nullable(new ArrowType.List());
-                outFields.add(new Field(spec.outputColumn(), ft,
+                Field in = spec.inputColumn() == null
+                        ? null : inputSchema.findField(spec.inputColumn());
+                if (in != null) child = new Field("item", in.getFieldType(), in.getChildren());
+                outFields.add(new Field(spec.outputColumn(), FieldType.nullable(new ArrowType.List()),
                         child != null ? List.of(child) : null));
                 stateCol += stateColCount[si];
                 continue;
@@ -746,7 +797,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
     private void mergeSpillRow(VectorSchemaRoot root, int row, Object[] mergedStates, int[] stateColCount) {
         int col = keyColumns.size();
         for (int si = 0; si < aggregations.size(); si++) {
-            if (distinctSpecFlag[si]) continue;   // 标量流不含 count_distinct 列
+            if (distinctSpecFlag[si] || collectSpecFlag[si]) continue;   // 标量流不含 count_distinct / collect 列
             Object otherState = readStateFromSpillCols(root, row, aggregations.get(si), col);
             AggregateFunction<Object> fn = (AggregateFunction<Object>) aggregations.get(si).aggregate();
             fn.merge(mergedStates[si], otherState);
@@ -767,36 +818,42 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
         return AggregationHashTable.compareValues(a, b);
     }
 
-    // ==================== Phase 2（count_distinct）：两条流统一 K 路归并 ====================
+    // ==================== Phase 2（count_distinct / collect）：辅助流统一 K 路归并 ====================
 
     /**
-     * 增量型 + {@code count_distinct} 的 Phase 2。
+     * 增量型 + {@code count_distinct} / 内建 {@code collect_list|set} 的 Phase 2。
      *
-     * <p><b>两条流</b>（溢写时形状不同，无法共用布局）：</p>
+     * <p><b>多条流</b>（溢写时形状不同，无法共用布局）：</p>
      * <ul>
      *   <li>标量流：每组一行，键唯一 —— 文件数 &gt; {@link #MAX_SCALAR_MERGE_K} 时先多轮归并压缩，
      *       再流式 K 路归并（与纯标量路径同构，内存有界）；</li>
      *   <li>去重流：每个值一行，按 {@code (key, value)} 有序 —— 先按 ordinal 归并成<b>一条</b>有序顺串
-     *       （流式、路数受分配器预算约束），再逐键数「相邻不重复值的个数」。</li>
+     *       （流式、路数受分配器预算约束），再逐键数「相邻不重复值的个数」；</li>
+     *   <li>collect 值流：每个收集值一行，按键有序（组内保持累加顺序）—— 同样先归并成一条有序顺串，
+     *       再逐键把值累加进状态。峰值 = 单键集合 + 归并路数 × 单批（单键集合是输出本身的要求）。</li>
      * </ul>
      *
-     * <p><b>关键</b>：去重侧全程不物化集合 —— 同一个键的几百万个值只会以「一行一个值」的顺序流过，
-     * 峰值内存 = 归并路数 × 单批 + 一个输出批，与单组去重基数无关。这正是旧格式
-     * （整组集合编码成一条 VARCHAR，编解码本身 O(值数) 且峰值 = 整组集合）的替代方案。</p>
+     * <p><b>关键</b>：去重侧全程不物化集合；collect 侧不再「一格 = 整组」地写溢写文件 ——
+     * 旧格式整组编码/复制/落盘的耗时是 O(单组值数)，低基数分组 + 几百万值时会把这步拖到分钟级。</p>
      */
     @SuppressWarnings({"rawtypes", "unchecked"})
-    private void mergeAndOutputDistinct(PartitionState<Slot> pa, int pid) throws Exception {
-        // 1) 每条去重流先归并成一条有序顺串（多轮、流式、内存有界；consumed 原文件已删）
+    private void mergeAndOutputAuxStreams(PartitionState<Slot> pa, int pid) throws Exception {
+        // 1) 每条去重流 / collect 值流先归并成一条有序顺串（多轮、流式、内存有界；consumed 原文件已删）
         Path[] distinctStreams = new Path[distinctSpecs.length];
         for (int ord = 0; ord < distinctSpecs.length; ord++) {
             List<Path> dfiles = new ArrayList<>(pa.distinctFilesFor(ord));
             if (!dfiles.isEmpty()) distinctStreams[ord] = compactDistinctRuns(dfiles, pa, pid, ord);
         }
+        Path[] collectStreams = new Path[collectSpecs.length];
+        for (int ord = 0; ord < collectSpecs.length; ord++) {
+            List<Path> cfiles = new ArrayList<>(pa.collectFilesFor(ord));
+            if (!cfiles.isEmpty()) collectStreams[ord] = compactCollectRuns(cfiles, pa, pid, ord);
+        }
 
-        // 标量状态列宽度：count_distinct 在标量流里不占列
+        // 标量状态列宽度：count_distinct 与 collect 在标量流里都不占列
         int[] stateColCount = new int[aggregations.size()];
         for (int si = 0; si < aggregations.size(); si++) {
-            stateColCount[si] = distinctSpecFlag[si] ? 0
+            stateColCount[si] = (distinctSpecFlag[si] || collectSpecFlag[si]) ? 0
                     : (aggregations.get(si).aggregate().functionName().equals("avg") ? 2 : 1);
         }
 
@@ -816,6 +873,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
         List<ScalarRun> scalarRuns = new ArrayList<>(runPaths.size());
         List<Field> firstFields = null;
         List<DistinctRun> runs = new ArrayList<>();
+        List<CollectRun> cruns = new ArrayList<>();
         // 在途输出批：取消检查点抛异常时由 finally 收尾（同 mergeAndOutput）。
         List<FieldVector> outVectors = null;
         try {
@@ -829,17 +887,27 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                     runs.add(new DistinctRun(distinctStreams[ord], distinctSpecs[ord]));
                 }
             }
+            for (int ord = 0; ord < collectStreams.length; ord++) {
+                if (collectStreams[ord] != null) {
+                    cruns.add(new CollectRun(collectStreams[ord], collectSpecs[ord]));
+                }
+            }
 
             List<Field> outFields = buildOutputFields(firstFields, stateColCount);
 
-            // 统一优先队列：编码 >= 0 = 标量顺串游标；< 0 = 去重流 (-i-1)
-            PriorityQueue<Integer> pq = new PriorityQueue<>(Math.max(1, scalarRuns.size() + runs.size()),
-                    (a, b) -> compareSpillKeys(cursorKey(a, scalarRuns, runs), cursorKey(b, scalarRuns, runs)));
+            // 统一优先队列：>= 0 = 标量顺串游标；< 0 = 去重流 (-i-1)；再往下 = collect 值流
+            PriorityQueue<Integer> pq = new PriorityQueue<>(
+                    Math.max(1, scalarRuns.size() + runs.size() + cruns.size()),
+                    (a, b) -> compareSpillKeys(cursorKey(a, scalarRuns, runs, cruns),
+                            cursorKey(b, scalarRuns, runs, cruns)));
             for (int i = 0; i < scalarRuns.size(); i++) {
                 if (scalarRuns.get(i).valid()) pq.add(i);
             }
             for (int ri = 0; ri < runs.size(); ri++) {
                 if (runs.get(ri).valid()) pq.add(-ri - 1);
+            }
+            for (int ci = 0; ci < cruns.size(); ci++) {
+                if (cruns.get(ci).valid()) pq.add(collectCursor(runs.size(), ci));
             }
 
             outVectors = allocOutputVectors(outFields);
@@ -848,7 +916,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
 
             while (!pq.isEmpty()) {
                 checkCancelled();
-                Object minKey = cursorKey(pq.peek(), scalarRuns, runs);
+                Object minKey = cursorKey(pq.peek(), scalarRuns, runs, cruns);
 
                 Object[] mergedStates = new Object[aggregations.size()];
                 for (int si = 0; si < aggregations.size(); si++) {
@@ -857,9 +925,9 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                             : aggregations.get(si).aggregate().createState();
                 }
 
-                // 弹出所有「当前键 = 最小键」的游标：标量同键跨文件、去重流每 ordinal 至多一个
+                // 弹出所有「当前键 = 最小键」的游标：标量同键跨文件、去重流 / collect 流每 ordinal 至多一个
                 same.clear();
-                while (!pq.isEmpty() && keysEqual(cursorKey(pq.peek(), scalarRuns, runs), minKey)) {
+                while (!pq.isEmpty() && keysEqual(cursorKey(pq.peek(), scalarRuns, runs, cruns), minKey)) {
                     same.add(pq.poll());
                 }
                 for (int ci : same) {
@@ -868,11 +936,15 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                         mergeScalarRow(run.root(), run.row(), mergedStates, stateColCount);
                         run.advance();
                         if (run.valid()) pq.add(ci);
-                    } else {
+                    } else if (-ci - 1 < runs.size()) {
                         int ri = -ci - 1;
                         DistinctRun run = runs.get(ri);
                         long cnt = consumeDistinctGroup(run, minKey);
                         ((DistinctCountState) mergedStates[run.specIndex()]).add(cnt);
+                        if (run.valid()) pq.add(ci);
+                    } else {
+                        CollectRun run = cruns.get(-ci - 1 - runs.size());
+                        consumeCollectGroup(run, minKey, mergedStates);
                         if (run.valid()) pq.add(ci);
                     }
                 }
@@ -923,8 +995,13 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
             }
             for (ScalarRun r : scalarRuns) r.closeQuietly();
             for (DistinctRun run : runs) run.closeQuietly();
+            for (CollectRun run : cruns) run.closeQuietly();
             // 归并产物不登记在 PartitionState（原始文件已在归并时删除），此处自行清理
             for (Path p : distinctStreams) {
+                if (p == null) continue;
+                try { Files.deleteIfExists(p); } catch (IOException ignored) {}
+            }
+            for (Path p : collectStreams) {
                 if (p == null) continue;
                 try { Files.deleteIfExists(p); } catch (IOException ignored) {}
             }
@@ -937,20 +1014,53 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
     }
 
     /** 优先队列元素的当前键：>=0 标量顺串游标；<0 去重流 (-i-1)。 */
-    private static Object cursorKey(int code, List<ScalarRun> scalarRuns, List<DistinctRun> runs) {
-        return code >= 0 ? scalarRuns.get(code).key() : runs.get(-code - 1).key();
+    private static Object cursorKey(int code, List<ScalarRun> scalarRuns,
+                                    List<DistinctRun> runs, List<CollectRun> cruns) {
+        if (code >= 0) return scalarRuns.get(code).key();
+        int k = -code - 1;
+        if (k < runs.size()) return runs.get(k).key();
+        return cruns.get(k - runs.size()).key();
     }
 
-    /** 合并一个标量溢写行（只走非 count_distinct 规格；列布局与 buildScalarSpillRoot 对应）。 */
+    /** collect 值流的优先队列编码：排在全部去重流之后。 */
+    private static int collectCursor(int distinctRunCount, int collectIdx) {
+        return -(distinctRunCount + collectIdx + 1);
+    }
+
+    /** 合并一个标量溢写行（只走非 count_distinct / 非 collect 规格；列布局与 buildScalarSpillRoot 对应）。 */
     @SuppressWarnings("unchecked")
     private void mergeScalarRow(VectorSchemaRoot root, int row, Object[] mergedStates, int[] stateColCount) {
         int col = keyColumns.size();
         for (int si = 0; si < aggregations.size(); si++) {
-            if (distinctSpecFlag[si]) continue;
+            if (distinctSpecFlag[si] || collectSpecFlag[si]) continue;
             Object otherState = readStateFromSpillCols(root, row, aggregations.get(si), col);
             AggregateFunction<Object> fn = (AggregateFunction<Object>) aggregations.get(si).aggregate();
             fn.merge(mergedStates[si], otherState);
             col += stateColCount[si];
+        }
+    }
+
+    /**
+     * 把 collect 值流中「键 = {@code key}」的全部行累加进该规格的状态（{@code mergedStates[specIndex]}）。
+     *
+     * <p>值按流内顺序追加 —— {@code collect_list} 保留全部（含重复），{@code collect_set} 由状态自身的
+     * {@code LinkedHashSet} 去重并保序；NULL 由聚合函数的 {@code accumulate} 跳过。</p>
+     */
+    @SuppressWarnings("unchecked")
+    private void consumeCollectGroup(CollectRun run, Object key, Object[] mergedStates) {
+        AggregationSpec spec = aggregations.get(run.specIndex());
+        AggregateFunction<Object> fn = (AggregateFunction<Object>) spec.aggregate();
+        Object state = mergedStates[run.specIndex()];
+        if (spec.isCollectMap()) {
+            while (run.valid() && keysEqual(run.key(), key)) {
+                fn.accumulate(state, new Object[]{run.value(), run.value2()});
+                run.advance();
+            }
+            return;
+        }
+        while (run.valid() && keysEqual(run.key(), key)) {
+            fn.accumulate(state, new Object[]{run.value()});
+            run.advance();
         }
     }
 
@@ -1037,7 +1147,12 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
         return runs.isEmpty() ? null : runs.get(0);
     }
 
-    /** 单轮可同时打开的路数：按「分配器上限 / 4 ÷ 首个源文件大小」估算，至少 2、至多 MAX。 */
+    /**
+     * 单轮可同时打开的路数：按「分配器上限 / 4 ÷ 首个源文件大小」估算，至少 2、至多 MAX。
+     *
+     * <p>溢写文件恒为无压缩 Arrow IPC（见 {@code SpillCompression}）⇒ 文件大小即落盘后回读的驻留内存上界，
+     * 不再需要按压缩比放大估算。</p>
+     */
     private int laneCount(Path first) {
         long est;
         try {
@@ -1151,13 +1266,128 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
     }
 
     /**
-     * 去重顺串的流式游标：文件内可能含多个 record batch（归并产物），逐批加载，
-     * 任意时刻只驻留<b>一个批</b>。
+     * 把同一条 collect 值流的多个顺串归并成一条按键有序的顺串（多轮收敛，与
+     * {@link #compactDistinctRuns} 同构）。
      *
-     * <p>★{@link ArrowFileReader#loadRecordBatch} 复用同一个 {@code VectorSchemaRoot} 的缓冲，
-     * 换批后旧值失效；但 {@code getObject} 对变长列会复制字节（Text 自带副本），故缓存的
-     * key/value 跨批仍然稳定 —— 与 Window 归并缓存 {@code curKeys} 的假设一致。</p>
+     * <p>与去重流的区别：<b>不按值排序、不做相邻去重</b> —— {@code collect_list} 必须保留重复值，
+     * 且同键内的先后顺序即累加顺序（{@code collect_set} 的「保序」也依赖它）。同键的多个游标按
+     * 「顺串编号」定序，保证归并结果确定。</p>
      */
+    private Path compactCollectRuns(List<Path> input, PartitionState<Slot> pa, int pid, int ordinal)
+            throws IOException {
+        List<Path> runs = new ArrayList<>(input);
+        int round = 0;
+        while (runs.size() > 1) {
+            checkCancelled();
+            List<Path> next = new ArrayList<>();
+            int i = 0;
+            while (i < runs.size()) {
+                checkCancelled();
+                int take = Math.min(runs.size() - i, laneCount(runs.get(i)));
+                if (take <= 1) {
+                    next.add(runs.get(i));
+                    i++;
+                    continue;
+                }
+                List<Path> chunk = new ArrayList<>(runs.subList(i, i + take));
+                Path out = spillDirForWrite().resolve(
+                        "p" + pid + "_m" + round + "_c" + ordinal + "_" + i + ".arrow");
+                Path produced = mergeCollectRuns(chunk, out, pa, ordinal);
+                if (produced != null) next.add(produced);
+                for (Path p : chunk) {
+                    try { Files.deleteIfExists(p); } catch (IOException ignored) {}
+                }
+                i += take;
+            }
+            runs = next;
+            round++;
+            bumpMergeProgress();
+        }
+        return runs.isEmpty() ? null : runs.get(0);
+    }
+
+    /** 单轮 collect 值流归并（按键有序、保留组内顺序与重复值），写出一个（多个 record batch 的）文件。 */
+    private Path mergeCollectRuns(List<Path> sources, Path outFile, PartitionState<Slot> pa, int ordinal)
+            throws IOException {
+        List<CollectRun> runs = new ArrayList<>(sources.size());
+        VectorSchemaRoot outRoot = null;
+        try {
+            for (Path p : sources) runs.add(new CollectRun(p, collectSpecs[ordinal]));
+            PriorityQueue<Integer> pq = new PriorityQueue<>(runs.size(), (a, b) -> {
+                int c = compareSpillKeys(runs.get(a).key(), runs.get(b).key());
+                return c != 0 ? c : Integer.compare(a, b);   // 同键按顺串编号定序（稳定）
+            });
+            for (int i = 0; i < runs.size(); i++) if (runs.get(i).valid()) pq.add(i);
+            if (pq.isEmpty()) return null;
+
+            List<Field> outFields = runs.get(pq.peek()).fields();
+            if (outFields == null) return null;
+
+            List<FieldVector> outVectors = new ArrayList<>(outFields.size());
+            for (Field f : outFields) {
+                FieldVector v = f.createVector(allocator);
+                v.setInitialCapacity(AGG_SPILL_PER_BATCH_KEYS);
+                v.allocateNew();
+                outVectors.add(v);
+            }
+            final VectorSchemaRoot out = new VectorSchemaRoot(new ArrayList<>(outFields), outVectors, 0);
+            outRoot = out;
+            int outRows = 0;
+            int outCapacity = minValueCapacity(outVectors);
+            boolean wrote = false;
+            TransferPair[][] tps = new TransferPair[runs.size()][];
+
+            try (FileChannel outCh = FileChannel.open(outFile, StandardOpenOption.CREATE,
+                    StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
+                 ArrowFileWriter writer = SpillCompression.writer(out, outCh)) {
+                while (!pq.isEmpty()) {
+                    checkCancelled();
+                    int ri = pq.poll();
+                    CollectRun run = runs.get(ri);
+                    if (outRows >= outCapacity) {
+                        for (FieldVector fv : outVectors) fv.reAlloc();
+                        outCapacity = minValueCapacity(outVectors);
+                        tps = new TransferPair[runs.size()][];   // reAlloc 换缓冲，旧映射失效
+                    }
+                    if (tps[ri] == null) {
+                        List<FieldVector> srcVectors = run.vectors();
+                        TransferPair[] pair = new TransferPair[outVectors.size()];
+                        for (int c = 0; c < pair.length; c++) {
+                            pair[c] = srcVectors.get(c).makeTransferPair(outVectors.get(c));
+                        }
+                        tps[ri] = pair;
+                    }
+                    for (TransferPair tp : tps[ri]) tp.copyValueSafe(run.row(), outRows);
+                    outRows++;
+                    if (outRows >= AGG_SPILL_PER_BATCH_KEYS) {
+                        out.setRowCount(outRows);
+                        writer.writeBatch();
+                        wrote = true;
+                        bumpMergeProgress();
+                        for (FieldVector fv : outVectors) fv.setValueCount(0);
+                        outRows = 0;
+                    }
+                    run.advance();
+                    if (run.valid()) pq.add(ri);
+                }
+                if (outRows > 0) {
+                    out.setRowCount(outRows);
+                    writer.writeBatch();
+                    wrote = true;
+                }
+            }
+            if (!wrote) {
+                try { Files.deleteIfExists(outFile); } catch (IOException ignored) {}
+                return null;
+            }
+            accountCompactionFile(pa, outFile);
+            return outFile;
+        } finally {
+            if (outRoot != null) { try { outRoot.close(); } catch (Exception ignored) {} }
+            for (CollectRun run : runs) run.closeQuietly();
+        }
+    }
+
     /**
      * 标量溢写顺串（键 + 标量状态）的流式游标：文件内可能含多个 record batch（归并产物），逐批加载，
      * 任意时刻只驻留<b>一个批</b>。
@@ -1283,6 +1513,99 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
         boolean valid() { return valid; }
         Object key() { return key; }
         Object value() { return value; }
+        int row() { return row; }
+        int specIndex() { return specIndex; }
+        List<FieldVector> vectors() { return root.getFieldVectors(); }
+        List<Field> fields() { return root == null ? null : root.getSchema().getFields(); }
+
+        void advance() {
+            row++;
+            if (row < rowCount) {
+                positionAtCurrentRow();
+                return;
+            }
+            if (loadNextBlock()) positionAtCurrentRow();
+            else valid = false;
+        }
+
+        @Override public void close() {
+            try { reader.close(); } catch (Exception ignored) {}
+            try { channel.close(); } catch (Exception ignored) {}
+        }
+
+        void closeQuietly() {
+            try { close(); } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * collect 逐值顺串（{@code [key..., value]}，按键有序）的流式游标：逐批加载，任意时刻只驻留一个批。
+     *
+     * <p>与 {@link DistinctRun} 同构，区别在<b>值不做字节→字符串归一</b>：直接用 {@code getObject}，
+     * 让 {@code byte[]}（二进制列）保持原样，由聚合函数的 {@code accumulate} 走
+     * {@code CollectSupport.normalize}（byte[] → 按内容比较的 ByteBuffer）。</p>
+     *
+     * <p>{@code collect_map} 的流是 {@code [key..., mapKey, mapValue]} 双值列（追加模式已按元素摊平）。</p>
+     */
+    private final class CollectRun implements AutoCloseable {
+        private final Path path;
+        private final FileChannel channel;
+        private final ArrowFileReader reader;
+        private final List<ArrowBlock> blocks;
+        private int blockIdx;
+        private VectorSchemaRoot root;
+        private int row;
+        private int rowCount;
+        private final int specIndex;
+        private final int valueCol;
+        private final boolean mapMode;
+        private Object key;
+        private Object value;
+        private Object value2;
+        private boolean valid;
+
+        CollectRun(Path path, int specIndex) throws IOException {
+            this.path = path;
+            this.specIndex = specIndex;
+            this.channel = FileChannel.open(path, StandardOpenOption.READ);
+            this.reader = SpillCompression.reader(channel, allocator);
+            this.blocks = reader.getRecordBlocks();
+            this.valueCol = keyColumns.size();
+            this.mapMode = HashAggregationOperator.this.aggregations.get(specIndex).isCollectMap();
+            if (loadNextBlock()) positionAtCurrentRow();
+            else valid = false;
+        }
+
+        private boolean loadNextBlock() {
+            while (blockIdx < blocks.size()) {
+                try {
+                    reader.loadRecordBatch(blocks.get(blockIdx++));
+                    root = reader.getVectorSchemaRoot();
+                } catch (IOException e) {
+                    throw new RuntimeException("读取 collect 溢写文件失败: " + path, e);
+                }
+                rowCount = root.getRowCount();
+                row = 0;
+                if (rowCount > 0) return true;
+            }
+            return false;
+        }
+
+        private void positionAtCurrentRow() {
+            key = buildKeyFromSpill(root, row);
+            FieldVector v = root.getVector(valueCol);
+            value = v.isNull(row) ? null : v.getObject(row);
+            if (mapMode) {
+                FieldVector v2 = root.getVector(valueCol + 1);
+                value2 = v2.isNull(row) ? null : v2.getObject(row);
+            }
+            valid = true;
+        }
+
+        boolean valid() { return valid; }
+        Object key() { return key; }
+        Object value() { return value; }
+        Object value2() { return value2; }
         int row() { return row; }
         int specIndex() { return specIndex; }
         List<FieldVector> vectors() { return root.getFieldVectors(); }
@@ -1680,13 +2003,6 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                         (org.apache.arrow.vector.VarCharVector) root.getVector(startCol);
                 yield com.dojao.core.function.aggregate.CountDistinctAggregateFunction
                         .decode(vv.isNull(row) ? null : vv.get(row));
-            }
-            case "collect_list", "collect_set" -> {
-                // List 列一格 = 整组值；NULL（空组 / 全 NULL 组）→ 空状态。
-                Object val = root.getVector(startCol).getObject(row);
-                java.util.Collection<?> vals = val instanceof java.util.Collection<?> c ? c : null;
-                yield com.dojao.core.function.aggregate.CollectSupport
-                        .fromValues(spec.aggregate().functionName(), vals);
             }
             default -> throw new UnsupportedOperationException(
                     "Cannot read spilt state for aggregate: " + spec.aggregate().functionName());

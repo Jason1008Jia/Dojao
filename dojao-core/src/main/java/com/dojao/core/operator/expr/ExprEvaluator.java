@@ -14,6 +14,7 @@ import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -124,7 +125,8 @@ public final class ExprEvaluator {
         int rowCount = root.getRowCount();
         // 第一遍：逐行求值收集结果 + 类型类别标记（决定输出向量类型）
         Object[] results = new Object[rowCount];
-        boolean anyFloat = false, anyDecimal = false, anyInt = false, anyBool = false, anyStr = false;
+        boolean anyFloat = false, anyDecimal = false, anyInt = false, anyBool = false;
+        boolean anyStr = false, anyList = false;
         for (int r = 0; r < rowCount; r++) {
             Object v = eval(node, root, r, indexOf);
             results[r] = v;
@@ -133,11 +135,13 @@ public final class ExprEvaluator {
             else if (v instanceof Double || v instanceof Float) anyFloat = true;
             else if (v instanceof Long || v instanceof Integer || v instanceof Short || v instanceof Byte) anyInt = true;
             else if (v instanceof Boolean) anyBool = true;
+            else if (v instanceof List<?>) anyList = true;   // split 等返回数组的函数
             else anyStr = true;
         }
         FieldVector out;
         int decimalScale = 0;
-        if (anyStr) out = new VarCharVector(outputName, allocator);
+        if (anyList) out = listVector(outputName, allocator);
+        else if (anyStr) out = new VarCharVector(outputName, allocator);
         else if (anyFloat) out = new Float8Vector(outputName, allocator);
         else if (anyDecimal) {
             // ★DECIMAL 结果必须落 Decimal64/128 向量（而不是 Float8）：否则「0.30」在输出端
@@ -170,6 +174,7 @@ public final class ExprEvaluator {
                 case DECIMAL -> decimalVector(outputName, allocator, node);
                 case BIGINT -> new BigIntVector(outputName, allocator);
                 case BIT -> new BitVector(outputName, allocator);
+                case LIST -> listVector(outputName, allocator);
                 // 静态类型确实未知 → 保持旧的 Int64 兜底（`SELECT 1 + NULL` 等）
                 case NONE -> new BigIntVector(outputName, allocator);
             };
@@ -177,9 +182,34 @@ public final class ExprEvaluator {
 
         out.setInitialCapacity(rowCount);
         out.allocateNew();
+        // LIST 结果（split / from_str_to_array）：startNewValue 记录本行 list 起点 →
+        // 子列按累积下标连续写 → endValue
+        ListVector listOut = out instanceof ListVector lv ? lv : null;
+        VarCharVector listChild = null;
+        if (listOut != null) {
+            listChild = (VarCharVector) listOut.getDataVector();
+            // 元素总数第一遍已算出 → 一次性预分配，元素为 NULL 时 setNull 也有缓冲可写
+            int total = 0;
+            for (Object rv : results) {
+                if (rv instanceof List<?> l) total += l.size();
+            }
+            listChild.setInitialCapacity(Math.max(1, total));
+            listChild.allocateNew();
+        }
+        int dataRow = 0;
         for (int r = 0; r < rowCount; r++) {
             Object v = results[r];
-            if (v == null) {
+            if (listOut != null) {
+                List<?> values = v == null ? List.of() : (List<?>) v;
+                listOut.startNewValue(r);
+                for (Object o : values) {
+                    if (o == null) listChild.setNull(dataRow);
+                    else listChild.setSafe(dataRow, string(o).getBytes(StandardCharsets.UTF_8));
+                    dataRow++;
+                }
+                listOut.endValue(r, values.size());
+                if (v == null) listOut.setNull(r);
+            } else if (v == null) {
                 out.setNull(r);
             } else if (out instanceof VarCharVector vc) {
                 vc.setSafe(r, string(v).getBytes(StandardCharsets.UTF_8));
@@ -193,8 +223,16 @@ public final class ExprEvaluator {
                 bt.setSafe(r, truthy(v) ? 1 : 0);
             }
         }
+        if (listOut != null) listChild.setValueCount(dataRow);
         out.setValueCount(rowCount);
         return out;
+    }
+
+    /** LIST(UTF8) 结果向量 —— 子列必须显式带上，否则 Field.createVector 建不出可写的 ListVector。 */
+    private static FieldVector listVector(String name, BufferAllocator allocator) {
+        Field child = new Field("item", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+        Field field = new Field(name, FieldType.nullable(ArrowType.List.INSTANCE), List.of(child));
+        return field.createVector(allocator);
     }
 
     // ==================== 全 NULL 结果的静态类型推断 ====================
@@ -223,8 +261,12 @@ public final class ExprEvaluator {
     private static final Set<String> POLYMORPHIC_FUNCTIONS = Set.of(
             "coalesce", "nvl", "ifnull", "if_null", "nullif", "greatest", "least");
 
+    /** 静态返回数组的内置标量函数（整批全 NULL 时据此落 LIST 向量，而不是 Int64 兜底）。 */
+    private static final Set<String> LIST_RETURNING_FUNCTIONS =
+            Set.of("split", "from_str_to_array");
+
     /** 全 NULL 结果的静态类型类别（决定输出向量类型）。 */
-    private enum NullKind { NONE, STRING, DOUBLE, DECIMAL, BIGINT, BIT }
+    private enum NullKind { NONE, STRING, DOUBLE, DECIMAL, BIGINT, BIT, LIST }
 
     /**
      * 整批全 NULL 时按<b>静态信息</b>推断输出类型类别。
@@ -253,6 +295,7 @@ public final class ExprEvaluator {
                 if (t instanceof ArrowType.FloatingPoint) return NullKind.DOUBLE;
                 if (t instanceof ArrowType.Decimal) return NullKind.DECIMAL;
                 if (t instanceof ArrowType.Bool) return NullKind.BIT;
+                if (t instanceof ArrowType.List) return NullKind.LIST;   // 数组列全 NULL 仍落 LIST
                 return NullKind.STRING;
             }
         }
@@ -263,6 +306,10 @@ public final class ExprEvaluator {
             }
             if (cs.elseExpr() != null) return staticNullKind(cs.elseExpr(), root, indexOf);
             return NullKind.NONE;
+        }
+        if (n instanceof ExprNode.FuncCall f
+                && LIST_RETURNING_FUNCTIONS.contains(f.name().toLowerCase(Locale.ROOT))) {
+            return NullKind.LIST;
         }
         return stringTyped(n, root, indexOf) ? NullKind.STRING : NullKind.NONE;
     }
@@ -289,7 +336,8 @@ public final class ExprEvaluator {
             // 的值都会落入 anyStr，运行时按 Utf8 输出。
             ArrowType t = root.getVector(idx).getField().getType();
             return !(t instanceof ArrowType.Int) && !(t instanceof ArrowType.FloatingPoint)
-                    && !(t instanceof ArrowType.Bool) && !(t instanceof ArrowType.Decimal);
+                    && !(t instanceof ArrowType.Bool) && !(t instanceof ArrowType.Decimal)
+                    && !(t instanceof ArrowType.List);   // 数组列不能按字符串输出（长度用 size）
         }
         if (n instanceof ExprNode.Cast cs) {
             return switch (cs.type()) {

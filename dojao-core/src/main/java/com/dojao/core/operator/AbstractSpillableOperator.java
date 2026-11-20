@@ -62,7 +62,7 @@ import java.util.function.LongConsumer;
 public abstract class AbstractSpillableOperator<S extends Slot>
         extends AbstractMeasurableOperator implements OperatorMemoryHandle, MergeProgress {
 
-    private static final Logger log = LoggerFactory.getLogger(AbstractSpillableOperator.class);
+    protected static final Logger log = LoggerFactory.getLogger(AbstractSpillableOperator.class);
 
     // ==================== 常量 ====================
 
@@ -631,7 +631,7 @@ public abstract class AbstractSpillableOperator<S extends Slot>
 
         for (int pid = 0; pid < partitions.length; pid++) {
             if (partitions[pid] != null) {
-                partitions[pid].awaitPendingSpills();
+                partitions[pid].awaitPendingSpills(pid);
                 // 溢写在别的线程跑，异常没人读 Future ⇒ 必须在这里（产出任何页之前）检查并上抛，
                 // 否则失败=静默丢数据（查询"成功"但少行）。Phase 2 是唯一产出源头，此处最稳妥。
                 partitions[pid].checkSpillFailure();
@@ -640,8 +640,12 @@ public abstract class AbstractSpillableOperator<S extends Slot>
         }
         // ★与监控同一口径：直接读统计数据（Σ dataFileSize 曾是另一套口径，归并重写后会对不上）。
         long spilledBytes = getStats().getSpilledBytes();
-        System.err.printf("[%s] Spilled: %s%n", getClass().getSimpleName(),
-                spilledBytes > 0 ? formatBytes(spilledBytes) : "0 (all in-memory)");
+        System.err.printf("[%s] Spilled: %s（分区 %d，触发 %d 次，单槽阈值 %s = memoryLimit %s × ratio %.2f ÷ owned %d）%n",
+                getClass().getSimpleName(),
+                spilledBytes > 0 ? formatBytes(spilledBytes) : "0 (all in-memory)",
+                partitions.length, getStats().getSpillTriggers(),
+                formatBytes(slotBytesThreshold), formatBytes(memoryLimit),
+                ResourceConfig.spillRatio(), budgetPartitions);
 
         int activeCount = 0;
         for (PartitionState<S> pa : partitions) {
@@ -719,6 +723,14 @@ public abstract class AbstractSpillableOperator<S extends Slot>
         // ★ 先立旗：阻塞在有界队列 emitPage 上的归并任务、以及 doNext() 的 poll 等待都要靠它退出
         //   —— 关闭后无人再排空队列，不立旗生产者会一直等下去（与 SortMergeJoinOperator 同构）。
         closed = true;
+        // ★先让「等溢写收尾」的消费线程立刻退出：它们可能正卡在 awaitPendingSpills 的 sleep 循环里，
+        //   且本线程不会去中断别人 —— 不立分区取消旗，它们会一直等到溢写自己跑完（取消后仍在烧 CPU）。
+        PartitionState<S>[] allPartitions = partitions;
+        if (allPartitions != null) {
+            for (PartitionState<S> p : allPartitions) {
+                if (p != null) p.markCancelled();
+            }
+        }
         // 排障：Phase 2 有多少时间是「被下游背压挡住」而非自己算/读（见 emitBlockNanos 注释）。
         long blockedMs = emitBlockNanos.get() / 1_000_000;
         if (blockedMs > 0) {
@@ -753,8 +765,19 @@ public abstract class AbstractSpillableOperator<S extends Slot>
             }
         }
         if (spillExecutor != null) {
+            // shutdownNow 会 interrupt 运行中的虚拟线程；溢写各阶段都有中断检查点 ⇒ 几十毫秒内退出。
+            // 若 10s 仍未退出，说明卡在不可中断的 I/O / 压缩里 —— 明确告警（此前静默 5s 就继续
+            // 关分配器，残留溢写线程继续吃 CPU，且随后的分配会撞已关闭的分配器）。
             spillExecutor.shutdownNow();
-            try { spillExecutor.awaitTermination(5, TimeUnit.SECONDS); } catch (Exception ignored) {}
+            try {
+                if (!spillExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
+                    log.warn("[溢写] {} 仍有溢写任务 10s 未退出（卡在不可中断的写盘/压缩），"
+                                    + "已继续关闭；该任务会在当前文件写完后自行退出",
+                            getStats().getOperatorId());
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
         }
         Page p;
         while ((p = outputQueue.poll()) != null) {
@@ -812,6 +835,14 @@ public abstract class AbstractSpillableOperator<S extends Slot>
                         + "直接拒绝%n", getClass().getSimpleName(), formatBytes(slotBytesThreshold));
             }
             noteSpillTrigger();
+            // 每次溢写都打印「本槽实际内存 / 本次阈值」：阈值 = memoryLimit × ratio ÷ owned 桶数，
+            // 再受 query.spill.minPartitionBytes 下限与 direct.limit 封顶（见 computeSlotBytesThreshold）。
+            long slotBytes = active.estimateMemoryBytes();
+            log.info("[溢写] {} 分区 {} 第 {} 次：槽位 {} ≥ 阈值 {}（owned={}，memoryLimit={} × ratio {}）",
+                    getStats().getOperatorId(), pid, getStats().getSpillTriggers(),
+                    formatBytes(slotBytes), formatBytes(slotBytesThreshold),
+                    budgetPartitions, formatBytes(memoryLimit),
+                    String.format("%.2f", ResourceConfig.spillRatio()));
             pa.submitSpill(spillExecutor, this, pid);
             pa.awaitIdleSlot();
             pa.checkSpillFailure();
@@ -845,16 +876,39 @@ public abstract class AbstractSpillableOperator<S extends Slot>
         }
     }
 
+    /**
+     * 溢写任务的<b>取消检查点</b>：跑在虚拟线程上，只能靠中断标记发现取消
+     * （{@code doClose()} 的 {@code shutdownNow()} 会 interrupt 运行中的任务）。
+     *
+     * <p>排序 / 复制 / 遍历键值都是纯 CPU 大循环，没有阻塞点就永远读不到中断标记 ——
+     * 表现正是「任务已 kill，Worker CPU 仍 100% 不回落」。各循环每隔一段调用一次。</p>
+     */
+    static void checkSpillCancelled() {
+        if (Thread.currentThread().isInterrupted()) {
+            throw new CancellationException("溢写任务被取消");
+        }
+    }
+
     protected void spillSlotSync(PartitionState<S> pa, int slotIdx, S slot, int pid) {
         if (slot.isEmpty()) return;
+        if (closed || pa.cancelled) return;   // 已关闭：槽位由 PartitionState.close() 统一释放
         VectorSchemaRoot sorted = null;
+        long t0 = System.currentTimeMillis();
         try {
+            checkSpillCancelled();
             sorted = slot.buildSortedSpillRoot();
+            long t1 = System.currentTimeMillis();
+            checkSpillCancelled();
             BatchWrite written = writeBatchToArrow(pa, sorted, pid);
+            long t2 = System.currentTimeMillis();
             if (maintainSpillIndex()) addToIndex(pa, sorted, written.batchIndex());
             // ★只累加本次文件写入量：直接累加分区累计 dataFileSize 会统计成 Σ(k×file) ≈ O(N²)
             // —— 线上曾出现「磁盘 129MB、监控 10.5GB」。
             accountSpilledBytes(written.bytes());
+            // 阶段耗时：溢写线程卡住时，这行之前的时间就是「排序」、之后是「写盘/压缩」的依据
+            log.info("[溢写] {} 分区 {} 槽位 {} 落盘完成：{} 行，排序 {}ms，写盘 {}ms",
+                    getStats().getOperatorId(), pid, slotIdx, sorted.getRowCount(),
+                    t1 - t0, t2 - t1);
         } catch (IOException e) {
             throw new RuntimeException("Failed to write Arrow batch for partition " + pid, e);
         } finally {
@@ -1190,6 +1244,27 @@ public abstract class AbstractSpillableOperator<S extends Slot>
                 v.setSafe(row, h);
             }
             case DurationVector v -> v.setSafe(row, durationUnits(v, val));
+            // ★COLLECT_MAP 结果：一格 = 一张 map。MapVector 是 ListVector 的子类，必须先判。
+            //   entries 是非空 struct —— 只写 offset 不置位的话，引擎拷贝 / 溢写后整张 map
+            //   会退化成 {null:null}，故逐条 setIndexDefined。
+            case org.apache.arrow.vector.complex.MapVector v -> {
+                int start = v.startNewValue(row);
+                org.apache.arrow.vector.complex.StructVector entries =
+                        (org.apache.arrow.vector.complex.StructVector) v.getDataVector();
+                List<FieldVector> kv = entries.getChildrenFromFields();
+                FieldVector keyVec = kv.get(0);
+                FieldVector valVec = kv.get(1);
+                int n = 0;
+                if (val instanceof java.util.Map<?, ?> m) {
+                    for (java.util.Map.Entry<?, ?> e : m.entrySet()) {
+                        setVectorValue(keyVec, start + n, e.getKey());
+                        setVectorValue(valVec, start + n, e.getValue());
+                        entries.setIndexDefined(start + n);
+                        n++;
+                    }
+                }
+                v.endValue(row, n);
+            }
             // ★COLLECT_LIST / COLLECT_SET 结果：一格 = 一组值。容器按需展开
             //   （startNewValue/endValue），元素递归写回子向量（byte[]/Text/数值等）。
             case org.apache.arrow.vector.complex.ListVector v -> {

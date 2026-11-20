@@ -399,11 +399,17 @@ public class HiveMetastore implements AutoCloseable {
         HiveStorageFormat format = HiveStorageFormat.detect(inputFormat, serdeLib);
 
         // SerDe 分隔参数（LazySimpleSerDe 默认 \001 / \ / \N）
-        char delimiter = parseDelimiter(firstNonNull(
-                serdeParams.get("field.delim"), serdeParams.get("serialization.format")),
-                '\001');
+        char delimiter = textDelimiter(serdeParams, '\001');
         char escape = parseDelimiter(serdeParams.get("escape.delim"), '\\');
         String nullString = firstNonNull(serdeParams.get("serialization.null.format"), "\\N");
+        if (format == HiveStorageFormat.TEXT) {
+            // 文本表切错分隔符会「静默串列」—— 把生效值与 SerDe 原文亮出来（每表一次）
+            System.err.printf("[Hive] TEXT 表 %s.%s：分隔符=%s 转义=%s NULL=%s（SerDe 原文 field.delim=%s"
+                            + " serialization.format=%s）%n",
+                    database, table, codePoint(delimiter), codePoint(escape), printable(nullString),
+                    printable(serdeParams.get("field.delim")),
+                    printable(serdeParams.get("serialization.format")));
+        }
 
         boolean transactional = "true".equalsIgnoreCase(params.getOrDefault("transactional", "false"));
 
@@ -573,14 +579,42 @@ public class HiveMetastore implements AutoCloseable {
     // ==================== 工具 ====================
 
     /**
-     * SerDe 分隔符解析 —— HMS 里同一个分隔符有多种写法：真字符（{@code U+0001}）、
-     * 反斜杠 u 转义（形如反斜杠+u 加 4 位十六进制）、八进制转义（反斜杠+001）、
-     * 十进制码 {@code 1} / {@code 001}，都要认。
+     * 文本表的字段分隔符：优先 {@code field.delim}（<b>字面字符</b>语义），没有才退回
+     * {@code serialization.format}（<b>十进制字符码</b>语义）。
+     *
+     * <p><b>两个键的语义不同，不能合并解析</b>：Hive 给只有 {@code serialization.format} 的文本表
+     * 写的常见值就是 {@code "1"}，含义是 {@code U+0001}；按字面读成字符 {@code '1'} 会让整行在
+     * 「数字 1」上乱切（线上 {@code staging_es_to_skb_info} 的串列事故），而 {@code field.delim="1"}
+     * 又确实可以表示分隔符就是字符 {@code 1} —— 所以按键区分，不做猜测。</p>
+     */
+    static char textDelimiter(Map<String, String> serdeParams, char fallback) {
+        String fieldDelim = serdeParams.get("field.delim");
+        if (fieldDelim != null && !fieldDelim.isEmpty()) {
+            return parseDelimiter(fieldDelim, fallback);
+        }
+        return parseSerializationFormat(serdeParams.get("serialization.format"), fallback);
+    }
+
+    /** {@code serialization.format}：全数字时是十进制字符码（Hive 写 {@code "1"} = {@code U+0001}）。 */
+    static char parseSerializationFormat(String raw, char fallback) {
+        if (raw == null || raw.isEmpty()) return fallback;
+        String s = raw.trim();
+        if (allDigits(s) && s.length() <= 5) {
+            return parseCode(s, fallback);
+        }
+        return parseDelimiter(s, fallback);
+    }
+
+    /**
+     * 字面语义的分隔符解析（{@code field.delim} / {@code escape.delim}）—— HMS 里的写法有：
+     * 真字符（{@code U+0001}）、反斜杠 u 转义（形如反斜杠+u 加 4 位十六进制）、
+     * {@code \t} / {@code \n} / {@code \r} / {@code \\} / {@code \xNN}、
+     * 反斜杠+十进制/八进制的 {@code \001}。单个数字按字面字符处理（见 {@link #textDelimiter}）。
      */
     static char parseDelimiter(String raw, char fallback) {
         if (raw == null || raw.isEmpty()) return fallback;
-        if (raw.length() == 1) return raw.charAt(0);
         String s = raw.trim();
+        if (s.isEmpty()) return fallback;
         if (s.length() >= 6 && s.startsWith("\\u")) {
             try {
                 return (char) Integer.parseInt(s.substring(2, 6), 16);
@@ -588,13 +622,45 @@ public class HiveMetastore implements AutoCloseable {
                 // 落到下面的分支
             }
         }
-        if (s.length() >= 2 && s.charAt(0) == '\\' && allDigits(s.substring(1))) {
-            return parseCode(s.substring(1), fallback);
-        }
-        if (allDigits(s)) {
-            return parseCode(s, fallback);
+        if (s.length() >= 2 && s.charAt(0) == '\\') {
+            switch (s.charAt(1)) {
+                case 't': return '\t';
+                case 'n': return '\n';
+                case 'r': return '\r';
+                case '\\': return '\\';
+                case 'x':
+                    if (s.length() >= 4) {
+                        try {
+                            return (char) Integer.parseInt(s.substring(2, 4), 16);
+                        } catch (NumberFormatException ignored) {
+                            // 落到下面
+                        }
+                    }
+                    break;
+                default:
+                    break;
+            }
+            if (allDigits(s.substring(1))) {
+                return parseCode(s.substring(1), fallback);
+            }
         }
         return raw.charAt(0);
+    }
+
+    /** 字符 → 日志可读形式（控制字符打成 {@code U+0001}）。 */
+    private static String codePoint(char c) {
+        return Character.isISOControl(c) ? String.format("U+%04X", (int) c) : "'" + c + "'";
+    }
+
+    /** 字符串 → 日志可读形式（控制字符逐个转义，空/null 打 {@code <无>}）。 */
+    private static String printable(String s) {
+        if (s == null || s.isEmpty()) return "<无>";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            sb.append(Character.isISOControl(c) ? String.format("\\u%04X", (int) c) : String.valueOf(c));
+        }
+        return sb.toString();
     }
 
     private static char parseCode(String digits, char fallback) {

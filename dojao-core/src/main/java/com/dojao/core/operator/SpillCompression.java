@@ -6,28 +6,26 @@ import org.apache.arrow.compression.CommonsCompressionFactory;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.compression.CompressionCodec;
-import org.apache.arrow.vector.compression.CompressionUtil;
 import org.apache.arrow.vector.ipc.ArrowFileReader;
 import org.apache.arrow.vector.ipc.ArrowFileWriter;
-import org.apache.arrow.vector.ipc.message.IpcOption;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.nio.channels.SeekableByteChannel;
 import java.nio.channels.WritableByteChannel;
-import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * 溢写 Arrow 文件的压缩编解码统一入口（LZ4 frame）。
+ * 溢写 Arrow 文件的压缩编解码统一入口。
  *
- * <p>溢写文件是<b>临时中间数据</b>，字符串列占比高、重复度大，裸 Arrow IPC 写盘量往往是内存数据量的
- * 数倍；而大排序 / 窗口的 Phase 1.5 归并每轮都会把全量重写一遍 —— 磁盘 I/O 与盘占用都被放大。
- * 开启压缩后文件按 Arrow IPC body compression 写（每 record batch 独立压缩），
- * {@link ArrowFileReader} 自动识别压缩元数据解压，读写路径与未压缩文件完全一致。</p>
+ * <p><b>写路径恒不压缩</b>：Arrow IPC 的 LZ4 body compression 走 commons-compress 的
+ * {@code FramedLZ4CompressorOutputStream}，在真实溢写批次上吞吐只有 ~0.2MB/s（实测 25 万行
+ * VarChar 键 4.5s、40 万行 106s、105 万行 75~143s），而无压缩写同样的批只要 15~35ms。
+ * 溢写是 Phase 1 的关键路径，压缩比（~3.7x）远不值这个代价 —— 表现为「溢写一触发查询就卡死」。
+ * {@code system.query.spill.compression=true} 只能换来一条告警，不再改变写路径。</p>
  *
- * <p><b>开关</b>：{@code system.query.spill.compression}（兼容 {@code query.spill.compression}），
- * 只认 {@code true} / {@code false}，默认 {@code true}。压缩算法固定 LZ4 frame。
- * 关闭时 writer 退回旧的无压缩写法；<b>reader 恒带压缩工厂</b> —— 未压缩文件不会触碰工厂
- * （Arrow 仅在记录批带 body compression 元数据时才创建 codec），因此同一进程可安全读取
- * 本次开关生效前遗留的旧文件。</p>
+ * <p><b>读路径恒带压缩工厂</b>：{@link ArrowFileReader} 按每个 record batch 的元数据自动选择是否解压，
+ * 未压缩文件不会触碰工厂；因此历史压缩文件仍可读，混写（老文件解压 / 新文件直读）也安全。</p>
  *
  * @author jiaxin
  * @version 1.0
@@ -35,19 +33,23 @@ import java.util.Map;
  */
 final class SpillCompression {
 
-    /** LZ4 / ZSTD codec 提供者（arrow-compression）；本工程只用 LZ4 frame。 */
+    private static final Logger log = LoggerFactory.getLogger(SpillCompression.class);
+
+    /** LZ4 / ZSTD codec 提供者（arrow-compression）。 */
     private static final CompressionCodec.Factory FACTORY = CommonsCompressionFactory.INSTANCE;
+
+    private static final AtomicBoolean WARNED = new AtomicBoolean(false);
 
     private SpillCompression() {
     }
 
-    /** 新建溢写文件 writer：开启压缩时按 LZ4 frame 写，否则保持旧的无压缩格式。 */
+    /** 新建溢写文件 writer：恒写成无压缩 Arrow IPC（压缩写实测吞吐 ~0.2MB/s，见类注释）。 */
     static ArrowFileWriter writer(VectorSchemaRoot root, WritableByteChannel out) {
-        if (!ResourceConfig.spillCompressionEnabled()) {
-            return new ArrowFileWriter(root, null, out);
+        if (ResourceConfig.spillCompressionEnabled() && WARNED.compareAndSet(false, true)) {
+            log.warn("[溢写] 配置要求开启溢写压缩，但压缩写实测吞吐仅 ~0.2MB/s（百万行批次可达分钟级），"
+                    + "已忽略该配置、保持无压缩写入；请把 query.spill.compression 置为 false 消除此告警");
         }
-        return new ArrowFileWriter(root, null, out, Map.of(), IpcOption.DEFAULT,
-                FACTORY, CompressionUtil.CodecType.LZ4_FRAME);
+        return new ArrowFileWriter(root, null, out);
     }
 
     /** 新建溢写文件 reader：恒带压缩工厂，未压缩文件不受影响。 */

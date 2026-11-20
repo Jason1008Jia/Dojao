@@ -4,6 +4,7 @@ import com.dojao.core.operator.CaseProjection;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 
 import java.math.BigDecimal;
 import java.util.Map;
@@ -106,8 +107,25 @@ public final class ExprTypeInference {
                  "soundex", "initcap", "printf", "translate", "elt", "hex",
                  "md5", "sha1", "sha2", "uuid", "date_format", "from_unixtime" ->
                     ArrowType.Utf8.INSTANCE;
+            // 数组返回函数：子列恒为 Utf8（元素 Field 由 toField 补齐）
+            case "split", "from_str_to_array" -> ArrowType.List.INSTANCE;
+            // 数组长度 → BIGINT（字符串长度 length 同口径，见 ExprBuiltins.length）
+            case "size" -> INT64;
             default -> null;
         };
+    }
+
+    /**
+     * 静态类型 → 完整 {@link Field}（LIST 必须带上子列 —— 光有 ArrowType.List 的 Field
+     * {@code createVector} 建不出可写的 ListVector）。目前推出 LIST 的内置函数是
+     * split / from_str_to_array。
+     */
+    public static Field toField(String name, ArrowType type, boolean nullable) {
+        if (type instanceof ArrowType.List) {
+            Field child = new Field("item", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+            return new Field(name, new FieldType(nullable, type, null), java.util.List.of(child));
+        }
+        return new Field(name, new FieldType(nullable, type, null), null);
     }
 
     /** 逐参数合并（NULL 字面量跳过）；任一非空参数推断不出 → null。 */

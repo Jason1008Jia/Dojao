@@ -155,51 +155,41 @@ public class FilterOperator extends AbstractMeasurableOperator {
                 return;
             }
             // 列 vs 列 / 字面量 判定：两侧均非字面量 → 列间比较（如 rating > __subq_val）；
-            // 右侧字面量 → 列比较；左侧字面量右侧列 → 翻转；两侧均字面量 → 无列可读 ⇒ UNKNOWN
+            // 右侧字面量 → 列比较；左侧字面量右侧列 → 翻转。
+            // ★形态不成立（两侧都是表达式如 size(a) <> size(b)、两侧都是字面量、或列名/字面量
+            //   形态不完整）→ <b>不直接落 UNKNOWN</b>，继续走 3.5 通用表达式求值器：
+            //   UNKNOWN 会「逐行放行」= 谓词被静默丢弃；且派生表外层 WHERE 的规划期门槛
+            //   （Planner.applyFilterIfSimple → referencedColumnsOf 非空）也会因此拒绝整条查询。
+            //   「绝不臆造列名」的约束不受影响 —— EXPR 形态的列清单取自 ExprParser 解析结果。
             String leftRaw = c.left().trim();
             String rightRaw = c.right().trim();
             boolean leftLit = isLiteralToken(leftRaw);
             boolean rightLit = isLiteralToken(rightRaw);
-            String rawLiteral;
             if (!leftLit && rightLit) {
-                form = Form.COLUMN_COMPARE;
-                column = leftRaw;
-                op = c.op();
-                rawLiteral = rightRaw;
-            } else if (!leftLit) {
-                form = Form.COLUMN_COLUMN_COMPARE;
-                column = leftRaw;
-                op = c.op();
-                rightColumn = SqlTextUtil.stripQualifier(rightRaw);
-                rawLiteral = null;
-            } else if (!rightLit) {
-                form = Form.COLUMN_COMPARE;
-                column = rightRaw;
-                op = reverseOp(c.op());
-                rawLiteral = leftRaw;
-            } else {
-                // 两侧都是字面量 → 压根没有列可读。旧行为是拿左侧字面量当「列名」去取向量
-                // （取不到 → 恒假 → 静默 0 行），且会把 "1" 这类伪列登记进扫描列集。改判 UNKNOWN。
-                form = Form.UNKNOWN;
-                return;
-            }
-            // ★校验列名与字面量的<b>形态完整性</b>：列必须是真列名（ident / alias.ident），
-            //   字面量必须整串就是字面量。不满足 ⇒ 这压根不是「单个简单谓词」——典型是没拆开的
-            //   合取（`dt ='2026-08-25' and spu_id is not null`，右段被 isLiteralToken 因首位引号
-            //   误判为字面量）⇒ 落 UNKNOWN 保守放行，<b>绝不臆造列名</b>：伪列一旦被登记进扫描列集，
-            //   轻则连接器报「表中不存在列」，重则过滤恒假 ⇒ 静默丢光所有行。
-            if (form == Form.COLUMN_COLUMN_COMPARE) {
-                if (!looksLikeColumnName(column) || !looksLikeColumnName(rightRaw)) {
-                    form = Form.UNKNOWN;
-                }
-            } else {
-                if (!looksLikeColumnName(column) || !isCompleteLiteralToken(rawLiteral)) {
-                    form = Form.UNKNOWN;
+                if (looksLikeColumnName(leftRaw) && isCompleteLiteralToken(rightRaw)) {
+                    form = Form.COLUMN_COMPARE;
+                    column = leftRaw;
+                    op = c.op();
+                    literal = unquote(rightRaw);
                     return;
                 }
-                literal = unquote(rawLiteral);
+            } else if (!leftLit) {
+                if (looksLikeColumnName(leftRaw) && looksLikeColumnName(rightRaw)) {
+                    form = Form.COLUMN_COLUMN_COMPARE;
+                    column = leftRaw;
+                    op = c.op();
+                    rightColumn = SqlTextUtil.stripQualifier(rightRaw);
+                    return;
+                }
+            } else if (!rightLit) {
+                if (looksLikeColumnName(rightRaw) && isCompleteLiteralToken(leftRaw)) {
+                    form = Form.COLUMN_COMPARE;
+                    column = rightRaw;
+                    op = reverseOp(c.op());
+                    literal = unquote(leftRaw);
+                    return;
+                }
             }
-            return;
         }
 
         // 3.5 复合布尔表达式（`NOT (...)` / `(a AND b)` / `(f(x) > 0) AND ...`）—— 上面的

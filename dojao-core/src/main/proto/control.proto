@@ -258,6 +258,10 @@ message AggregationDtoMsg {
   // collect-evaluate 型：SQL 实际收集列（按位交付给外挂函数）；非 collect 型为空。
   // 声明名（CollectAggregateFunction.inputColumns()）仅作参数位标签，不要求与 SQL 列同名。
   repeated string collect_input_columns = 4;
+  // collect_map / map_agg：value 输入列（input_column 为 key 列）；其余聚合为空。
+  string value_column = 5;
+  // collect_map 第三参数：同 key 值是否追加为列表（默认 false = 覆盖）。
+  bool map_append = 6;
 }
 
 message CaseBranchMsg {

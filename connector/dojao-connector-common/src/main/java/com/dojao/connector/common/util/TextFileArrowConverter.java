@@ -45,7 +45,6 @@ public class TextFileArrowConverter implements AutoCloseable {
     public static final char DEFAULT_DELIMITER = '\001';
     /** Hive 默认转义符。 */
     public static final char DEFAULT_ESCAPE = '\\';
-
     private final BufferAllocator allocator;
     private final int batchSize;
     private final Schema arrowSchema;
@@ -54,6 +53,7 @@ public class TextFileArrowConverter implements AutoCloseable {
     private final String nullString;
     private final LineReader reader;
     private boolean exhausted;
+    private boolean shapeChecked;
 
     public TextFileArrowConverter(BufferAllocator allocator, Path path, FileSystem fs,
                                   Schema arrowSchema, int batchSize) throws IOException {
@@ -276,6 +276,10 @@ public class TextFileArrowConverter implements AutoCloseable {
 
     private void fillRow(List<FieldVector> vectors, String line, int row) {
         String[] fields = split(line, delimiter, escape, nullString);
+        if (!shapeChecked) {
+            shapeChecked = true;
+            warnShapeIfMismatched(vectors.size(), fields.length);
+        }
         for (int col = 0; col < vectors.size(); col++) {
             FieldVector vec = vectors.get(col);
             if (col >= fields.length || fields[col] == null || nullString.equals(fields[col])) {
@@ -387,6 +391,34 @@ public class TextFileArrowConverter implements AutoCloseable {
 
     private static String segment(StringBuilder decoded, StringBuilder raw, String nullString) {
         return raw.toString().equals(nullString) ? null : decoded.toString();
+    }
+
+    /** 已报警过的「列数 / 切分段数」组合（同表同形态只报一次，别刷屏）。 */
+    private static final java.util.Set<String> SHAPE_WARNED =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * 首行切出来的段数与表列数不一致 → 大声告警。
+     *
+     * <p>分隔符取错（比如 SerDe 里 {@code serialization.format=1} 被当成字符 {@code '1'}）时，
+     * 数据不会报错，只会<b>静默串列</b>；这里把「按分隔符切成几段 vs 表有几列」直接摆出来，
+     * 一眼能看出分隔符不对。</p>
+     */
+    private void warnShapeIfMismatched(int columns, int actual) {
+        if (columns <= 0 || actual == columns || SHAPE_WARNED.size() > 200) {
+            return;
+        }
+        String key = columns + "/" + actual + "/" + (int) delimiter;
+        if (!SHAPE_WARNED.add(key)) {
+            return;
+        }
+        System.err.printf("[文本表] 首行按分隔符切成 %d 段，与表列数 %d 不一致（分隔符=%s，转义=%s）"
+                        + " → 元数据里的分隔符可能不对，请核对 SerDe 参数 field.delim /"
+                        + " serialization.format；按错误分隔符切分会静默串列%n",
+                actual, columns,
+                Character.isISOControl(delimiter) ? String.format("U+%04X", (int) delimiter)
+                        : "'" + delimiter + "'",
+                Character.isISOControl(escape) ? String.format("U+%04X", (int) escape) : "'" + escape + "'");
     }
 
     // ==================== Vector 创建 ====================

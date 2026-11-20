@@ -598,8 +598,8 @@ final class HiveWriteSession implements AutoCloseable {
         if (format == HiveStorageFormat.TEXT) {
             char delim = meta.textDelimiter();
             params.put("field.delim", String.valueOf(delim));
-            params.put("serialization.format", String.valueOf(delim));
-            params.put("line.delim", "\n");
+            params.put("serialization.format", String.valueOf((int) delim));   // 十进制字符码（Hive 语义）
+            params.put("line.delim", String.valueOf(10));   // 十进制字符码（换行）
             params.put("escape.delim", String.valueOf(meta.textEscape()));
             if (meta.textNullString() != null) {
                 params.put("serialization.null.format", meta.textNullString());

@@ -1196,6 +1196,10 @@ public final class FragmentExecutor {
         if (collectFn != null) {
             return AggregationSpec.collect(dto.outputColumn(), collectFn, dto.collectInputColumns());
         }
+        if ("collect_map".equalsIgnoreCase(dto.aggregateName())) {
+            return AggregationSpec.collectMap(dto.inputColumn(), dto.valueColumn(),
+                    dto.outputColumn(), dto.mapAppend());
+        }
         return new AggregationSpec(dto.inputColumn(), dto.outputColumn(), aggregateFor(dto.aggregateName()));
     }
 

@@ -143,6 +143,16 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
      */
     private static final String WRITE_FORMAT_KEY = "hive.default.format";
 
+    /**
+     * CTAS 新建表的表类型（catalog 规范名 {@code catalog.hive.default.cts.table}，
+     * 归一化后键名 {@code hive.default.cts.table}）：{@code external}（默认，hive3）或 {@code managed}。
+     *
+     * <p><b>为什么默认 external</b>：Hive3 的 HMS 默认 {@code hive.create.as.acid=true}，管理表建出来
+     * 会被 {@code TransactionalValidationListener} 自动翻成 ACID 事务表（且不补分桶 → 写入必失败）；
+     * 外部表天然不受该监听器影响，DROP TABLE 也不会删数据。hive2 catalog 保持原行为（默认 managed）。</p>
+     */
+    private static final String CTS_TABLE_KEY = "hive.default.cts.table";
+
     /** 大文件切割的默认触发阈值：1GB。小于它的文件「一个文件一片」足够，切了反而多开销。 */
     private static final long DEFAULT_SPLIT_FILE_MIN_BYTES = 1024L * 1024 * 1024;
 
@@ -212,6 +222,13 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
      * 不看这个值，按目标表自身的格式落文件。
      */
     private final HiveStorageFormat writeFormat;
+
+    /**
+     * CTAS 新建表是否建成 <b>外部表</b>（catalog 属性 {@code catalog.hive.default.cts.table}）：
+     * 默认 hive3 = {@code true}、hive2 = {@code false}（管理表，保持原行为）。
+     * 外部表 DROP 时不动数据目录，也不被 HMS 的 {@code hive.create.as.acid} 自动翻成事务表。
+     */
+    private final boolean ctsExternal;
 
     /**
      * 桶裁剪开关（catalog 属性 {@code catalog.hive.bucket.pruning}，默认 <b>true</b>）：
@@ -295,6 +312,7 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         long splitMin = parseSizeBytes(props.get(SPLIT_FILE_MIN_KEY));
         this.splitFileMinBytes = splitMin > 0L ? splitMin : DEFAULT_SPLIT_FILE_MIN_BYTES;
         this.writeFormat = resolveWriteFormat(props);
+        this.ctsExternal = resolveCtsExternal(props);
         this.bucketPruning = Boolean.parseBoolean(props.getOrDefault(BUCKET_PRUNING_KEY, "true"));
         this.acidRead = Boolean.parseBoolean(props.getOrDefault(ACID_READ_KEY, "false"));
         this.acidWrite = Boolean.parseBoolean(props.getOrDefault(ACID_WRITE_KEY, "true"));
@@ -1056,6 +1074,27 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         return HiveStorageFormat.fromCatalogValue(raw);
     }
 
+    /**
+     * CTAS 表类型：catalog 属性 {@code catalog.hive.default.cts.table}（也接受旧写法
+     * {@code catalog.hive3.default.cts.table} / {@code catalog.hive.cts.table}）。
+     *
+     * <p>取值 {@code external} / {@code managed}（{@code manager} 同义）；缺省 hive3 = external、
+     * hive2 = managed。无法识别的取值构造期直接报错 —— 宁可 catalog 建不出来，也不要建出意料之外的表。</p>
+     */
+    private boolean resolveCtsExternal(Map<String, String> props) {
+        String raw = firstNonBlank(props.get(CTS_TABLE_KEY), props.get("hive.cts.table"),
+                props.get("default.cts.table"), props.get("cts.table"));
+        boolean hive3Default = version == HiveVersion.HIVE3;
+        if (raw == null) return hive3Default;
+        return switch (raw.trim().toLowerCase(Locale.ROOT)) {
+            case "external", "extern" -> true;
+            case "managed", "manager", "internal" -> false;
+            default -> throw new IllegalArgumentException("无法识别的 "
+                    + CatalogProperties.key(version.type(), "default.cts.table") + " 取值: " + raw
+                    + "（可选 external / managed，默认 " + (hive3Default ? "external" : "managed") + "）");
+        };
+    }
+
     /** 解析 {@code 64M} / {@code 1G} / {@code 8388608}；空或非法返回 {@code -1}（语义同 ResourceConfig）。 */
     private static long parseSizeBytes(String raw) {
         if (raw == null || raw.isBlank()) return -1L;
@@ -1228,8 +1267,11 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
                             + meta.format() + "）: " + meta.database() + "." + meta.table());
                 }
                 if (!meta.bucketed()) {
-                    throw new UnsupportedOperationException("ACID 事务表写入要求分桶表"
-                            + "（CLUSTERED BY ... INTO N BUCKETS）: "
+                    throw new UnsupportedOperationException("目标表是 Hive 事务表但未分桶"
+                            + "（transactional=true、CLUSTERED BY 为空），无法按 ACID 格式写入。"
+                            + "该形态通常是 HMS 开启 hive.create.as.acid 后把建表请求自动翻成事务表"
+                            + "却没补分桶 —— 请 DROP TABLE 后用 Dojao 重建（新版本建表显式写"
+                            + " transactional=false，不会再被自动转换）: "
                             + meta.database() + "." + meta.table());
                 }
             }
@@ -1299,7 +1341,12 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
 
     /**
      * CTAS 建表：HMS 登记表（格式由 {@code catalog.hive.default.format} 决定：ORC / Parquet / 文本）
-     * + 建 HDFS 目录（Hive MANAGED TABLE 的惯例目录 {@code <db.location>/<table>}）。
+     * + 建 HDFS 目录（惯例目录 {@code <db.location>/<table>}）。
+     *
+     * <p>表类型由 {@code catalog.hive.default.cts.table} 决定：{@code external}（hive3 默认）建
+     * {@code EXTERNAL_TABLE}，{@code managed}（hive2 默认）建 {@code MANAGED_TABLE}。两者都会显式写
+     * {@code transactional=false}，避免 HMS 的 {@code hive.create.as.acid} 把管理表自动翻成
+     * 「事务表 + 无分桶」的死形态。</p>
      *
      * <p>表已存在：{@code ifNotExists} → 返回 false（调用方跳过写入，不误插旧表）；否则让 HMS
      * 抛标准「already exists」错误（与 MySQL/PG 连接器同一语义）。</p>
@@ -1330,10 +1377,18 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         t.setCreateTime((int) (System.currentTimeMillis() / 1000));
         t.setLastAccessTime(0);
         t.setRetention(0);
-        t.setTableType("MANAGED_TABLE");
+        t.setTableType(ctsExternal ? "EXTERNAL_TABLE" : "MANAGED_TABLE");
         t.setSd(tableSd(location, fields));
         t.setPartitionKeys(new ArrayList<>());
-        t.setParameters(new LinkedHashMap<>(Map.of("EXTERNAL", "FALSE")));
+        // transactional=false 不是冗余：HMS 若开启 metastore.create.tables.as.acid（hive.create.as.acid），
+        // 其 TransactionalValidationListener 会把「参数里没有 transactional」的 MANAGED ORC 表自动翻成
+        // 事务表 —— 但它只改参数、不补分桶，表随即变成「事务表 + 无分桶」，任何写入都会失败
+        // （线上 CTAS staging_scrm_customer_customer 即此形态）。监听器见到 false 会直接跳过自动转换
+        // （一并把该键从表参数里移除），与 Trino 建 Hive 表的做法一致。
+        Map<String, String> tableParams = new LinkedHashMap<>();
+        tableParams.put("EXTERNAL", ctsExternal ? "TRUE" : "FALSE");
+        tableParams.put("transactional", "false");
+        t.setParameters(tableParams);
         metastore.createTable(t);
 
         try {
@@ -1343,15 +1398,21 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
             try { metastore.dropTable(schema, table); } catch (Throwable ignored) { }
             throw new RuntimeException("创建 Hive 表目录失败: " + location, e);
         }
-        System.err.printf("[Hive] CTAS 建表 %s.%s（%s，location=%s）%n", schema, table, writeFormat, location);
+        System.err.printf("[Hive] CTAS 建表 %s.%s（%s，%s，location=%s）%n", schema, table, writeFormat,
+                ctsExternal ? "EXTERNAL_TABLE" : "MANAGED_TABLE", location);
         return true;
     }
 
     @Override
     public void dropTable(String catalog, String schema, String table) {
-        String location = metastore.table(schema, table).map(HiveTableMeta::location).orElse(null);
+        Optional<HiveTableMeta> meta = metastore.table(schema, table);
+        String location = meta.map(HiveTableMeta::location).orElse(null);
         metastore.dropTable(schema, table);
-        if (location != null && !location.isBlank()) {
+        // EXTERNAL TABLE 的语义是「DROP 只删元数据、不动数据」：HMS 自身对外部表不删数据，
+        // 这里也不能补删，否则外部表的数据会被一条 DROP TABLE 静默清空。
+        boolean external = meta.map(m -> "true".equalsIgnoreCase(
+                m.parameters().getOrDefault("EXTERNAL", "false"))).orElse(false);
+        if (location != null && !location.isBlank() && !external) {
             try {
                 fsOf(location).delete(new Path(location), true);
             } catch (IOException e) {
@@ -1362,10 +1423,16 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
 
     @Override
     public void truncateTable(String catalog, String schema, String table) {
-        String location = metastore.table(schema, table).map(HiveTableMeta::location).orElse(null);
+        Optional<HiveTableMeta> meta = metastore.table(schema, table);
+        String location = meta.map(HiveTableMeta::location).orElse(null);
         if (location == null || location.isBlank()) {
             throw new IllegalStateException(
                     "Hive 表不存在或缺少 location，无法 TRUNCATE: " + schema + "." + table);
+        }
+        // 与 Hive 一致：TRUNCATE 只允许作用于管理表；外部表的数据属于「表目录之外」，不许清空。
+        if ("true".equalsIgnoreCase(meta.get().parameters().getOrDefault("EXTERNAL", "false"))) {
+            throw new UnsupportedOperationException("Hive 外部表不支持 TRUNCATE（数据目录不属于表管理）: "
+                    + schema + "." + table + "；如需清空请 DROP TABLE 后重建，或直接删数据文件");
         }
         try {
             FileSystem fs = fsOf(location);
@@ -1599,8 +1666,8 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         if (format == HiveStorageFormat.TEXT) {
             char delim = meta.textDelimiter();
             params.put("field.delim", String.valueOf(delim));
-            params.put("serialization.format", String.valueOf(delim));
-            params.put("line.delim", "\n");
+            params.put("serialization.format", String.valueOf((int) delim));   // 十进制字符码（Hive 语义）
+            params.put("line.delim", String.valueOf(10));   // 十进制字符码（换行）
             params.put("escape.delim", String.valueOf(meta.textEscape()));
             if (meta.textNullString() != null) {
                 params.put("serialization.null.format", meta.textNullString());

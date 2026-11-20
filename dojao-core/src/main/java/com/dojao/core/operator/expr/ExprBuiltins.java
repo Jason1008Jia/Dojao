@@ -1,5 +1,8 @@
 package com.dojao.core.operator.expr;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Instant;
@@ -9,6 +12,8 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 
@@ -35,7 +40,20 @@ public final class ExprBuiltins {
     private static final Set<String> NAMES = Set.of(
             "year", "month", "day", "date",          // 日期提取
             "floor", "ceil", "ceiling", "round", "abs", // 数学
-            "concat", "upper", "ucase", "lower", "lcase", "length"); // 字符串
+            "concat", "upper", "ucase", "lower", "lcase", "length", // 字符串
+            "split",                                 // 分隔符切分 → 数组
+            "from_str_to_array",                     // JSON 数组文本 → 数组
+            "size");                                 // 数组长度（字符串长度用 length）
+
+    /**
+     * split 的分隔符正则编译缓存：分隔符是「每行都传」的参数，逐行 {@code Pattern.compile} 在百万行
+     * 上是纯浪费。与 LIKE 缓存同口径（上限 256 条，超出整体清空）。
+     */
+    private static final java.util.Map<String, java.util.regex.Pattern> SPLIT_PATTERN_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** from_str_to_array 的 JSON 解析器（ObjectMapper 线程安全，与 StringFunctions 同款）。 */
+    private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
 
     private ExprBuiltins() {
     }
@@ -113,7 +131,38 @@ public final class ExprBuiltins {
             }
             case "length": {
                 require(name, args, 1);
-                return args[0] == null ? null : (long) ExprEvaluator.string(args[0]).length();
+                if (args[0] == null) return null;
+                // 口径约定：字符串长度用 length、数组长度用 size（见 function-conventions.md）。
+                // 数组若落进 string() 会变成 "[a, b]" 的字符数 —— 静默错值，必须响亮拒绝。
+                if (args[0] instanceof java.util.Collection<?>) {
+                    throw new IllegalArgumentException("length 只用于字符串；数组长度请用 size(...)");
+                }
+                return (long) ExprEvaluator.string(args[0]).length();
+            }
+            case "size": {
+                // size(array) —— list/array 的长度。字符串请用 length（Spark 同口径）。
+                require(name, args, 1);
+                if (args[0] == null) return null;
+                if (args[0] instanceof java.util.Collection<?> c) return (long) c.size();
+                throw new IllegalArgumentException(
+                        "size 只用于数组（list/array）；字符串长度请用 length(...)，实得: "
+                                + args[0].getClass().getSimpleName());
+            }
+            case "split": {
+                // split(str, regex) —— 分隔符按正则解释（Hive/Spark 口径）；limit=-1 保留末尾空串，
+                // 否则 'a,b,' 会被 Java 默认行为裁成 [a, b] 而与上游数据列数对不上。
+                require(name, args, 2);
+                if (args[0] == null || args[1] == null) return null;
+                String[] parts = splitPattern(ExprEvaluator.string(args[1]))
+                        .split(ExprEvaluator.string(args[0]), -1);
+                return java.util.List.of(parts);
+            }
+            case "from_str_to_array": {
+                // from_str_to_array(str) —— 只接受合法 JSON 数组文本（如 '["a","b"]'）；
+                // 非法 JSON / 非数组 → NULL。元素一律落 Utf8 文本，JSON null → NULL 元素。
+                require(name, args, 1);
+                if (args[0] == null) return null;
+                return jsonTextArray(ExprEvaluator.string(args[0]));
             }
             default:
                 throw new IllegalArgumentException("未内置函数: " + name);
@@ -121,6 +170,41 @@ public final class ExprBuiltins {
     }
 
     // ==================== 工具 ====================
+
+    /** split 分隔符 → 编译好的正则（带缓存；非法正则报可读错误而不是每行抛一次）。 */
+    private static java.util.regex.Pattern splitPattern(String regex) {
+        java.util.regex.Pattern p = SPLIT_PATTERN_CACHE.get(regex);
+        if (p != null) return p;
+        try {
+            p = java.util.regex.Pattern.compile(regex);
+        } catch (java.util.regex.PatternSyntaxException e) {
+            throw new IllegalArgumentException("split 的分隔符不是合法正则: '" + regex + "'", e);
+        }
+        if (SPLIT_PATTERN_CACHE.size() >= 256) SPLIT_PATTERN_CACHE.clear();
+        SPLIT_PATTERN_CACHE.put(regex, p);
+        return p;
+    }
+
+    /**
+     * JSON 数组文本 → 文本列表；非法 JSON 或非数组 → null。元素口径与 get_json_object 一致：
+     * 值节点取 {@code asText()}，对象/数组子节点保留 JSON 文本，JSON null → null 元素。
+     * 用 ArrayList 而非 List.of —— 子元素允许 NULL。
+     */
+    private static List<String> jsonTextArray(String text) {
+        JsonNode node;
+        try {
+            node = JSON_MAPPER.readTree(text);
+        } catch (Exception e) {
+            return null;
+        }
+        if (node == null || !node.isArray()) return null;
+        List<String> out = new ArrayList<>(node.size());
+        for (JsonNode el : node) {
+            out.add(el == null || el.isNull() ? null
+                    : el.isValueNode() ? el.asText() : el.toString());
+        }
+        return out;
+    }
 
     private static void require(String name, Object[] args, int... allowed) {
         for (int n : allowed) {

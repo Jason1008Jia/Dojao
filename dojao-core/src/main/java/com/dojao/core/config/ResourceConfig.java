@@ -161,8 +161,10 @@ public final class ResourceConfig {
     /**
      * 溢写 Arrow 文件压缩开关（{@code system.query.spill.compression}，兼容 {@code query.spill.compression}）。
      *
-     * <p>只认 {@code true} / {@code false}，<b>默认开启</b>；压缩算法固定 <b>LZ4 frame</b>
-     * （Arrow IPC body compression，每 record batch 独立压缩）。见 {@code SpillCompression}。</p>
+     * <p><b>已失效</b>：压缩写路径实测吞吐仅 ~0.2MB/s（LZ4 frame 走 commons-compress 流式实现，
+     * 百万行批次可达 75~143 秒，直接卡死查询），溢写 writer 恒写无压缩 Arrow IPC。
+     * 本开关仅用于检测「仍配置为 true」并打一条告警；reader 始终兼容历史压缩文件。
+     * 见 {@code SpillCompression}。</p>
      */
     public static final String SYSTEM_QUERY_SPILL_COMPRESSION = "system.query.spill.compression";
     /** 上述开关的兼容写法（{@code query.spill.compression}）。 */
@@ -310,8 +312,12 @@ public final class ResourceConfig {
     public static final String DEFAULT_SPILL_DIR_NAME = "spill";
     /** 默认溢写盘使用率上限 0.8：用满 80% 的盘不再承接溢写。 */
     public static final double DEFAULT_SPILL_DISK_MAX_USAGE = 0.8;
-    /** 溢写文件压缩默认开启：溢写是临时中间数据（字符串多、重复度高），LZ4 显著降低写盘量与盘占用。 */
-    public static final boolean DEFAULT_SPILL_COMPRESSION = true;
+    /**
+     * 溢写文件压缩默认关闭。压缩写走 commons-compress 的流式 LZ4 frame，实测吞吐仅 ~0.2MB/s
+     * （25 万行 VarChar 键 4.5s，40 万行 106s，105 万行 75~143s），而无压缩写同样的批只需 15~35ms ——
+     * 写路径已恒不压缩；reader 始终兼容已有压缩文件。
+     */
+    public static final boolean DEFAULT_SPILL_COMPRESSION = false;
     /** 聚合 Phase 2 每批 key 数默认 50000（query.agg.perBatchKeys）。 */
     public static final int DEFAULT_AGG_PER_BATCH_KEYS = 50000;
     /** 聚合溢写归并每批 key 数默认 10000（query.agg.spill.perBatchKeys）。 */
@@ -939,11 +945,11 @@ public final class ResourceConfig {
     }
 
     /**
-     * 溢写 Arrow 文件是否压缩（{@code system.query.spill.compression}，兼容 {@code query.spill.compression}）。
+     * 溢写 Arrow 文件是否配置为压缩（{@code system.query.spill.compression}，兼容 {@code query.spill.compression}）。
      *
-     * <p>只认 {@code true} / {@code false}，默认 {@link #DEFAULT_SPILL_COMPRESSION}（开启）；
-     * 除 {@code false} 外一律按开启处理（与全仓其它布尔开关同口径，容忍笔误不至于静默退回大文件）。
-     * 压缩算法固定 LZ4 frame，见 {@code com.dojao.core.operator.SpillCompression}。</p>
+     * <p>默认 {@link #DEFAULT_SPILL_COMPRESSION}（关闭），除 {@code false} 外一律按开启处理。
+     * <b>该开关不再改变写路径</b>（压缩写吞吐 ~0.2MB/s，已弃用）：配置为 true 时由
+     * {@code com.dojao.core.operator.SpillCompression} 打一条「已忽略」告警。</p>
      */
     public static boolean spillCompressionEnabled() {
         String v = value(SYSTEM_QUERY_SPILL_COMPRESSION, null);

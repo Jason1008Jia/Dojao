@@ -431,7 +431,7 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
         System.err.println("[Sort] Flushing remaining data to Arrow files...");
 
         for (int pid = 0; pid < partitions.length; pid++) {
-            if (partitions[pid] != null) partitions[pid].awaitPendingSpills();
+            if (partitions[pid] != null) partitions[pid].awaitPendingSpills(pid);
         }
 
         int activeCount = 0;

@@ -76,6 +76,7 @@ public final class CatalogCreateSupport {
             Map.entry("metastore.uris", "MetaStore 地址"),
             Map.entry("fs.defaultfs", "默认文件系统"),
             Map.entry("default.format", "写入格式"),
+            Map.entry("default.cts.table", "CTAS 建表类型"),
             Map.entry("batch.size", "单批读取行数"),
             Map.entry("partition.limit", "分区枚举上限"),
             Map.entry("bucket.pruning", "分桶裁剪"),

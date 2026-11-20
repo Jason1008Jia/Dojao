@@ -29,6 +29,9 @@ final class HiveConnectorFactorySupport {
                 + "（Hive 表 location 若是完整 URI，本项可省）");
         props.put("catalog.hive.default.format", "可选，默认 orc。新建表（CTAS）的物理格式：orc / parquet / text"
                 + "（写已有表时按目标表自身格式）");
+        props.put("catalog.hive.default.cts.table", "可选，默认 external（hive3）/ managed（hive2）。"
+                + "CTAS 建表类型：external 建外部表（DROP 不删数据、不会被自动翻成 ACID 事务表）；"
+                + "managed 建管理表（manager 同义）");
         props.put("catalog.hive.batch.size", "可选。单批读取行数，默认取引擎默认批大小");
         props.put("catalog.hive.partition.limit", "可选。分区枚举上限，默认 10000");
         props.put("catalog.hive.bucket.pruning", "可选，默认 true。分桶表桶裁剪开关 —— 分桶列被等值/IN 命中时只读命中桶文件");

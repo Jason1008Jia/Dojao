@@ -272,13 +272,17 @@ public final class ControlSerde {
                 .setOutputColumn(a.outputColumn())
                 .setAggregateName(a.aggregateName())
                 .addAllCollectInputColumns(a.collectInputColumns())
+                .setValueColumn(nz(a.valueColumn()))
+                .setMapAppend(a.mapAppend())
                 .build();
     }
 
     private static FragmentSpec.AggregationDto fromAggregationDto(AggregationDtoMsg m) {
         return new FragmentSpec.AggregationDto(
                 m.getInputColumn().isEmpty() ? null : m.getInputColumn(),
-                m.getOutputColumn(), m.getAggregateName(), m.getCollectInputColumnsList());
+                m.getOutputColumn(), m.getAggregateName(), m.getCollectInputColumnsList(),
+                m.getValueColumn().isEmpty() ? null : m.getValueColumn(),
+                m.getMapAppend());
     }
 
     private static CaseProjectionMsg toCaseProjection(CaseProjection c) {

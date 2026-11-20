@@ -313,8 +313,7 @@ public class DistributedChainedOperator extends AbstractDistributedOperator
             case FragmentSpec.AggregateStep a -> {
                 List<Field> out = new ArrayList<>(fieldsByNames(wire, a.keyColumns()));
                 for (FragmentSpec.AggregationDto dto : a.aggregations()) {
-                    out.add(dtoAggregationField(dto.outputColumn(), dto.aggregateName(),
-                            wire, dto.inputColumn()));
+                    out.add(dtoAggregationField(dto, wire));
                 }
                 yield out;
             }

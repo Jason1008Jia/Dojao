@@ -1644,7 +1644,7 @@ public final class Planner {
                 if (t == null) return null;
                 Field src = byName.get(col) != null ? byName.get(col) : lower.get(col.toLowerCase(Locale.ROOT));
                 boolean nullable = src == null || src.isNullable();
-                out.add(new Field(col, new FieldType(nullable, t, null), List.of()));
+                out.add(com.dojao.core.operator.expr.ExprTypeInference.toField(col, t, nullable));
                 continue;
             }
             Field src = byName.get(col) != null ? byName.get(col) : lower.get(col.toLowerCase(Locale.ROOT));
@@ -3002,6 +3002,17 @@ public final class Planner {
             return new Field(col, FieldType.nullable(new ArrowType.Int(64, true)), null);
         }
         String argText = agg.get().arg();
+        if ("collect_map".equals(fn) || "map_agg".equals(fn)) {
+            // 双输入聚合：key / value 两列 + 可选字面量 TRUE（同 key 追加为列表）
+            List<String> args = ScalarExpr.splitTopLevelComma(argText);
+            if (args.size() < 2) return null;
+            Field keyF = baseFields.get(
+                    SqlTextUtil.stripQualifier(args.get(0).trim()).toLowerCase(Locale.ROOT));
+            Field valF = baseFields.get(
+                    SqlTextUtil.stripQualifier(args.get(1).trim()).toLowerCase(Locale.ROOT));
+            boolean append = args.size() >= 3 && "true".equalsIgnoreCase(args.get(2).trim());
+            return AggregationSpec.mapField(col, keyF, valF, append);
+        }
         if (fn.endsWith("_if")) {
             // 条件聚合：value 是第一个顶层参数（第二参数为条件）
             List<String> args = ScalarExpr.splitTopLevelComma(argText);
@@ -4377,7 +4388,7 @@ public final class Planner {
      */
     private static Field inferExprField(String name, ExprNode node, Map<String, Field> srcFields) {
         ArrowType t = inferArrowType(node, srcFields);
-        return t == null ? null : new Field(name, FieldType.nullable(t), null);
+        return t == null ? null : com.dojao.core.operator.expr.ExprTypeInference.toField(name, t, true);
     }
 
     /**
@@ -6587,13 +6598,17 @@ public final class Planner {
                 fn = fn.substring(0, fn.length() - 3);   // SUM_IF → SUM / MAX_IF → MAX / MIN_IF → MIN
             }
         }
+        // 双输入聚合（collect_map / map_agg）的参数是 "k, v[, flag]"，不能按单表达式解析 → 下面分支内解析
+        boolean mapAgg = "COLLECT_MAP".equals(fn) || "MAP_AGG".equals(fn);
         // 聚合参数：裸列名直接引用；CASE 表达式改写为派生列（CaseProject 预计算后聚合）
-        String inputCol = a.star() ? null : resolveAggInput(argText, fn, upstream,
+        String inputCol = (a.star() || mapAgg) ? null : resolveAggInput(argText, fn, upstream,
                 caseProjections, derivedCols);
         if (distinctAgg && !"COUNT".equals(fn)
-                && !"MIN".equals(fn) && !"MAX".equals(fn)) {
+                && !"MIN".equals(fn) && !"MAX".equals(fn)
+                && !"COLLECT_MAP".equals(fn) && !"MAP_AGG".equals(fn)) {
             // MIN/MAX(DISTINCT) 与不带 DISTINCT 完全等价（同一组值的极值不变）⇒ 下面按普通 MIN/MAX 建规格，
             // 去重语义自然满足。SUM/AVG(DISTINCT) 需另立函数，明确报不支持，不做静默降级（降级会给出错的数）。
+            // collect_map 分支内给出指向 collect_set 的提示，故在此放行。
             throw unsupported(fn + "(DISTINCT ...)（当前仅支持 COUNT / MIN / MAX(DISTINCT ...)）");
         }
         return switch (fn) {
@@ -6619,6 +6634,35 @@ public final class Planner {
                 yield "COLLECT_SET".equals(fn)
                         ? AggregationSpec.collectSet(inputCol, outName)
                         : AggregationSpec.collectList(inputCol, outName);
+            }
+            // COLLECT_MAP / MAP_AGG：把 (key, value) 对收集成 map<key, value>；第三参数为字面量
+            // TRUE 时同 key 值追加为列表（map<key, list<value>>），默认同 key 后者覆盖。
+            case "COLLECT_MAP", "MAP_AGG" -> {
+                if (a.star()) {
+                    throw unsupported(fn + " 需要 (key, value) 列参数，不支持 *");
+                }
+                if (distinctAgg) {
+                    throw unsupported(fn + "(DISTINCT ...) 不支持：需要去重请用 collect_set");
+                }
+                List<String> args = ScalarExpr.splitTopLevelComma(argText);
+                if (args.size() != 2 && args.size() != 3) {
+                    throw unsupported(fn + " 参数个数 " + args.size()
+                            + " 不对，应为 " + fn.toLowerCase(Locale.ROOT) + "(key, value[, is_append])");
+                }
+                String keyCol = resolveAggInput(args.get(0).trim(), fn, upstream,
+                        caseProjections, derivedCols);
+                String valueCol = resolveAggInput(args.get(1).trim(), fn, upstream,
+                        caseProjections, derivedCols);
+                boolean append = false;
+                if (args.size() == 3) {
+                    String flag = args.get(2).trim().toUpperCase(Locale.ROOT);
+                    if (!"TRUE".equals(flag) && !"FALSE".equals(flag)) {
+                        throw unsupported(fn + " 第三参数必须是字面量 TRUE / FALSE："
+                                + args.get(2).trim());
+                    }
+                    append = "TRUE".equals(flag);
+                }
+                yield AggregationSpec.collectMap(keyCol, valueCol, outName, append);
             }
             default -> {
                 // 先查 collect-evaluate 型（CollectAggregateRegistry，框架攒值），再查增量型
@@ -7172,9 +7216,17 @@ public final class Planner {
                             if (!derived.contains(c) && !needed.contains(c)) needed.add(c);
                         }
                     }
-                } else if (a.inputColumn() != null && !derived.contains(a.inputColumn())
-                        && !needed.contains(a.inputColumn())) {
-                    needed.add(a.inputColumn());
+                } else {
+                    if (a.inputColumn() != null && !derived.contains(a.inputColumn())
+                            && !needed.contains(a.inputColumn())) {
+                        needed.add(a.inputColumn());
+                    }
+                    // collect_map 的第二输入列：漏掉它 Worker 侧 value 恒为 null → 整张 map 变 NULL
+                    // （单机 buildAggregationSpec 的 computeChildRequirements 分支已有同样保留）。
+                    if (a.valueColumn() != null && !derived.contains(a.valueColumn())
+                            && !needed.contains(a.valueColumn())) {
+                        needed.add(a.valueColumn());
+                    }
                 }
             }
             for (GroupKeyExpression gk : groupKeyExpressions) {
@@ -8985,6 +9037,8 @@ public final class Planner {
             case "max" -> AggregationSpec.max(in, out);
             case "collect_list" -> AggregationSpec.collectList(in, out);
             case "collect_set" -> AggregationSpec.collectSet(in, out);
+            case "collect_map" -> AggregationSpec.collectMap(
+                    in, dto.valueColumn(), out, dto.mapAppend());
             default -> {
                 AggregateFunction<?> custom = AggregateFunctionRegistry.getGlobal(dto.aggregateName());
                 if (custom == null) {
@@ -10307,6 +10361,7 @@ public final class Planner {
                 } else if (s.inputColumn() != null) {
                     need.add(s.inputColumn());
                 }
+                if (s.valueColumn() != null) need.add(s.valueColumn());
             }
             return List.of(need);
         }

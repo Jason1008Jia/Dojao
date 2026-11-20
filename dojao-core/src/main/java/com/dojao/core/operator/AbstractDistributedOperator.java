@@ -335,7 +335,7 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
                 return null;
             }
             if (t == null) return null;
-            out.add(new Field(g.derivedColumn(), FieldType.nullable(t), null));
+            out.add(com.dojao.core.operator.expr.ExprTypeInference.toField(g.derivedColumn(), t, true));
         }
         return out;
     }
@@ -354,6 +354,11 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
     public static Field aggregationOutputField(AggregationSpec a, List<Field> inputFields) {
         Field input = (inputFields == null || a.inputColumn() == null)
                 ? null : fieldOf(inputFields, a.inputColumn());
+        if (a.valueColumn() != null) {
+            // collect_map：key / value 双输入，map 子字段取两列类型
+            Field value = inputFields == null ? null : fieldOf(inputFields, a.valueColumn());
+            return a.outputField(a.outputColumn(), input, value);
+        }
         return aggregationOutputField(a, input);
     }
 
@@ -381,7 +386,7 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
             if (p == null || p.derivedColumn() == null || byName.containsKey(p.derivedColumn())) continue;
             ArrowType t = ExprTypeInference.inferProjection(p, byName);
             if (t == null) continue;
-            Field f = new Field(p.derivedColumn(), FieldType.nullable(t), null);
+            Field f = ExprTypeInference.toField(p.derivedColumn(), t, true);
             out.add(f);
             byName.putIfAbsent(f.getName(), f);
         }
@@ -460,7 +465,7 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
             throw new UnsupportedOperationException("CTAS 输出列推导：窗口链投影列 '" + name
                     + "' = " + target.exprText() + " 无法静态推断类型");
         }
-        return new Field(name, FieldType.nullable(type), null);
+        return ExprTypeInference.toField(name, type, true);
     }
 
     private static List<String> fieldNames(List<Field> fields) {
@@ -525,6 +530,24 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
     /** 传输 DTO 聚合的输出列 Field（名 = 别名；count→BIGINT、其余→DOUBLE）。 */
     protected static Field dtoAggregationField(String outputColumn, String aggregateName) {
         return new Field(outputColumn, FieldType.nullable(dtoAggregateType(aggregateName)), null);
+    }
+
+    /**
+     * 传输 DTO 聚合的输出列 Field —— 双输入 {@code collect_map} 走 map 子字段推导
+     * （key / value 类型来自 wire），其余同 {@link #dtoAggregationField(String, String, List, String)}。
+     */
+    protected static Field dtoAggregationField(FragmentSpec.AggregationDto dto, List<Field> wire) {
+        if (dto.aggregateName() != null
+                && (dto.aggregateName().equalsIgnoreCase("collect_map")
+                        || dto.aggregateName().equalsIgnoreCase("map_agg"))) {
+            Field keyIn = (wire == null || dto.inputColumn() == null)
+                    ? null : fieldOf(wire, dto.inputColumn());
+            Field valIn = (wire == null || dto.valueColumn() == null)
+                    ? null : fieldOf(wire, dto.valueColumn());
+            return AggregationSpec.mapField(dto.outputColumn(), keyIn, valIn, dto.mapAppend());
+        }
+        return dtoAggregationField(dto.outputColumn(), dto.aggregateName(),
+                wire, dto.inputColumn());
     }
 
     /** 传输 DTO 聚合的输出列 Field —— 输入列在 {@code wire} 中按名取类型（MIN/MAX 与输入同型）。 */
