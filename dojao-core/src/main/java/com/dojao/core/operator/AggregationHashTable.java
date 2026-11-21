@@ -2,6 +2,7 @@ package com.dojao.core.operator;
 
 import com.dojao.common.data.Page;
 import com.dojao.core.function.aggregate.CollectMapAggregateFunction;
+import com.dojao.core.function.aggregate.CollectOrderedListAggregateFunction;
 import com.dojao.core.function.aggregate.CollectSupport;
 import com.dojao.core.function.aggregate.CountDistinctAggregateFunction;
 import com.dojao.core.function.aggregate.MinMaxSupport;
@@ -53,7 +54,7 @@ public class AggregationHashTable extends RowHashTable implements Slot {
     private final AggregationSpec[] specs;
     private final AggregateFunction<?>[] aggregates;
     private final String[] inputColumns;
-    /** 第二输入列（collect_map 的 value 列；其余聚合为 null）。 */
+    /** 第二输入列（collect_map 的 value 列 / collect_ordered_list 的排序列；其余聚合为 null）。 */
     private final String[] valueColumns;
 
     /**
@@ -79,7 +80,7 @@ public class AggregationHashTable extends RowHashTable implements Slot {
 
     // 输入列索引（首次输入时解析）
     private int[] inputColIndices;
-    /** 第二输入列索引（collect_map 的 value 列；非 map 为 -1）。 */
+    /** 第二输入列索引（collect_map 的 value 列 / collect_ordered_list 的排序列；非双输入为 -1）。 */
     private int[] valueColIndices;
     private boolean indicesResolved;
 
@@ -97,6 +98,12 @@ public class AggregationHashTable extends RowHashTable implements Slot {
      * {@code list<元素类型>} 需要子字段，{@link ArrowType} 表达不了，故单独保留 Field。
      */
     private Field[] resolvedOutputFields;
+
+    /**
+     * 各聚合第二输入列的 Field（首次输入时解析）：collect_ordered_list 的逐值溢写流需要排序列的
+     * Arrow 类型建列，其余规格该槽位为 null。
+     */
+    private Field[] resolvedValueFields;
 
     // 批量聚合扩展：任一聚合实现 BatchAggregateFunction → 页内按 group 归组后批量累加。
     // 内置五函数不实现 → batchEnabled=false，走原逐行路径，性能零影响。
@@ -295,15 +302,16 @@ public class AggregationHashTable extends RowHashTable implements Slot {
             return;
         }
         FieldVector vec = root.getVector(inputColIndices[si]);
-        // collect_map / map_agg：双输入（key, value）。NULL 由聚合函数自身跳过。
-        if (specs[si].isCollectMap()) {
-            Object key = vec.isNull(row) ? null : vec.getObject(row);
-            Object value = null;
+        // 双输入聚合（collect_map 的 key/value、collect_ordered_list 的 value/排序键）。
+        // NULL 由聚合函数自身跳过。
+        if (specs[si].isCollectMap() || specs[si].isOrderedList()) {
+            Object first = vec.isNull(row) ? null : vec.getObject(row);
+            Object second = null;
             if (valueColIndices != null && valueColIndices[si] >= 0) {
                 FieldVector vv = root.getVector(valueColIndices[si]);
-                value = vv.isNull(row) ? null : vv.getObject(row);
+                second = vv.isNull(row) ? null : vv.getObject(row);
             }
-            aggregate.accumulate(state, new Object[]{key, value});
+            aggregate.accumulate(state, new Object[]{first, second});
             return;
         }
         // 经 Object 判型：AggregateFunction<Object> 与 CountDistinctAggregateFunction
@@ -443,6 +451,7 @@ public class AggregationHashTable extends RowHashTable implements Slot {
         valueColIndices = new int[specs.length];
         resolvedOutputTypes = new ArrowType[specs.length];
         resolvedOutputFields = new Field[specs.length];
+        resolvedValueFields = new Field[specs.length];
         for (int i = 0; i < specs.length; i++) {
             inputColIndices[i] = indexOf(fields, inputColumns[i]);
             valueColIndices[i] = indexOf(fields, valueColumns[i]);
@@ -451,6 +460,7 @@ public class AggregationHashTable extends RowHashTable implements Slot {
             ArrowType inputType = inputField == null ? null : inputField.getType();
             resolvedOutputTypes[i] = resultTypeFor(specs[i], inputType);
             resolvedOutputFields[i] = specs[i].outputField(specs[i].outputColumn(), inputField, valueField);
+            resolvedValueFields[i] = valueField;
         }
         indicesResolved = true;
     }
@@ -507,11 +517,13 @@ public class AggregationHashTable extends RowHashTable implements Slot {
         if (fields == null || fields.isEmpty()) return;
         resolvedOutputTypes = new ArrowType[specs.length];
         resolvedOutputFields = new Field[specs.length];
+        resolvedValueFields = new Field[specs.length];
         for (int i = 0; i < specs.length; i++) {
             Field in = fieldByName(fields, inputColumns[i]);
             Field val = fieldByName(fields, valueColumns[i]);
             resolvedOutputTypes[i] = resultTypeFor(specs[i], in == null ? null : in.getType());
             resolvedOutputFields[i] = specs[i].outputField(specs[i].outputColumn(), in, val);
+            resolvedValueFields[i] = val;
         }
     }
 
@@ -763,6 +775,21 @@ public class AggregationHashTable extends RowHashTable implements Slot {
                     vec.setValueCount(groupCount);
                     fields.add(f); vectors.add(vec);
                 }
+                case "collect_ordered_list" -> {
+                    if (!includeDistinct) break;   // 标量流：有序 collect 状态走独立逐值流
+                    // 调试 / 探针口径：整组序列化成一格 List 值（已按排序列排好；生产溢写走
+                    // buildOrderedCollectSpillRoot：每值一行，附带排序列）。
+                    Field template = outputField(si);
+                    Field f = new Field(outName + "_s0", template.getFieldType(), template.getChildren());
+                    FieldVector vec = createVector(f, allocator);
+                    vec.allocateNew();
+                    for (int g = 0; g < groupCount; g++) {
+                        Object state = groupStates.get(g)[si];
+                        setVectorValue(vec, g, ((AggregateFunction) aggregate).evaluate(state));
+                    }
+                    vec.setValueCount(groupCount);
+                    fields.add(f); vectors.add(vec);
+                }
                 case "collect_map" -> {
                     if (!includeDistinct) break;   // 标量流：map 状态走独立逐值流
                     // 调试 / 探针口径：整组序列化成一格 Map 值（生产溢写走 buildMapCollectSpillRoot）。
@@ -964,6 +991,7 @@ public class AggregationHashTable extends RowHashTable implements Slot {
     public VectorSchemaRoot buildCollectSpillRoot(int ordinal) {
         int si = collectSpecs[ordinal];
         if (specs[si].isCollectMap()) return buildMapCollectSpillRoot(si);
+        if (specs[si].isOrderedList()) return buildOrderedCollectSpillRoot(si);
         int n = 0;
         for (int g = 0; g < groupCount; g++) {
             Object st = groupStates.get(g)[si];
@@ -1013,6 +1041,85 @@ public class AggregationHashTable extends RowHashTable implements Slot {
             for (Object v : c) {
                 for (TransferPair tp : keyTps) tp.copyValueSafe(g, r);
                 setVectorValue(valueVec, r, CollectSupport.export(v));
+                r++;
+            }
+        }
+        for (FieldVector v : vectors) v.setValueCount(r);
+        return new VectorSchemaRoot(fields, vectors, r);
+    }
+
+    /**
+     * {@code collect_ordered_list} 的<b>逐值</b>溢写根：{@code [key..., value, orderKey]}，
+     * 每个收集值一行，按键有序（稳定排序 ⇒ 组内保持累加顺序；最终顺序在 evaluate 时按排序列重排）。
+     *
+     * @return 该规格的溢写根；本槽位该规格没有任何值时返回 {@code null}
+     */
+    private VectorSchemaRoot buildOrderedCollectSpillRoot(int si) {
+        int n = 0;
+        for (int g = 0; g < groupCount; g++) {
+            Object st = groupStates.get(g)[si];
+            if (st instanceof CollectOrderedListAggregateFunction.OrderedState os) n += os.size();
+        }
+        if (n == 0) return null;
+
+        Field template = outputField(si);
+        Field child = template.getChildren().isEmpty() ? null : template.getChildren().get(0);
+        String outName = specs[si].outputColumn();
+        Field valueField = new Field(outName + "_cv",
+                child != null ? child.getFieldType() : FieldType.nullable(VARCHAR),
+                child != null ? child.getChildren() : null);
+        Field orderField = resolvedValueFields != null ? resolvedValueFields[si] : null;
+        if (orderField == null) {
+            orderField = new Field(outName + "_ov", FieldType.nullable(VARCHAR), null);
+        } else {
+            orderField = new Field(outName + "_ov", FieldType.nullable(orderField.getType()),
+                    orderField.getChildren());
+        }
+
+        List<Field> fields = new ArrayList<>(keyColumns.size() + 2);
+        List<FieldVector> vectors = new ArrayList<>(keyColumns.size() + 2);
+        List<TransferPair> keyTps = new ArrayList<>(keyColumns.size());
+        for (FieldVector kv : keyVectors) {
+            // ★必须先设 valueCount：TransferPair.copyValueSafe 会校验源行号 < valueCount
+            kv.setValueCount(groupCount);
+            FieldVector dst = kv.getField().createVector(allocator);
+            dst.setInitialCapacity(n);
+            dst.allocateNew();
+            keyTps.add(kv.makeTransferPair(dst));
+            fields.add(kv.getField());
+            vectors.add(dst);
+        }
+        FieldVector valueVec = createVector(valueField, allocator);
+        valueVec.setInitialCapacity(n);
+        valueVec.allocateNew();
+        FieldVector orderVec = createVector(orderField, allocator);
+        orderVec.setInitialCapacity(n);
+        orderVec.allocateNew();
+        fields.add(valueField);
+        fields.add(orderField);
+        vectors.add(valueVec);
+        vectors.add(orderVec);
+
+        // 键排序（稳定）：与其它 collect 流一致，保证 Phase 2 K 路归并按组聚集
+        int[] order = new int[groupCount];
+        for (int g = 0; g < groupCount; g++) order[g] = g;
+        if (!keyColumns.isEmpty() && groupCount > 1) {
+            Object[] keys = new Object[groupCount];
+            for (int g = 0; g < groupCount; g++) keys[g] = extractKey(g);
+            sortIndices(order, (a, b) -> compareKeyValues(keys[a], keys[b]));
+        }
+
+        int r = 0;
+        for (int g : order) {
+            Object st = groupStates.get(g)[si];
+            if (!(st instanceof CollectOrderedListAggregateFunction.OrderedState os)
+                    || os.size() == 0) continue;
+            List<Object> vals = os.values();
+            List<Object> keys = os.orderKeys();
+            for (int i = 0; i < vals.size(); i++) {
+                for (TransferPair tp : keyTps) tp.copyValueSafe(g, r);
+                setVectorValue(valueVec, r, CollectSupport.export(vals.get(i)));
+                setVectorValue(orderVec, r, CollectSupport.export(keys.get(i)));
                 r++;
             }
         }
@@ -1389,6 +1496,12 @@ public class AggregationHashTable extends RowHashTable implements Slot {
                 java.util.Collection<?> vals = val instanceof java.util.Collection<?> c ? c : null;
                 yield CollectSupport.fromValues(aggregates[specIdx].functionName(), vals);
             }
+            case "collect_ordered_list" -> {
+                // 整根溢写（调试 / 探针）一格 = 已排序的整组值，排序键置 NULL（稳定排序保序）
+                Object val = root.getVector(startCol).getObject(row);
+                java.util.Collection<?> vals = val instanceof java.util.Collection<?> c ? c : null;
+                yield CollectOrderedListAggregateFunction.fromValues(vals);
+            }
             case "collect_map" -> {
                 // 整根溢写（调试 / 探针）一格 = 整张 map；逐条目流由 HashAggregationOperator 的
                 // collect 通道回读，不走这里。逐条目 replay 走 accumulate，与累加路径同口径。
@@ -1443,6 +1556,7 @@ public class AggregationHashTable extends RowHashTable implements Slot {
         spilled.inputColIndices = this.inputColIndices;
         spilled.resolvedOutputTypes = this.resolvedOutputTypes;
         spilled.resolvedOutputFields = this.resolvedOutputFields;
+        spilled.resolvedValueFields = this.resolvedValueFields;
         spilled.rowHashes = this.rowHashes;
         spilled.rehashCount = this.rehashCount;
         spilled.estimatedMem = this.estimatedMem;
@@ -1582,6 +1696,10 @@ public class AggregationHashTable extends RowHashTable implements Slot {
             // COUNT(DISTINCT)：紧凑状态按实际数组（开放寻址表 / 字节 arena）计量；
             // 其它 Set 实现（历史状态）沿用「条目 + 装箱对象」口径。
             else if (s instanceof com.dojao.core.function.aggregate.DistinctSet ds) mem += ds.estimatedBytes();
+            // COLLECT_ORDERED_LIST：两条并行 ArrayList（各 48B 容器 + 32B/条目引用与装箱）
+            else if (s instanceof CollectOrderedListAggregateFunction.OrderedState os) {
+                mem += 96L + (long) os.size() * 64L;
+            }
             // COLLECT_MAP：容器 64B + 每条目（Node 40 + key/value 装箱 ~56）≈ 96B + 追加列表元素 32B。
             else if (s instanceof CollectMapAggregateFunction.MapState ms) {
                 mem += 64L + (long) ms.mapSize() * 96L + ms.elementCount() * 32L;

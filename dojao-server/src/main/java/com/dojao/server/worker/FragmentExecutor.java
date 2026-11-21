@@ -32,6 +32,7 @@ import com.dojao.core.operator.WindowFunctionType;
 import com.dojao.core.operator.WindowSortOperator;
 import com.dojao.core.function.aggregate.AvgAggregateFunction;
 import com.dojao.core.function.aggregate.CollectListAggregateFunction;
+import com.dojao.core.function.aggregate.CollectOrderedListAggregateFunction;
 import com.dojao.core.function.aggregate.CollectSetAggregateFunction;
 import com.dojao.core.function.aggregate.CountAggregateFunction;
 import com.dojao.core.function.aggregate.CountDistinctAggregateFunction;
@@ -1200,6 +1201,11 @@ public final class FragmentExecutor {
             return AggregationSpec.collectMap(dto.inputColumn(), dto.valueColumn(),
                     dto.outputColumn(), dto.mapAppend());
         }
+        if ("collect_ordered_list".equalsIgnoreCase(dto.aggregateName())) {
+            // valueColumn = 排序列、mapAppend = 是否降序（与 collect_map 复用同一对 DTO 字段）
+            return AggregationSpec.collectOrderedList(dto.inputColumn(), dto.valueColumn(),
+                    dto.outputColumn(), dto.mapAppend());
+        }
         return new AggregationSpec(dto.inputColumn(), dto.outputColumn(), aggregateFor(dto.aggregateName()));
     }
 
@@ -1219,6 +1225,7 @@ public final class FragmentExecutor {
             case "max" -> MaxAggregateFunction.INSTANCE;
             case "collect_list" -> CollectListAggregateFunction.INSTANCE;
             case "collect_set" -> CollectSetAggregateFunction.INSTANCE;
+            case "collect_ordered_list" -> CollectOrderedListAggregateFunction.ASCENDING;
             default -> null;
         };
         if (builtin != null) return builtin;

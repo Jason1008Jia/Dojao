@@ -25,6 +25,9 @@ import java.util.List;
  * <p>{@code collect_map} / {@code map_agg} 是增量型里的双输入特例：{@code inputColumn} = key 列、
  * {@code valueColumn} = value 列、{@code mapAppend} = 同 key 值是否追加为列表。</p>
  *
+ * <p>{@code collect_ordered_list} 同样复用这两个字段：{@code inputColumn} = 被收集的值列、
+ * {@code valueColumn} = 排序列、{@code mapAppend} = 是否降序。</p>
+ *
  * @author jiaxin
  * @version 2.0
  * @date 2026/7/15
@@ -69,20 +72,21 @@ public record AggregationSpec(
         return switch (name) {
             case "sum", "avg", "min", "max" -> FLOAT64;
             case "count", "count_distinct", "sum_int64" -> INT64;
-            // collect_list / collect_set：元素类型来自输入列，ArrowType 本身不含子字段，
-            // 声明完整 schema 请用 outputField(...)
-            case "collect_list", "collect_set" -> LIST;
+            // collect_list / collect_set / collect_ordered_list：元素类型来自输入列，
+            // ArrowType 本身不含子字段，声明完整 schema 请用 outputField(...)
+            case "collect_list", "collect_set", "collect_ordered_list" -> LIST;
             // collect_map：key/value 类型来自输入列，完整声明同样走 outputField(...)
             case "collect_map" -> MAP;
             default -> FLOAT64; // 自定义聚合默认 double
         };
     }
 
-    /** 是否 collect_list / collect_set（输出嵌套 List，字段需带子字段）。 */
+    /** 是否 collect_list / collect_set / collect_ordered_list（输出嵌套 List，字段需带子字段）。 */
     public boolean isCollectArray() {
         if (aggregate == null) return false;
         String name = aggregate.functionName();
-        return "collect_list".equals(name) || "collect_set".equals(name);
+        return "collect_list".equals(name) || "collect_set".equals(name)
+                || "collect_ordered_list".equals(name);
     }
 
     /** 是否 collect_map / map_agg（输出嵌套 Map，双输入列：key + value）。 */
@@ -90,7 +94,17 @@ public record AggregationSpec(
         return aggregate != null && "collect_map".equals(aggregate.functionName());
     }
 
-    /** 状态是否走「逐值溢写流」（collect_list / collect_set / collect_map）：标量流里不占列。 */
+    /**
+     * 是否 collect_ordered_list（双输入列：值 + 排序列；{@code mapAppend} 复用为降序位）。
+     */
+    public boolean isOrderedList() {
+        return aggregate != null && "collect_ordered_list".equals(aggregate.functionName());
+    }
+
+    /**
+     * 状态是否走「逐值溢写流」（collect_list / collect_set / collect_ordered_list / collect_map）：
+     * 标量流里不占列。
+     */
     public boolean usesCollectSpill() {
         return isCollectArray() || isCollectMap();
     }
@@ -243,6 +257,18 @@ public record AggregationSpec(
     /** COLLECT_SET：去重收集为 {@code list<输入类型>}（NULL 跳过，空组 → NULL）。 */
     public static AggregationSpec collectSet(String inputColumn, String outputColumn) {
         return new AggregationSpec(inputColumn, outputColumn, CollectSetAggregateFunction.INSTANCE);
+    }
+
+    /**
+     * COLLECT_ORDERED_LIST：按 {@code orderColumn} 排序后收集为 {@code list<值类型>}。
+     * {@code descending = false}（缺省）升序；NULL 值跳过，空组 → NULL。
+     */
+    public static AggregationSpec collectOrderedList(String inputColumn, String orderColumn,
+                                                     String outputColumn, boolean descending) {
+        return new AggregationSpec(inputColumn, outputColumn,
+                descending ? CollectOrderedListAggregateFunction.DESCENDING
+                        : CollectOrderedListAggregateFunction.ASCENDING,
+                null, List.of(), orderColumn, descending);
     }
 
     /**

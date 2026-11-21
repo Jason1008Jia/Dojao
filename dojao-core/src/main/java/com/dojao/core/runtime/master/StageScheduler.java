@@ -76,6 +76,18 @@ public final class StageScheduler {
     }
 
     /**
+     * 通用<b>二次 shuffle 聚合尾</b>（任意分布式载体通用）：载体终端输出按分组键重哈希进聚合交换，
+     * 每分区一个 {@link FragmentSpec.AggregateConsumer} 做终态聚合后回传 Master。
+     *
+     * @param partitionStep      交给载体终端片段（Middle* 形态）的重分区描述
+     * @param terminals          每分区一个 AggregateConsumer（新终端，回传 Master）
+     * @param finalConsumerCount 回传 Master 的终端片段数（全局聚合压缩后为 1）
+     */
+    public record AggregationTail(FragmentSpec.PartitionStep partitionStep,
+                                  List<FragmentSpec> terminals, int finalConsumerCount) {
+    }
+
+    /**
      * 多 join 链的<b>一个 join 环节</b>：本层 join 的键 + 右表（build 侧）的读取描述。
      * 左表（probe 侧）来自上一层的 join 输出（第 1 层 = 首个基表 {@code firstLeftKeys}）。
      *
@@ -2547,6 +2559,51 @@ public final class StageScheduler {
     }
 
     /**
+     * 通用<b>二次 shuffle 聚合尾</b>（任何分布式载体通用）：载体终端输出按 GROUP BY 键重哈希进
+     * 一个每分区独立的聚合交换，由每分区一个 {@link FragmentSpec.AggregateConsumer} 做<b>终态</b>
+     * 聚合后回传 Master。与 {@code planJoinAggregation} 的聚合尾段同一套机制（每分区独立交换标识
+     * + 单桶归属掩码），区别只在交换 / 片段标识前缀，避免同一查询内撞名。
+     *
+     * <p><b>正确性</b>：分组键经同一 round-robin owner 映射哈希 → 每个分组落唯一桶 → 唯一
+     * {@code AggregateConsumer} 本地完整聚合即该分组最终结果（co-partitioning 不变量），
+     * Master 零合并。对不可 partial 合并的聚合（collect* / avg / count(distinct)）同样成立。</p>
+     *
+     * <p><b>全局聚合</b>（{@code groupKeys} 空）压缩到单分区：空键哈希恒 0，只会有 0 号桶收到
+     * 数据；若按 n 个分区派发，其余分区收到 0 行会补空行假数据。</p>
+     *
+     * @param numSenders 上游会向聚合交换 complete 的发送方数（= 载体终端片段数）
+     */
+    public static AggregationTail planAggregationTail(String queryId, List<WorkerRegistration> workers,
+                                                      int numPartitions, List<String> groupKeys,
+                                                      FragmentSpec.AggregateStep aggregate,
+                                                      String exchangeTag, String fragmentTag,
+                                                      int numSenders) {
+        PartitionLayout layout = PartitionLayout.roundRobin(workers, numPartitions);
+        int n = layout.numPartitions();
+        int aggParts = groupKeys.isEmpty() ? 1 : n;
+        String aggExchange = queryId + "-" + exchangeTag;
+        List<String> perPartitionExchanges = new ArrayList<>(aggParts);
+        for (int p = 0; p < aggParts; p++) {
+            perPartitionExchanges.add(aggExchange + "#" + p);
+        }
+        FragmentSpec.AggregateStep step = aggregate.numPartitions() == aggParts
+                ? aggregate : aggregate.withNumPartitions(aggParts);
+        List<FragmentSpec> terminals = new ArrayList<>(aggParts);
+        for (int p = 0; p < aggParts; p++) {
+            boolean[] owned = new boolean[aggParts];
+            owned[p] = true;
+            terminals.add(new FragmentSpec.AggregateConsumer(fragmentId(queryId, fragmentTag, p),
+                    layout.ownerOf(p),
+                    new FragmentSpec.ExchangeInStep(aggExchange + "#" + p, aggParts, numSenders, owned),
+                    step));
+        }
+        FragmentSpec.PartitionStep partitionStep = new FragmentSpec.PartitionStep(
+                aggExchange, List.copyOf(groupKeys), aggParts,
+                layout.ownerWorkerIdsList(), perPartitionExchanges);
+        return new AggregationTail(partitionStep, List.copyOf(terminals), aggParts);
+    }
+
+    /**
      * 规划一个<b>多窗口分组链</b>的分布式执行舞台（裸表扫描源）：
      *
      * <pre>
@@ -2563,6 +2620,36 @@ public final class StageScheduler {
                                                    int numPartitions, ReadRequest baseRequest,
                                                    List<FragmentSpec.WindowStep> windowSteps,
                                                    DojaoConnector probe) {
+        return planWindowChain(queryId, workers, numPartitions, baseRequest, windowSteps, probe, null, null);
+    }
+
+    /**
+     * {@link #planWindowChain} + <b>二次 shuffle 聚合尾</b>（外层聚合不可 partial 合并 / 分组键
+     * 不覆盖末组窗口分区键时的通用兜底）：
+     *
+     * <pre>
+     *  扫表 ─► Partition(窗口键) ─► [中间窗口层…] ─► 末组窗口（改为 MiddleWindowConsumer）
+     *       ─► Partition(分组键) ─► 每分区 AggregateConsumer（终态聚合）─► Master
+     * </pre>
+     *
+     * <p>末组窗口不再直接回传 Master：窗口输出按 <b>GROUP BY 键</b>重哈希进聚合交换，每个分组整组
+     * 落在唯一分区，{@code AggregateConsumer} 本地聚合即<b>最终结果</b>（不是 partial），Master 零
+     * 合并。因此 {@code collect_ordered_list} / {@code collect_map} / {@code avg} /
+     * {@code count(distinct)} 等不可合并聚合同样正确；数据流全程留在 Worker。</p>
+     *
+     * <p>派发顺序：① 聚合终端（注册聚合交换读端）→ ② 末组窗口中间层 → ③ 中间窗口层逆序 →
+     * ④ 扫描 Producers。</p>
+     *
+     * @param tailAggregate 二次聚合（{@code keyColumns} = GROUP BY 键；空键 = 全局聚合压缩到单分区）；
+     *                      null = 旧行为（末组窗口直接回传 Master）
+     * @param tailComputed  分组键表达式合成列（末组窗口输出上、重哈希前物化；可空）
+     */
+    public static DistributedStage planWindowChain(String queryId, List<WorkerRegistration> workers,
+                                                   int numPartitions, ReadRequest baseRequest,
+                                                   List<FragmentSpec.WindowStep> windowSteps,
+                                                   DojaoConnector probe,
+                                                   FragmentSpec.AggregateStep tailAggregate,
+                                                   List<GroupKeyExpression> tailComputed) {
         if (windowSteps == null || windowSteps.isEmpty()) {
             throw new IllegalArgumentException("planWindowChain: windowSteps 不能为空");
         }
@@ -2579,13 +2666,28 @@ public final class StageScheduler {
         List<ScanSlice> slices = planSlices(probe, baseRequest, n);
 
         List<FragmentSpec> consumers = new ArrayList<>();
-        // 末窗口：终端，每 Worker 一个
+        // 二次 shuffle 聚合尾：末组窗口改成中间层（窗口输出按分组键重哈希），聚合终端先派发
+        //（每个分组整组落唯一分区 → 该分区 AggregateConsumer 的完整聚合即最终结果）。
+        AggregationTail tail = tailAggregate == null ? null
+                : planAggregationTail(queryId, workers, n, tailAggregate.keyColumns(), tailAggregate,
+                        "WAGG", "WAG", numWorkers);
+        if (tail != null) {
+            consumers.addAll(tail.terminals());
+        }
+        // 末窗口：终端，每 Worker 一个（带聚合尾时改为中间层 + 重分区）
         for (int w = 0; w < numWorkers; w++) {
             String workerId = workers.get(w).info().workerId();
-            consumers.add(new FragmentSpec.WindowConsumer(fragmentId(queryId, "CW", w), workerId,
-                    new FragmentSpec.ExchangeInStep(windowExchange(queryId, k - 1), n,
-                            k == 1 ? slices.size() : numWorkers, layout.ownedMask(workerId)),
-                    ws.get(k - 1)));
+            FragmentSpec.ExchangeInStep in = new FragmentSpec.ExchangeInStep(
+                    windowExchange(queryId, k - 1), n,
+                    k == 1 ? slices.size() : numWorkers, layout.ownedMask(workerId));
+            if (tail == null) {
+                consumers.add(new FragmentSpec.WindowConsumer(fragmentId(queryId, "CW", w), workerId,
+                        in, ws.get(k - 1)));
+            } else {
+                consumers.add(new FragmentSpec.MiddleWindowConsumer(fragmentId(queryId, "CW", w), workerId,
+                        in, ws.get(k - 1), tail.partitionStep())
+                        .withNextComputed(tailComputed == null ? List.of() : tailComputed));
+            }
         }
         // 中间窗口层（逆序）：own 桶 → 本地窗口 → 按下一组键重哈希
         for (int i = k - 2; i >= 0; i--) {
@@ -2613,8 +2715,9 @@ public final class StageScheduler {
                     // 首组窗口键含表达式：扫描端在哈希分区前物化合成列
                     ws.get(0).computed()));
         }
-        // 只有终端 WindowConsumer（CW*，每 Worker 一个）上报 FragmentFinished；中间层 MW* 不回传。
-        return new DistributedStage(layout.ownerWorkerIds(), consumers, producers, numWorkers);
+        // 只有终端片段（CW* WindowConsumer 或聚合尾 WAG*）上报 FragmentFinished；中间层不回传。
+        return new DistributedStage(layout.ownerWorkerIds(), consumers, producers,
+                tail == null ? numWorkers : tail.finalConsumerCount());
     }
 
     /**

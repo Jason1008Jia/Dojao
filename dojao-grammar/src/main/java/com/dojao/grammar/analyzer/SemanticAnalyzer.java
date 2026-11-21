@@ -80,7 +80,7 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
         "STDDEV", "STDDEV_POP", "STDDEV_SAMP",
         "VAR_POP", "VAR_SAMP", "VARIANCE",
         "COLLECT_LIST", "COLLECT_SET", "ARRAY_AGG",
-        "COLLECT_MAP", "MAP_AGG",
+        "COLLECT_MAP", "MAP_AGG", "COLLECT_ORDERED_LIST",
         "STRING_AGG", "LISTAGG", "GROUP_CONCAT",
         "FIRST_VALUE", "LAST_VALUE",
         "CORR", "COVAR_POP", "COVAR_SAMP"

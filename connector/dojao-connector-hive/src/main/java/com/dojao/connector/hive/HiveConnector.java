@@ -277,6 +277,8 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
      * 否则两个片段会往同一份 ORC 写文件里交错写。
      */
     private final ConcurrentMap<Thread, HiveWriteSession> writeSessions = new ConcurrentHashMap<>();
+    /** 新建目录 / 文件的 HDFS 权限（catalog 属性可覆盖；默认对齐 Hive 的 umask 0002）。 */
+    private final HiveWritePermissions writePermissions;
 
     /** 慢操作告警阈值：低于它的步骤一声不吭，超过就报 —— 定位「读一个小查询为什么几十秒」用。 */
     private static final long SLOW_STEP_MS = 300L;
@@ -318,6 +320,7 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         this.acidWrite = Boolean.parseBoolean(props.getOrDefault(ACID_WRITE_KEY, "true"));
         this.nestedNative = !"text".equalsIgnoreCase(
                 props.getOrDefault(NESTED_MODE_KEY, "native").trim());
+        this.writePermissions = HiveWritePermissions.from(props);
     }
 
     public String getCatalogName() { return catalogName; }
@@ -370,7 +373,8 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
     @Override
     public boolean tableExists(String catalog, String schema, String table) {
         if (!catalogExists(catalog)) return false;
-        return metastore.tableExists(schema, table);
+        // 存在性回源：缓存快照可能落后于外部 / 其他进程的 DDL，CTAS 会据此误判「表已存在」静默跳过
+        return metastore.tableFresh(schema, table).isPresent();
     }
 
     @Override
@@ -1201,7 +1205,11 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         String realTable = sep < 0 ? target : target.substring(0, sep);
         String stagingDir = sep < 0 ? null : target.substring(sep + 1);
 
-        HiveTableMeta meta = requireTable(request.schema(), realTable);
+        // 每个写会话的第一页强制回源 HMS：Worker 的连接器实例跨查询复用，旧缓存会把
+        // DROP → 重建（列已变）后的表按旧列建 HiveWriteSession。首页回源一次，后续页走会话内快照。
+        HiveTableMeta meta = writeSessions.containsKey(Thread.currentThread())
+                ? requireTable(request.schema(), realTable)
+                : requireFreshTable(request.schema(), realTable);
         checkWritableTarget(meta, acidWrite, metastore.hive2());
         // 目标列名（INSERT INTO t(a,b)）：页列按位置对应这些名字，否则用页自己的列名
         List<String> pageColumns = request.targetColumns();
@@ -1332,7 +1340,7 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
             moveOnClose = true;
         }
         HiveWriteSession created = new HiveWriteSession(conf, fs, meta, metastore, tempDir, moveOnClose,
-                nestedNativeFor(meta));
+                nestedNativeFor(meta), writePermissions);
         HiveWriteSession raced = writeSessions.putIfAbsent(self, created);
         return raced != null ? raced : created;
     }
@@ -1392,7 +1400,8 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         metastore.createTable(t);
 
         try {
-            fsOf(location).mkdirs(new Path(location));
+            // 权限必须在这里落：默认 umask 下目录是 770/写入用户私有组，HiveServer2 的查询用户读不了
+            writePermissions.mkdirs(fsOf(location), new Path(location));
         } catch (IOException e) {
             // 目录建不出来 → 回滚元数据，别留一张没有目录的空表
             try { metastore.dropTable(schema, table); } catch (Throwable ignored) { }
@@ -1405,7 +1414,7 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
 
     @Override
     public void dropTable(String catalog, String schema, String table) {
-        Optional<HiveTableMeta> meta = metastore.table(schema, table);
+        Optional<HiveTableMeta> meta = metastore.tableFresh(schema, table);
         String location = meta.map(HiveTableMeta::location).orElse(null);
         metastore.dropTable(schema, table);
         // EXTERNAL TABLE 的语义是「DROP 只删元数据、不动数据」：HMS 自身对外部表不删数据，
@@ -1423,7 +1432,7 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
 
     @Override
     public void truncateTable(String catalog, String schema, String table) {
-        Optional<HiveTableMeta> meta = metastore.table(schema, table);
+        Optional<HiveTableMeta> meta = metastore.tableFresh(schema, table);
         String location = meta.map(HiveTableMeta::location).orElse(null);
         if (location == null || location.isBlank()) {
             throw new IllegalStateException(
@@ -1499,7 +1508,7 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
      */
     @Override
     public boolean supportsOverwrite(String catalog, String schema, String table) {
-        HiveTableMeta meta = metastore.table(schema, table).orElse(null);
+        HiveTableMeta meta = metastore.tableFresh(schema, table).orElse(null);
         if (meta == null || meta.location() == null || meta.location().isBlank()) return false;
         try {
             FileSystem fs = fsOf(meta.location());
@@ -1518,7 +1527,7 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
      */
     @Override
     public String beginOverwrite(String catalog, String schema, String table) {
-        HiveTableMeta meta = requireTable(schema, table);
+        HiveTableMeta meta = requireFreshTable(schema, table);
         if (meta.location() == null || meta.location().isBlank()) {
             throw new IllegalStateException("INSERT OVERWRITE 目标表无 location: "
                     + schema + "." + table);
@@ -1531,7 +1540,7 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         checkWritableTarget(meta, acidWrite, metastore.hive2());
         String staging = new Path(new Path(meta.location()), HiveWriteSession.newTempDirName()).toString();
         try {
-            fsOf(staging).mkdirs(new Path(staging));
+            writePermissions.mkdirs(fsOf(staging), new Path(staging));
         } catch (IOException e) {
             throw new IllegalStateException("创建 INSERT OVERWRITE staging 目录失败: " + staging, e);
         }
@@ -1552,12 +1561,15 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         int sep = staging.indexOf(STAGING_SEP);
         String realTable = sep < 0 ? table : staging.substring(0, sep);
         String stagingDir = sep < 0 ? staging : staging.substring(sep + 1);
-        HiveTableMeta meta = requireTable(schema, realTable);
+        // 提交时回源：staging 期间表可能被外部重建（location / 分区定义变化），必须按当前元数据搬运
+        HiveTableMeta meta = requireFreshTable(schema, realTable);
         Path stagingPath = new Path(stagingDir);
         Path location = new Path(meta.location());
         try {
             FileSystem fs = fsOf(meta.location());
-            fs.mkdirs(location);
+            writePermissions.mkdirs(fs, location);
+            // 兜底：Worker 已给自己的文件落过权限，这里再对齐一次（rename 不改权限）
+            writePermissions.applyFilePerms(fs, stagingPath);
             if (!meta.partitioned()) {
                 deleteDataFiles(fs, location);
                 moveFilesInDir(fs, stagingPath, location);
@@ -1567,7 +1579,7 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
                     if (!s.isDirectory()) continue;
                     Path dest = new Path(location, s.getPath().getName());
                     fs.delete(dest, true);
-                    fs.mkdirs(dest);
+                    writePermissions.mkdirs(fs, dest);
                     moveFilesInDir(fs, s.getPath(), dest);
                     upsertPartition(meta, dest);
                 }
@@ -2894,6 +2906,12 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
 
     private HiveTableMeta requireTable(String schema, String table) {
         return metastore.table(schema, table).orElseThrow(() ->
+                new IllegalArgumentException("Hive 表不存在: " + catalogName + "." + schema + "." + table));
+    }
+
+    /** 写 / DDL 路径专用：跳过缓存回源 HMS（表可能已被本进程之外的操作重建）。 */
+    private HiveTableMeta requireFreshTable(String schema, String table) {
+        return metastore.tableFresh(schema, table).orElseThrow(() ->
                 new IllegalArgumentException("Hive 表不存在: " + catalogName + "." + schema + "." + table));
     }
 

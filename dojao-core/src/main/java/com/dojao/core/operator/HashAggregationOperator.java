@@ -56,6 +56,8 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
         String args = spec.inputColumn() == null ? "*" : spec.inputColumn();
         if (spec.isCollectMap()) {
             args += ", " + spec.valueColumn() + (spec.mapAppend() ? ", TRUE" : "");
+        } else if (spec.isOrderedList()) {
+            args += ", " + spec.valueColumn() + (spec.mapAppend() ? ", DESC" : "");
         }
         return fn + "(" + args + ") AS " + spec.outputColumn();
     }
@@ -1051,7 +1053,8 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
         AggregationSpec spec = aggregations.get(run.specIndex());
         AggregateFunction<Object> fn = (AggregateFunction<Object>) spec.aggregate();
         Object state = mergedStates[run.specIndex()];
-        if (spec.isCollectMap()) {
+        if (spec.isCollectMap() || spec.isOrderedList()) {
+            // 双值列流：[key..., value, 第二值]（collect_map 的 mapValue / 有序列表的排序键）
             while (run.valid() && keysEqual(run.key(), key)) {
                 fn.accumulate(state, new Object[]{run.value(), run.value2()});
                 run.advance();
@@ -1558,7 +1561,8 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
         private int rowCount;
         private final int specIndex;
         private final int valueCol;
-        private final boolean mapMode;
+        /** 双值列流（collect_map / collect_ordered_list）：第二值在 valueCol + 1。 */
+        private final boolean dualValueMode;
         private Object key;
         private Object value;
         private Object value2;
@@ -1571,7 +1575,8 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
             this.reader = SpillCompression.reader(channel, allocator);
             this.blocks = reader.getRecordBlocks();
             this.valueCol = keyColumns.size();
-            this.mapMode = HashAggregationOperator.this.aggregations.get(specIndex).isCollectMap();
+            AggregationSpec spec = HashAggregationOperator.this.aggregations.get(specIndex);
+            this.dualValueMode = spec.isCollectMap() || spec.isOrderedList();
             if (loadNextBlock()) positionAtCurrentRow();
             else valid = false;
         }
@@ -1595,7 +1600,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
             key = buildKeyFromSpill(root, row);
             FieldVector v = root.getVector(valueCol);
             value = v.isNull(row) ? null : v.getObject(row);
-            if (mapMode) {
+            if (dualValueMode) {
                 FieldVector v2 = root.getVector(valueCol + 1);
                 value2 = v2.isNull(row) ? null : v2.getObject(row);
             }

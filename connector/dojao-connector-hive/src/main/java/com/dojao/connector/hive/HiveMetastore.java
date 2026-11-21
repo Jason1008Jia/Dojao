@@ -45,7 +45,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * catalog 类型标识，以及 ACID 读快照的取法 —— 见 {@link #validWriteIds}（Hive3）与
  * {@link #validTxns}（Hive2）。</p>
  *
- * <p>惰性连接：首个探查请求才握手；表元数据按 {@code db.table} 缓存（表结构在查询期内不变）。</p>
+ * <p>惰性连接：首个探查请求才握手；表元数据按 {@code db.table} 缓存（读路径短 TTL，
+ * 写 / DDL 路径回源 HMS —— 见 {@link #tableFresh}）。</p>
  *
  * <p><b>线程安全</b>：{@link HiveMetaStoreClient} 不是线程安全的（单 socket + 无同步），而一个
  * 连接器实例会被多个扫描线程并发使用（并行切片各调 {@code openSplit} → {@code table(..)} 探表）。
@@ -67,7 +68,19 @@ public class HiveMetastore implements AutoCloseable {
     /** catalog 的 Hadoop 访问身份（{@code hadoop.user.name}）；null = 用进程默认 UGI。 */
     private final String user;
 
-    private final Map<String, HiveTableMeta> tableCache = new ConcurrentHashMap<>();
+    /**
+     * 表元数据缓存（{@code db.table} → 快照 + 抓取时刻）—— <b>必须带 TTL</b>：连接器实例是
+     * <b>进程级</b>的（Worker 启动时注册、跨查询复用；Master 与 Worker 各有独立缓存），外部或在
+     * 另一进程里 DROP / CREATE 表都没有通知渠道。没有 TTL 时一次旧快照会跟随进程到退出：CTAS 在
+     * Master 侧按新列建表，Worker 仍拿旧列校验写入页（「写入页缺少 Hive 数据列」）。
+     * 正确性关键路径（写会话建立 / DDL）另由 {@link #tableFresh} 强制回源。
+     */
+    private final Map<String, CachedTable> tableCache = new ConcurrentHashMap<>();
+
+    /** 读路径快照有效期：只限制「外部 DDL 后的可见延迟」，不参与写 / DDL 的正确性保证。 */
+    private static final long TABLE_CACHE_TTL_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(60);
+
+    private record CachedTable(HiveTableMeta meta, long fetchedNanos) { }
 
     private volatile HiveMetaStoreClient client;
 
@@ -190,28 +203,51 @@ public class HiveMetastore implements AutoCloseable {
 
     // ==================== 表元数据 ====================
 
-    /** 表元数据（含缓存）。表不存在返回 empty。 */
+    /** 表元数据（读路径，TTL 内复用快照）。表不存在返回 empty。 */
     public synchronized Optional<HiveTableMeta> table(String database, String table) {
         String key = database + "." + table;
-        HiveTableMeta cached = tableCache.get(key);
-        if (cached != null) return Optional.of(cached);
+        CachedTable cached = tableCache.get(key);
+        if (cached != null && System.nanoTime() - cached.fetchedNanos() < TABLE_CACHE_TTL_NANOS) {
+            return Optional.of(cached.meta());
+        }
+        return loadTable(database, table, key);
+    }
 
+    /**
+     * 跳过缓存直接回源 HMS，并把结果回写缓存 —— <b>写 / DDL 路径专用</b>（建表、删表、写会话建立）。
+     * 这些操作必须看到当前真实的表结构：旧快照会让写入按旧列校验页（缺列报错）或用旧 location
+     * 落文件 / 搬分区。
+     */
+    public synchronized Optional<HiveTableMeta> tableFresh(String database, String table) {
+        return loadTable(database, table, database + "." + table);
+    }
+
+    private Optional<HiveTableMeta> loadTable(String database, String table, String key) {
         Table t;
         try {
             t = client().getTable(database, table);
         } catch (NoSuchElementException e) {
+            tableCache.remove(key);
             return Optional.empty();
         } catch (Exception e) {
-            if (isNotFound(e)) return Optional.empty();
+            if (isNotFound(e)) {
+                tableCache.remove(key);
+                return Optional.empty();
+            }
             throw new RuntimeException("探查 Hive 表失败: " + key + ": " + rootCause(e), e);
         }
         HiveTableMeta meta = translate(database, table, t);
-        tableCache.put(key, meta);
+        tableCache.put(key, new CachedTable(meta, System.nanoTime()));
         return Optional.of(meta);
     }
 
     public boolean tableExists(String database, String table) {
         return table(database, table).isPresent();
+    }
+
+    /** 失效单表缓存（本进程内 DDL 后调用；跨进程靠 TTL / 写路径回源兜底）。 */
+    public synchronized void invalidateTable(String database, String table) {
+        tableCache.remove(database + "." + table);
     }
 
     /** 清空表元数据缓存（Hive 侧 DDL 变更后由调用方手动触发）。 */

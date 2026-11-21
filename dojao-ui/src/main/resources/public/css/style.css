@@ -1209,7 +1209,8 @@ textarea:focus, textarea:focus-visible,
 }
 .app-toast.show { opacity: 1; transform: translate(-50%, 0); }
 
-.home-main { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; }
+/* 工作区外距收窄：原来 24px，编辑器与顶部 header / 左侧 catalog 树之间的沟槽太大 */
+.home-main { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; }
 
 /* 编辑器外框：左上角工具条 + 编辑器本体 */
 .sql-editor-wrap {

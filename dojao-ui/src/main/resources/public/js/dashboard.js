@@ -3994,6 +3994,10 @@ function bindSqlEditor() {
         } else if (k === 'y' || (k === 'z' && e.shiftKey)) {
             e.preventDefault();
             if (idx < stack.length - 1) applyAt(idx + 1);
+        } else if (k === 'd' && !e.shiftKey) {
+            // Ctrl+D：复制光标所在行（VS Code 的 Duplicate Line）；浏览器默认是「加书签」，必须拦
+            e.preventDefault();
+            duplicateSqlLine(input);
         }
     });
 
@@ -4099,6 +4103,35 @@ function replaceSqlSelection(input, text) {
     var s = input.selectionStart, e = input.selectionEnd;
     input.value = input.value.slice(0, s) + text + input.value.slice(e);
     var pos = s + text.length;
+    input.setSelectionRange(pos, pos);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+/**
+ * Ctrl+D：复制光标所在行（VS Code 的 Duplicate Line）。
+ *
+ * <p>无选区：取光标所在整行（不含换行符），在行尾换行前插入「换行 + 同一行」，
+ * 光标跟随到复制出的新行、保持原列偏移；末行没有尾随换行时同样以「换行 + 行」追加。
+ * 有选区：复制选区文本插到选区之后，新副本保持选中。派发 input 事件让撤销栈 / 高亮 / 脏态生效。</p>
+ */
+function duplicateSqlLine(input) {
+    var text = input.value || '';
+    var s = input.selectionStart, e = input.selectionEnd;
+    if (s !== e) {
+        var sel = text.slice(s, e);
+        input.value = text.slice(0, e) + sel + text.slice(e);
+        input.setSelectionRange(e, e + sel.length);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        return;
+    }
+    // s === 0 时 lastIndexOf 的 fromIndex 为负会被当成 0，误把首字符的换行算成上行结尾
+    var lineStart = s === 0 ? 0 : text.lastIndexOf('\n', s - 1) + 1;
+    var nl = text.indexOf('\n', s);
+    var lineEnd = nl === -1 ? text.length : nl;
+    var line = text.slice(lineStart, lineEnd);
+    var insertAt = lineEnd;
+    input.value = text.slice(0, insertAt) + '\n' + line + text.slice(insertAt);
+    var pos = insertAt + 1 + (s - lineStart);
     input.setSelectionRange(pos, pos);
     input.dispatchEvent(new Event('input', { bubbles: true }));
 }

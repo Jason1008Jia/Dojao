@@ -93,6 +93,8 @@ final class HiveWriteSession implements AutoCloseable {
     private final boolean moveOnClose;
     /** 复合类型按原生嵌套结构写（{@code catalog.hive.nested.mode=native}）还是按文本写。 */
     private final boolean nestedNative;
+    /** 新建目录 / 文件的 HDFS 权限（默认对齐 Hive umask 0002，catalog 属性可覆盖）。 */
+    private final HiveWritePermissions permissions;
 
     /** 目标表是否 ACID 事务表（写侧走 delta 目录 + 事务提交）。 */
     private final boolean acid;
@@ -135,6 +137,13 @@ final class HiveWriteSession implements AutoCloseable {
 
     HiveWriteSession(Configuration conf, FileSystem fs, HiveTableMeta meta, HiveMetastore metastore,
                      String tempDirLocation, boolean moveOnClose, boolean nestedNative) {
+        this(conf, fs, meta, metastore, tempDirLocation, moveOnClose, nestedNative,
+                HiveWritePermissions.DEFAULTS);
+    }
+
+    HiveWriteSession(Configuration conf, FileSystem fs, HiveTableMeta meta, HiveMetastore metastore,
+                     String tempDirLocation, boolean moveOnClose, boolean nestedNative,
+                     HiveWritePermissions permissions) {
         this.conf = conf;
         this.fs = fs;
         this.meta = meta;
@@ -142,6 +151,7 @@ final class HiveWriteSession implements AutoCloseable {
         this.tempDir = new Path(tempDirLocation);
         this.moveOnClose = moveOnClose;
         this.nestedNative = nestedNative;
+        this.permissions = permissions;
         this.acid = meta.transactional();
         this.insertOnly = meta.insertOnly();
         this.dataColumnNames = new ArrayList<>();
@@ -272,7 +282,7 @@ final class HiveWriteSession implements AutoCloseable {
             // 事务表：文件必须落在 delta_<id>_<id>_0000/ 下，收尾统一 mv + 提交事务
             ensureTxn();
             Path dir = new Path(root, deltaDirName);
-            fs.mkdirs(dir);
+            permissions.mkdirs(fs, dir);
             writeAcidVersionFile(dir);
             int copy = fileCopies.merge(group.key(), 1, Integer::sum) - 1;
             String name = group.bucketId() >= 0
@@ -287,7 +297,7 @@ final class HiveWriteSession implements AutoCloseable {
         }
 
         Path dir = root;
-        fs.mkdirs(dir);
+        permissions.mkdirs(fs, dir);
         String suffix = format.fileSuffix();
         String name = group.bucketId() >= 0
                 ? String.format("%06d", group.bucketId()) + "_" + fileToken + "_" + (fileSeq++) + suffix
@@ -345,6 +355,8 @@ final class HiveWriteSession implements AutoCloseable {
         for (ArrowFileWriter w : writers.values()) closeQuietly(w);
         writers.clear();
         try {
+            // rename 不改权限：文件必须在搬进表目录之前落上目标权限，否则 Hive 读侧访问不了
+            permissions.applyFilePerms(fs, tempDir);
             if (!moveOnClose) {                 // OVERWRITE：留给 commitOverwrite
                 if (acid) abortAcid();
                 return;
@@ -458,7 +470,7 @@ final class HiveWriteSession implements AutoCloseable {
      */
     private void commitAcid() throws IOException {
         Path target = new Path(meta.location());
-        fs.mkdirs(target);
+        permissions.mkdirs(fs, target);
         if (!meta.partitioned()) {
             moveDeltaDirs(tempDir, target);
         } else {
@@ -467,7 +479,7 @@ final class HiveWriteSession implements AutoCloseable {
                 for (FileStatus s : sub) {
                     if (!s.isDirectory()) continue;
                     Path dest = new Path(target, s.getPath().getName());
-                    fs.mkdirs(dest);
+                    permissions.mkdirs(fs, dest);
                     moveDeltaDirs(s.getPath(), dest);
                     registerPartition(s.getPath().getName(), dest);
                 }
@@ -515,7 +527,7 @@ final class HiveWriteSession implements AutoCloseable {
      */
     void moveIntoPlace() throws IOException {
         Path target = new Path(meta.location());
-        fs.mkdirs(target);
+        permissions.mkdirs(fs, target);
         if (!meta.partitioned()) {
             moveFilesInDir(tempDir, target);
             fs.delete(tempDir, true);
@@ -526,7 +538,7 @@ final class HiveWriteSession implements AutoCloseable {
             if (!s.isDirectory()) continue;
             String dirName = s.getPath().getName();
             Path dest = new Path(target, dirName);
-            fs.mkdirs(dest);
+            permissions.mkdirs(fs, dest);
             moveFilesInDir(s.getPath(), dest);
             registerPartition(dirName, dest);
         }

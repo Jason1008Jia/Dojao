@@ -47,7 +47,7 @@ import java.util.concurrent.atomic.AtomicLong;
  *   doClose（final）：反向取消所有片段任务，排空队列释放页，closeProbes() 释放探针连接器
  * </pre>
  *
- * <p>结果队列有界 → 回传即背压 → 消费慢时 Worker 侧算子阻塞 → 分区队列 → 发送端逐级阻塞。</p>
+ * <p>结果队列页数 + 字节双上界 → 回传即背压 → 消费慢时 Worker 侧算子阻塞 → 分区队列 → 发送端逐级阻塞。</p>
  *
  * @author jiaxin
  * @version 3.0
@@ -79,8 +79,15 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
     protected final WorkerGateway gateway;
     protected final List<WorkerRegistration> workers;
 
-    /** Worker 回传的<b>数据页</b>队列（有界：回传即背压）。 */
-    protected final BlockingQueue<FragmentEvent> resultQueue = new LinkedBlockingQueue<>(RESULT_QUEUE_CAPACITY);
+    /**
+     * Worker 回传的<b>数据页</b>队列（页数 + 字节双上界，回传即背压）。
+     *
+     * <p>只限页数不够：窗口 / join 的输出页随数据宽度可达几十 MB，32 页足以吃穿 Master 的
+     * Arrow 预算（线上 {@code row_number()} 派生表整表回传：接收线程分配 2MB 时已占 1.1GB）。
+     * 字节预算与扫描回传同口径（{@link ByteBoundedQueue#defaultBudgetBytes()}）。</p>
+     */
+    protected final BlockingQueue<FragmentEvent> resultQueue =
+            new FragmentEventQueue(RESULT_QUEUE_CAPACITY, ByteBoundedQueue.defaultBudgetBytes());
     /**
      * Worker 回传的<b>控制事件</b>队列（FINISHED / FAILED / PROGRESS，无界）。
      *
@@ -111,6 +118,9 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
     /** join 之上的行级谓词（可空，join → Filter → 外层聚合下沉）：非 null → 终端 join 片段
      *  在本地 join 之后先过滤再聚合。 */
     protected volatile String terminalJoinFilter;
+    /** 终端<b>二次 shuffle 聚合</b>（可空，外层聚合不可 partial 合并 / 非协分区时由 Planner 设置）：
+     *  非 null → 载体终端输出按分组键重哈希到每分区终态聚合，Master 只收最终组行。 */
+    protected volatile FragmentSpec.AggregateStep terminalReshuffleAggregate;
     /** 分布式写总行数：各分区 FragmentFinished.rowCount 求和（响应 rows_inserted）。 */
     protected final AtomicLong totalOutputRows = new AtomicLong();
     /** 片段任务跟踪：taskId → 运行态（监控用；生命周期 RUNNING → FINISHED / FAILED）。 */
@@ -516,7 +526,8 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
         }
         if (aggregateName != null && (aggregateName.equalsIgnoreCase("collect_list")
                 || aggregateName.equalsIgnoreCase("collect_set")
-                || aggregateName.equalsIgnoreCase("array_agg"))) {
+                || aggregateName.equalsIgnoreCase("array_agg")
+                || aggregateName.equalsIgnoreCase("collect_ordered_list"))) {
             return new ArrowType.List();
         }
         boolean bigint = aggregateName != null
@@ -556,7 +567,8 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
         Field input = (wire == null || inputColumn == null) ? null : fieldOf(wire, inputColumn);
         if (aggregateName != null && (aggregateName.equalsIgnoreCase("collect_list")
                 || aggregateName.equalsIgnoreCase("collect_set")
-                || aggregateName.equalsIgnoreCase("array_agg"))) {
+                || aggregateName.equalsIgnoreCase("array_agg")
+                || aggregateName.equalsIgnoreCase("collect_ordered_list"))) {
             // 嵌套输出必须带子字段（元素类型来自输入列）
             Field child = input != null
                     ? new Field("item", input.getFieldType(), input.getChildren())
@@ -673,6 +685,36 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
     /** 已设置的终端 join 过滤（可空；审计 / EXPLAIN 只读）。 */
     public String terminalJoinFilter() {
         return terminalJoinFilter;
+    }
+
+    /**
+     * 设置终端<b>二次 shuffle 聚合尾</b>：载体终端结果不再直接回传 Master，而是按 GROUP BY 键
+     * 重哈希进一个每分区独立的聚合交换，由每分区一个 {@code AggregateConsumer} 做<b>终态</b>
+     * 聚合后回传 —— 每个分组整组落在唯一分区，本地聚合即最终结果，Master 零合并。
+     *
+     * <p>与 {@link #setTerminalPartialAggregate}（partial + Master 合并）的区别：这里每分区算的是
+     * <b>完整聚合</b>，因此对 {@code collect_ordered_list} / {@code collect_map} / {@code avg} /
+     * {@code count(distinct)} 等<b>不可 partial 合并</b>的聚合也成立。代价是终端输出多付一次 shuffle
+     * （但仍全程留在 Worker，不会把明细行搬回 Master 单机）。</p>
+     *
+     * <p>载体须覆写 {@link #supportsReshuffleAggregate()} 并在 {@code dispatchStage} 里落实该尾段。</p>
+     */
+    public void setTerminalReshuffleAggregate(FragmentSpec.AggregateStep step) {
+        this.terminalReshuffleAggregate = step;
+    }
+
+    /** 已设置的终端二次 shuffle 聚合（可空；审计 / EXPLAIN 只读）。 */
+    public FragmentSpec.AggregateStep terminalReshuffleAggregate() {
+        return terminalReshuffleAggregate;
+    }
+
+    /**
+     * 本载体是否支持在终端结果之上追加二次 shuffle 聚合尾
+     * （{@link #setTerminalReshuffleAggregate}）。默认 false —— 未知载体一律不挂，
+     * Planner 回退 Master 单机聚合（正确优先）。
+     */
+    public boolean supportsReshuffleAggregate() {
+        return false;
     }
 
     /**

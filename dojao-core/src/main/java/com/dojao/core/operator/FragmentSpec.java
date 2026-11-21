@@ -364,7 +364,9 @@ public sealed interface FragmentSpec
     /**
      * 聚合函数的传输 DTO —— 用 {@code aggregateName} 替代运行期聚合函数实例（FragmentSpec 不得引用运行期算子）。
      *
-     * <p>{@code valueColumn} / {@code mapAppend} 只对 {@code collect_map}（key, value 双输入）有意义。</p>
+     * <p>{@code valueColumn} / {@code mapAppend} 只对双输入聚合有意义：{@code collect_map}
+     * （key + value，{@code mapAppend} = 同 key 追加）与 {@code collect_ordered_list}
+     * （值 + 排序列，{@code mapAppend} = 降序）。</p>
      */
     record AggregationDto(String inputColumn, String outputColumn, String aggregateName,
                           List<String> collectInputColumns, String valueColumn, boolean mapAppend) {

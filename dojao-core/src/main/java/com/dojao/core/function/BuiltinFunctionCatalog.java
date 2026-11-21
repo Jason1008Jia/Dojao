@@ -64,7 +64,8 @@ public final class BuiltinFunctionCatalog {
     private static final List<String> AGGREGATES = List.of(
             "count", "count_distinct", "sum", "avg", "min", "max",
             "count_if", "sum_if", "max_if", "min_if",
-            "collect_list", "collect_set", "array_agg", "collect_map", "map_agg");
+            "collect_list", "collect_set", "array_agg", "collect_map", "map_agg",
+            "collect_ordered_list");
 
     private BuiltinFunctionCatalog() {
     }

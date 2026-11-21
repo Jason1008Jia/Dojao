@@ -33,6 +33,10 @@ import java.util.Map;
  * <p>逐行按分隔符切分（支持单字符转义），按目标列类型做解析；解析失败或 {@code \N} 记为 NULL。
  * 行内字段少于列数 → 补 NULL；多于列数 → 忽略多余字段。</p>
  *
+ * <p><b>分批口径</b>：行数（{@code batchSize}）与字节（{@link #DEFAULT_MAX_BATCH_BYTES}）双上界，
+ * 先到先收批 —— 宽行表（如 ES 落地的 JSON 全量串）只按行数分批会产出几百 MB 的页，回传链路
+ * 同时持有源页 / 流根拷贝 / Master 入站缓冲 / copyPage 拷贝，几页即吃穿分配器。</p>
+ *
  * @author jiaxin
  * @version 1.0
  * @date 2026/9/19
@@ -45,8 +49,18 @@ public class TextFileArrowConverter implements AutoCloseable {
     public static final char DEFAULT_DELIMITER = '\001';
     /** Hive 默认转义符。 */
     public static final char DEFAULT_ESCAPE = '\\';
+    /**
+     * 单批<b>字节</b>上界（默认 32MB，与 {@code JdbcArrowConverter#DEFAULT_MAX_BATCH_BYTES} 同口径）：
+     * 只按行数分批时，宽行（大 JSON / 长文本）会出现「10000 行一批 = 几百 MB 的 Arrow 页」——
+     * 页在回传链路上至少被复制两次（Worker 流根、Master 入站 + {@code copyPage}），
+     * 几页就能把分配器吃穿（线上 {@code staging_es_to_skb_info} 的 {@code raw_json_data} 即此形态）。
+     * 行数到顶或字节到顶都收批 —— 页小一点只多几次网络往返，爆内存则查询直接失败。
+     */
+    public static final long DEFAULT_MAX_BATCH_BYTES = 32L * 1024 * 1024;
+
     private final BufferAllocator allocator;
     private final int batchSize;
+    private final long maxBatchBytes;
     private final Schema arrowSchema;
     private final char delimiter;
     private final char escape;
@@ -64,8 +78,17 @@ public class TextFileArrowConverter implements AutoCloseable {
     public TextFileArrowConverter(BufferAllocator allocator, Path path, FileSystem fs,
                                   Schema arrowSchema, char delimiter, char escape,
                                   String nullString, int batchSize) throws IOException {
+        this(allocator, path, fs, arrowSchema, delimiter, escape, nullString, batchSize,
+                DEFAULT_MAX_BATCH_BYTES);
+    }
+
+    public TextFileArrowConverter(BufferAllocator allocator, Path path, FileSystem fs,
+                                  Schema arrowSchema, char delimiter, char escape,
+                                  String nullString, int batchSize, long maxBatchBytes)
+            throws IOException {
         this.allocator = allocator;
         this.batchSize = batchSize;
+        this.maxBatchBytes = maxBatchBytes > 0 ? maxBatchBytes : DEFAULT_MAX_BATCH_BYTES;
         this.arrowSchema = arrowSchema;
         this.delimiter = delimiter;
         this.escape = escape;
@@ -149,6 +172,8 @@ public class TextFileArrowConverter implements AutoCloseable {
         private int pos;
         private int limit;
         private boolean eof;
+        /** 上一行在文件里的 UTF-8 字节数（含行尾）—— 供 {@link #convertNextBatch} 的字节上界计数。 */
+        private long lastLineBytes;
 
         LineReader(InputStream in, int bufferBytes) {
             this.in = in;
@@ -168,6 +193,7 @@ public class TextFileArrowConverter implements AutoCloseable {
                         continue;
                     }
                     String line = new String(buf, start, i - start, StandardCharsets.UTF_8);
+                    int consumed = i - start + 1;
                     pos = i + 1;
                     if (b == '\r') {
                         // CRLF 时吃掉紧跟的 '\n'（可能落在下一次读块的第一个字节）
@@ -176,18 +202,26 @@ public class TextFileArrowConverter implements AutoCloseable {
                         }
                         if (pos < limit && buf[pos] == '\n') {
                             pos++;
+                            consumed++;
                         }
                     }
+                    lastLineBytes = consumed;
                     return line;
                 }
                 // 本块内没有行尾 → 把这段行首挪到 0、必要时扩容，再读更多字节
                 pos = start;
                 if (!fill()) {
                     String last = new String(buf, 0, limit, StandardCharsets.UTF_8);
+                    lastLineBytes = limit;
                     pos = limit;
                     return last;
                 }
             }
+        }
+
+        /** 上一行读入的字节数（含行尾；末行无行尾 = 行内容字节数）。 */
+        long lastLineBytes() {
+            return lastLineBytes;
         }
 
         /** 把 {@code [pos, limit)} 挪到 0 并至少读到一个新字节；EOF 返回 false。 */
@@ -254,10 +288,13 @@ public class TextFileArrowConverter implements AutoCloseable {
 
         List<FieldVector> vectors = createVectors(arrowSchema);
         int rowCount = 0;
+        long bytes = 0L;
         String line;
         while (rowCount < batchSize && (line = reader.readLine()) != null) {
+            bytes += reader.lastLineBytes();
             fillRow(vectors, line, rowCount);
             rowCount++;
+            if (bytes >= maxBatchBytes) break;   // 行数到顶或字节到顶都收批
         }
         if (rowCount == 0) {
             exhausted = true;
@@ -435,6 +472,7 @@ public class TextFileArrowConverter implements AutoCloseable {
 
     public Schema getArrowSchema() { return arrowSchema; }
     public int getBatchSize() { return batchSize; }
+    public long getMaxBatchBytes() { return maxBatchBytes; }
 
     @Override
     public void close() throws IOException {

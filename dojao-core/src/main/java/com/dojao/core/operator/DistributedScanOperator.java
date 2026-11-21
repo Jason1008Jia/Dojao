@@ -15,7 +15,6 @@ import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -118,17 +117,16 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
     private volatile boolean skipDispatch;
 
     /**
-     * Worker 回传事件队列（有界即背压，容量 {@value #EVENT_QUEUE_CAPACITY}）。
+     * Worker 回传事件队列（{@link ScanEventQueue}：<b>页数 + 字节</b>双上界，有界即背压）。
      *
-     * <p>容量按「页」计，而单页最多约 1 万行 × 行宽 —— 旧值 2000 相当于允许把数 GB 结果缓存在
-     * Master 堆外，且 Flight 接收路径不经过 {@code NodeMemory.throttle()}，多窗口分组/单机回退
-     * 这类「全部数据回 Master」的查询会直接把传输层额度吃穿（线上表现为 Flight 线程抛
-     * {@code OutOfMemoryError: Cannot reserve ... direct buffer memory}）。64 页在保持流水线
-     * 深度的同时，把 Master 端滞留量限制在可预期范围；队列满时接收线程阻塞 ⇒ Worker 的
-     * {@code putNext} 随之阻塞，形成端到端背压。</p>
+     * <p>只按「页」计不够：单页字节随行宽相差两个数量级，宽行走 TEXT/JDBC 路径一页可达几十 MB，
+     * 64 页足以吃穿 Master 的 Arrow 预算（线上 {@code staging_es_to_skb_info} 宽 JSON 扫描：
+     * 分配 32MB 时已占 1.1GB）。字节预算取节点 Arrow 预算的 1/4，队列满时接收线程阻塞 ⇒
+     * Worker 的 {@code putNext} 随之阻塞，形成端到端背压。</p>
      */
     private static final int EVENT_QUEUE_CAPACITY = 64;
-    private final BlockingQueue<ScanEvent> eventQueue = new LinkedBlockingQueue<>(EVENT_QUEUE_CAPACITY);
+    private final BlockingQueue<ScanEvent> eventQueue =
+            new ScanEventQueue(EVENT_QUEUE_CAPACITY, ByteBoundedQueue.defaultBudgetBytes());
     /** 控制面：taskId → 分区任务跟踪记录。 */
     private final ConcurrentHashMap<String, ScanTask> taskTracker = new ConcurrentHashMap<>();
     /** 已确认完成（ScanFinished）的分区计数，到齐 totalPartitions 则 EOF。 */
@@ -238,6 +236,11 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
     /** 设置分片侧投影（null = 不投影，扫描页原样处理）。 */
     public void setProjection(FragmentSpec.ScanProjection p) {
         this.projection = p;
+    }
+
+    /** 当前分片侧投影（null = 无）；查询路径的投影下推据此避免重复折叠。 */
+    public FragmentSpec.ScanProjection projection() {
+        return projection;
     }
 
     /** 设置写目标（null = 数据页回传 Master；非空 = 分片就地写、只回传行数）。 */

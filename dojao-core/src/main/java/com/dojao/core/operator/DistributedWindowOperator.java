@@ -93,6 +93,11 @@ public class DistributedWindowOperator extends AbstractDistributedOperator
     @Override
     protected Page finalizeResultPage(Page page) {
         if (page == null || page.isEOF() || page.getRoot() == null) return page;
+        // 聚合尾（二次 shuffle / partial 下沉）：回传页是<b>聚合输出</b>（分组键 + 聚合列），
+        // 不是窗口输出 —— 按窗口列裁剪会把聚合列全部裁掉（只剩同名的分组键列），直接走基类。
+        if (terminalReshuffleAggregate != null || terminalPartialAggregate != null) {
+            return super.finalizeResultPage(page);
+        }
         List<String> want = emittedColumns();
         // 已同宽同名 → 直接走基类（归一分区号，见 AbstractDistributedOperator#finalizeResultPage）
         List<String> have = new ArrayList<>();
@@ -200,8 +205,11 @@ public class DistributedWindowOperator extends AbstractDistributedOperator
             if (p == null || p.isBlank()) continue;
             effective = probe.pushdownPredicate(effective, p);
         }
-        StageScheduler.DistributedStage stage = StageScheduler.planWindowChain(
-                queryId, workers, numPartitions, effective, windowSteps, probe);
+        FragmentSpec.AggregateStep reshuffle = terminalReshuffleAggregate;
+        StageScheduler.DistributedStage stage = reshuffle == null
+                ? StageScheduler.planWindowChain(queryId, workers, numPartitions, effective, windowSteps, probe)
+                : StageScheduler.planWindowChain(queryId, workers, numPartitions, effective, windowSteps, probe,
+                        reshuffle, null);
 
         // 先 Consumer（同步注册接收端）后 Producer（发送端）—— 发送方 push 前所有接收端就绪
         List<FragmentSpec> consumers = withTerminal(stage.consumers());   // 分布式写 SinkStep + top-N 截断尾
@@ -223,6 +231,12 @@ public class DistributedWindowOperator extends AbstractDistributedOperator
         try { probe.closeRead(); } catch (Throwable ignored) { }
     }
 
+    /** 本算子是否支持在窗口输出之上追加二次 shuffle 聚合尾（见基类同名方法）。 */
+    @Override
+    public boolean supportsReshuffleAggregate() {
+        return true;
+    }
+
     @Override
     public List<Field> outputFields() {
         // CTAS 建表 schema = 窗口输出页 schema（WindowFunctionOperator.buildOutputSchema 复刻）：
@@ -233,7 +247,20 @@ public class DistributedWindowOperator extends AbstractDistributedOperator
         List<Field> input = scanFields(probe, baseRequest.catalog(), baseRequest.schema(),
                 baseRequest.table(), base);
         // 多组链 + K 形状投影吸收：逐步按声明输出列重定基再追加函数列（见基类 helper）。
-        return windowChainOutputFields(input, windowSteps);
+        List<Field> windowOut = windowChainOutputFields(input, windowSteps);
+        FragmentSpec.AggregateStep agg = terminalReshuffleAggregate;
+        if (agg == null) {
+            return windowOut;
+        }
+        // 二次 shuffle 聚合尾：终端输出页 = 分组键（窗口输出里按名取）+ 聚合结果列
+        //（CASE 派生列先并入输入侧，与 Worker 侧 CaseProjectOperator 追加列同口径）。
+        List<Field> aggInput = withDerivedFields(windowOut, agg.caseProjections());
+        List<Field> out = new ArrayList<>(agg.keyColumns().size() + agg.aggregations().size());
+        out.addAll(fieldsByNames(aggInput, agg.keyColumns()));
+        for (FragmentSpec.AggregationDto dto : agg.aggregations()) {
+            out.add(dtoAggregationField(dto, aggInput));
+        }
+        return out;
     }
 
     /** 多窗口分组链（长度 1 = 单组，与旧行为等价）。 */

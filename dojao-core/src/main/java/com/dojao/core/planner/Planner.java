@@ -242,6 +242,8 @@ public final class Planner {
         // 递归列裁剪：从结果列反推上游需求，全树插入 Project + 扫描推下列选择（只顶层调用一次）
         if (!skipColumnPruning) {
             root = optimizeColumns(root);
+            // 投影下推到扫描分片（查询路径）：列裁剪之后再折叠，见 pushdownScanProjection 说明
+            root = pushdownScanProjection(root);
         }
         // 顶层 ORDER BY / LIMIT / OFFSET：裁剪后按最终输出列解析键并包全局 Sort + Limit
         if (orderSource instanceof LogicalPlan.Select sel) {
@@ -1710,6 +1712,123 @@ public final class Planner {
                 scan, innerRoot.outputColumns(), innerRoot);
     }
 
+    // ==================== 查询路径：投影下推到扫描分片 ====================
+
+    /**
+     * 把「{@code Project / ScalarProject} 直接挂在 {@link DistributedScanOperator} 上」折叠成<b>分片侧
+     * 投影</b>（与 scan-sink 共用 {@link FragmentSpec.ScanProjection} + Worker 端
+     * {@code WorkerControlProducer#applyProjection}）：各 Worker 扫完自己那段数据就地求值
+     * {@code get_json_object} 这类重表达式，Master 只收投影后的窄列。
+     *
+     * <p><b>为什么必须做</b>：宽行表（TEXT 里一整行几十 KB JSON）上把投影留在 Master，等于 Worker
+     * 回传<b>全宽原始行</b>，Master 的 Arrow 预算被「Flight 入站 body + copyPage 拷贝 + Project 输出」
+     * 逐页叠加吃穿而 OOM（线上 {@code staging_es_to_skb_info} 事故）。下推后回传字节只与投影列宽相关，
+     * 重表达式还顺带按分区并行。</p>
+     *
+     * <p><b>为什么放在列裁剪之后</b>：{@link #optimizeColumns} 按「扫描节点输出列 = 源表列」建模，
+     * 用它把 {@code selectedColumns} 收窄到投影真正引用的源列；若在裁剪前就把投影挂到扫描上，扫描
+     * 节点的输出列会变成派生列（{@code second_industry}），列裁剪再按列名回推就会把源表里不存在的
+     * 名字写进 {@code selectedColumns}，Worker 侧直接「列不存在」。所以这里只做「换执行位置」，
+     * 不动列集合。</p>
+     *
+     * <p><b>语义等价性</b>：Worker 端用的是<b>同一个</b> {@code ScalarProjectOperator /
+     * ProjectOperator}（表达式、输出列序、计算列集合逐字相同），逐行求值语义不变，唯一差别是求值
+     * 进程从 Master 换成数据所在的分片。</p>
+     */
+    private PhysicalNode pushdownScanProjection(PhysicalNode node) {
+        // 先在当前节点尝试折叠（含「穿过中间裁剪 Project」的链式折叠）；命中的话整条链就地变成
+        // 扫描算子，直接返回（无需再下探子节点）。
+        PhysicalNode fused = fuseScanProjection(node);
+        if (fused != node) return fused;
+
+        List<PhysicalNode> children = node.children();
+        if (children.isEmpty()) return node;
+        List<PhysicalNode> rewritten = new ArrayList<>(children.size());
+        boolean changed = false;
+        for (PhysicalNode child : children) {
+            PhysicalNode r = pushdownScanProjection(child);
+            rewritten.add(r);
+            if (r != child) changed = true;
+        }
+        if (!changed) return node;
+        // 子节点被折叠成扫描算子 → 父算子的上游引用要换成新算子（否则仍指向已摘除的投影）
+        fixOperatorUpstreams(node, children, rewritten);
+        return new PhysicalNode(node.name(), node.operator(), node.outputColumns(),
+                rewritten, node.estimatedRows(), node.sources());
+    }
+
+    /**
+     * 把「投影链 + 分布式扫描」折叠成扫描算子自带的 {@code projection}，返回以投影列声明输出的
+     * 扫描节点（Master 侧不再保留这些投影算子）。
+     *
+     * <p><b>投影链</b>：列裁剪会在 {@code ScalarProject} 与 {@code Scan} 之间插一层收窄列的普通
+     * {@code Project}（例如扫描为满足分区谓词多读了 {@code dt}，投影却只用 {@code [id, raw_json_data]}，
+     * 裁剪于是插入 {@code Project[id, raw_json_data]} 裁掉 {@code dt}）。这时<b>必须下推最外层那层
+     * 语义投影</b>（{@code ScalarProject[get_json_object(...)]}），而不是先下推内层普通 Project ——
+     * 否则 Worker 只做了「选列」，重表达式仍留在 Master 对着全宽 {@code raw_json_data} 求值，OOM 依旧。
+     * 这里从顶往下穿过「非改名、无 {@code *}」的普通 Project 直接找扫描，把最外层投影一次性挂上，
+     * 中间那些收窄列 Project 随之下掉（扫描的 {@code selectedColumns} 是这些中间投影的<b>超集</b>，
+     * Worker 端 {@code applyProjection} 按名取列、多出的列被忽略，语义不变）。</p>
+     *
+     * <p>以下形态<b>不</b>下推，保持原计划：</p>
+     * <ul>
+     *   <li>输出列含 {@code *}：{@code Page.select} 运行期按 root schema 展开，无法随切片下发；</li>
+     *   <li>改名投影（{@code ProjectOperator#isAliased()}）：{@link FragmentSpec.ScanProjection} 只表达
+     *       「按名取列」，改名后会退化成按裸列名取首个同名列，语义会错；</li>
+     *   <li>中间隔着 Filter / join / 改名投影等会改变行集或列名的算子；</li>
+     *   <li>该扫描已经挂了投影（避免重复折叠）；</li>
+     *   <li>纯透传（输出列 == 扫描列且无计算列）：下推零收益，不折腾计划形状。</li>
+     * </ul>
+     */
+    private PhysicalNode fuseScanProjection(PhysicalNode node) {
+        Operator top = node.operator();
+        if (top instanceof ProjectOperator p && p.isAliased()) return node;
+        if (!(top instanceof ScalarProjectOperator) && !(top instanceof ProjectOperator)) return node;
+
+        // 从顶往下穿过「非改名、无 *」的普通 Project，定位最底下的分布式扫描。
+        PhysicalNode cur = node;
+        while (true) {
+            if (cur.children().size() != 1) return node;
+            PhysicalNode child = cur.children().get(0);
+            Operator co = child.operator();
+            if (co instanceof DistributedScanOperator scan) {
+                if (scan.projection() != null) return node;
+                return fuseOntoScan(top, child);
+            }
+            if (co instanceof ProjectOperator pp && !pp.isAliased() && !pp.columns().contains("*")) {
+                cur = child;   // 继续穿过中间收窄列 Project
+                continue;
+            }
+            return node;   // 中间隔着 Filter / 改名投影 / join 等 → 不下推
+        }
+    }
+
+    /** 把最外层投影 {@code top} 挂到 {@code scanNode}，返回以投影列声明输出的扫描节点（无子节点）。 */
+    private PhysicalNode fuseOntoScan(Operator top, PhysicalNode scanNode) {
+        DistributedScanOperator scan = (DistributedScanOperator) scanNode.operator();
+        FragmentSpec.ScanProjection projection;
+        List<String> outCols;
+        if (top instanceof ScalarProjectOperator sp) {
+            outCols = sp.outputColumns();
+            List<GroupKeyExpression> exprs = sp.projections().stream()
+                    .map(p -> new GroupKeyExpression(p.outputName(), p.exprText())).toList();
+            projection = new FragmentSpec.ScanProjection(outCols,
+                    List.copyOf(sp.computedColumns()), exprs);
+        } else {
+            ProjectOperator p = (ProjectOperator) top;
+            outCols = p.columns();
+            projection = new FragmentSpec.ScanProjection(outCols, List.of(), List.of());
+        }
+        if (outCols.isEmpty() || outCols.contains("*")) return scanNode;
+        if (projection.isIdentity() && outCols.equals(scanNode.outputColumns())) return scanNode;
+        scan.setProjection(projection);
+        System.err.printf("[Planner] 投影下推到扫描分片（回传只剩窄列）: %s <- %s%n",
+                outCols, scanNode.name());
+        // 扫描节点同时承担投影：声明输出列改为投影列，Master 侧不再有这些投影算子
+        return new PhysicalNode(scanNode.name(), scan, outCols, List.of(),
+                scanNode.estimatedRows(), scanNode.sources());
+    }
+
     private LogicalPlan.Select asSelect(LogicalPlan plan) {
         if (plan instanceof LogicalPlan.Select s) return s;
         if (plan instanceof LogicalPlan.Explain e) return asSelect(e.statement());
@@ -3012,6 +3131,16 @@ public final class Planner {
                     SqlTextUtil.stripQualifier(args.get(1).trim()).toLowerCase(Locale.ROOT));
             boolean append = args.size() >= 3 && "true".equalsIgnoreCase(args.get(2).trim());
             return AggregationSpec.mapField(col, keyF, valF, append);
+        }
+        if ("collect_ordered_list".equals(fn)) {
+            // 双输入聚合：第一个参数是被收集的值列（输出元素类型来源），第二个是排序列
+            List<String> args = ScalarExpr.splitTopLevelComma(argText);
+            if (args.size() < 2) return null;
+            Field valF = baseFields.get(
+                    SqlTextUtil.stripQualifier(args.get(0).trim()).toLowerCase(Locale.ROOT));
+            if (valF == null) return null;
+            Field child = new Field("item", valF.getFieldType(), valF.getChildren());
+            return new Field(col, FieldType.nullable(new ArrowType.List()), List.of(child));
         }
         if (fn.endsWith("_if")) {
             // 条件聚合：value 是第一个顶层参数（第二参数为条件）
@@ -6598,14 +6727,17 @@ public final class Planner {
                 fn = fn.substring(0, fn.length() - 3);   // SUM_IF → SUM / MAX_IF → MAX / MIN_IF → MIN
             }
         }
-        // 双输入聚合（collect_map / map_agg）的参数是 "k, v[, flag]"，不能按单表达式解析 → 下面分支内解析
-        boolean mapAgg = "COLLECT_MAP".equals(fn) || "MAP_AGG".equals(fn);
+        // 双输入聚合（collect_map / map_agg / collect_ordered_list）的参数是 "a, b[, flag]"，
+        // 不能按单表达式解析 → 下面分支内解析
+        boolean dualInputAgg = "COLLECT_MAP".equals(fn) || "MAP_AGG".equals(fn)
+                || "COLLECT_ORDERED_LIST".equals(fn);
         // 聚合参数：裸列名直接引用；CASE 表达式改写为派生列（CaseProject 预计算后聚合）
-        String inputCol = (a.star() || mapAgg) ? null : resolveAggInput(argText, fn, upstream,
+        String inputCol = (a.star() || dualInputAgg) ? null : resolveAggInput(argText, fn, upstream,
                 caseProjections, derivedCols);
         if (distinctAgg && !"COUNT".equals(fn)
                 && !"MIN".equals(fn) && !"MAX".equals(fn)
-                && !"COLLECT_MAP".equals(fn) && !"MAP_AGG".equals(fn)) {
+                && !"COLLECT_MAP".equals(fn) && !"MAP_AGG".equals(fn)
+                && !"COLLECT_ORDERED_LIST".equals(fn)) {
             // MIN/MAX(DISTINCT) 与不带 DISTINCT 完全等价（同一组值的极值不变）⇒ 下面按普通 MIN/MAX 建规格，
             // 去重语义自然满足。SUM/AVG(DISTINCT) 需另立函数，明确报不支持，不做静默降级（降级会给出错的数）。
             // collect_map 分支内给出指向 collect_set 的提示，故在此放行。
@@ -6663,6 +6795,43 @@ public final class Planner {
                     append = "TRUE".equals(flag);
                 }
                 yield AggregationSpec.collectMap(keyCol, valueCol, outName, append);
+            }
+            // COLLECT_ORDERED_LIST：按第二参数列排序后收集第一参数列。第三参数为字面量：
+            // 缺省 = 升序；TRUE / ASC = 升序，FALSE / DESC = 降序（引号可选）。
+            case "COLLECT_ORDERED_LIST" -> {
+                if (a.star()) {
+                    throw unsupported(fn + " 需要 (value, order_key) 列参数，不支持 *");
+                }
+                if (distinctAgg) {
+                    throw unsupported(fn + "(DISTINCT ...) 不支持：需要去重请用 collect_set");
+                }
+                List<String> args = ScalarExpr.splitTopLevelComma(argText);
+                if (args.size() != 2 && args.size() != 3) {
+                    throw unsupported(fn + " 参数个数 " + args.size()
+                            + " 不对，应为 collect_ordered_list(value, order_key[, false])");
+                }
+                String valueCol = resolveAggInput(args.get(0).trim(), fn, upstream,
+                        caseProjections, derivedCols);
+                String orderCol = resolveAggInput(args.get(1).trim(), fn, upstream,
+                        caseProjections, derivedCols);
+                boolean descending = false;
+                if (args.size() == 3) {
+                    String flag = args.get(2).trim();
+                    if (flag.length() >= 2 && flag.charAt(0) == '\''
+                            && flag.charAt(flag.length() - 1) == '\'') {
+                        flag = flag.substring(1, flag.length() - 1).trim();
+                    }
+                    flag = flag.toUpperCase(Locale.ROOT);
+                    if ("TRUE".equals(flag) || "ASC".equals(flag)) {
+                        descending = false;
+                    } else if ("FALSE".equals(flag) || "DESC".equals(flag)) {
+                        descending = true;
+                    } else {
+                        throw unsupported(fn + " 第三参数必须是字面量 TRUE / FALSE / ASC / DESC："
+                                + args.get(2).trim());
+                    }
+                }
+                yield AggregationSpec.collectOrderedList(valueCol, orderCol, outName, descending);
             }
             default -> {
                 // 先查 collect-evaluate 型（CollectAggregateRegistry，框架攒值），再查增量型
@@ -7062,17 +7231,17 @@ public final class Planner {
      * 认不出「窗口链 + 列裁剪投影」形状整段回退。聚合结果按名引用窗口输出列，跳过纯列选择投影
      * 不改变语义（与 {@link #extractDistributedAggregationNode} 同口径）。</p>
      *
-     * <p><b>只下沉可合并的聚合</b>：avg（需要和+计数）、count(distinct) / collect / 自定义 UDAF
-     * 的 partial 不可合并 → 返回 null 回退（行为不变）。</p>
+     * <p><b>可合并聚合</b>（count / sum / min / max）走「每分区终态 / partial + Master 合并」；
+     * <b>不可合并聚合</b>（avg / count(distinct) / collect_list / collect_map /
+     * collect_ordered_list / 自定义 UDAF）与<b>非协分区分组键</b>改走<b>二次 shuffle 聚合尾</b>：
+     * 窗口输出按分组键重哈希，每分区一个 {@code AggregateConsumer} 做<b>完整聚合</b>（每分组整组
+     * 落唯一分区 ⇒ 终态即结果），Master 零合并（见 {@link #supportsReshuffleAggregate} 载体能力）。</p>
      */
     private PhysicalNode tryBuildAggregationOverWindowChain(PhysicalNode upstream,
                                                             List<String> keys,
                                                             List<AggregationSpec> aggs,
                                                             List<CaseProjection> caseProjections) {
         if (aggs.isEmpty()) return null;
-        // 分组键是 CASE 派生列时，派生列要在分区前物化 —— 与窗口链的 Worker 侧重分区冲突，保持回退。
-        if (!keys.isEmpty() && !caseProjections.isEmpty()) return null;
-        if (!mergeableAggregates(aggs)) return null;
         // 穿透纯列选择投影（不改名、不新增列）直达窗口链载体；表达式 / CASE / 改名投影保持回退。
         PhysicalNode cur = upstream;
         while (cur.operator() instanceof ProjectOperator proj && !proj.isAliased()
@@ -7088,32 +7257,47 @@ public final class Planner {
         List<FragmentSpec.WindowStep> steps = carrier.windowSteps();
         if (steps == null || steps.isEmpty()) return null;
         FragmentSpec.WindowStep last = steps.get(steps.size() - 1);
+        if (!cur.outputColumns().containsAll(keys)) return null;
 
-        // 分组聚合：协分区判定 —— 分组键必须覆盖末组窗口分区键（否则同一分组散落多分区，
-        // 每分区各出一行会重复）。分区键可能是合成列（__win_key_N），此时键集不含它 ⇒ 回退。
-        if (!keys.isEmpty()
-                && (!cur.outputColumns().containsAll(keys)
-                    || !keys.containsAll(last.partitionBy()))) {
-            return null;
+        // 分组聚合的协分区判定：分组键必须覆盖末组窗口分区键（否则同一分组散落多分区，
+        // 每分区各出一行会重复）。分区键可能是合成列（__win_key_N），此时键集不含它 ⇒ 不协分区。
+        boolean coPartitioned = keys.isEmpty() || keys.containsAll(last.partitionBy());
+        // 分组键是 CASE 派生列时，派生列要在分区前物化 —— 协分区路径与窗口链的 Worker 侧重分区
+        // 冲突；二次 shuffle 路径由 AggregateConsumer 头先算 CaseProject 再聚合，天然可行。
+        boolean partialEligible = mergeableAggregates(aggs)
+                && (keys.isEmpty() || (caseProjections.isEmpty() && coPartitioned));
+
+        if (partialEligible) {
+            // 二级聚合：桶数与窗口链末组一致（pid 分槽）。
+            int partitions = last.numPartitions();
+            FragmentSpec.AggregateStep step = new FragmentSpec.AggregateStep(
+                    keys, aggs.stream().map(FragmentSpec.AggregationDto::of).toList(),
+                    caseProjections, context.memoryLimit(), partitions);
+            // 由 AbstractDistributedOperator.withTerminal 统一挂到终端 WindowConsumer（所有载体共用）。
+            dist.setTerminalPartialAggregate(step);
+
+            List<String> outCols = new ArrayList<>(keys);
+            for (AggregationSpec a : aggs) outCols.add(a.outputColumn());
+            PhysicalNode partialNode = new PhysicalNode(cur.name(), cur.operator(), outCols, List.of());
+            if (!keys.isEmpty()) {
+                // 协分区终态聚合：各分区输出互不相交，直接并集即结果，无需 Master 合并。
+                return partialNode;
+            }
+            PartialAggregationMergeOperator merge = new PartialAggregationMergeOperator(cur.operator(), aggs);
+            return new PhysicalNode("AggregationMerge", merge, outCols, partialNode);
         }
 
-        // 二级聚合：桶数与窗口链末组一致（pid 分槽）。
-        int partitions = last.numPartitions();
+        // 二次 shuffle 聚合尾：不可合并 / 非协分区 —— 窗口输出按分组键重哈希，每分区完整聚合。
+        // 载体须显式支持（未知载体保守回退 Master 单机聚合）。
+        if (!dist.supportsReshuffleAggregate()) return null;
         FragmentSpec.AggregateStep step = new FragmentSpec.AggregateStep(
                 keys, aggs.stream().map(FragmentSpec.AggregationDto::of).toList(),
-                caseProjections, context.memoryLimit(), partitions);
-        // 由 AbstractDistributedOperator.withTerminal 统一挂到终端 WindowConsumer（所有载体共用）。
-        dist.setTerminalPartialAggregate(step);
+                caseProjections, context.memoryLimit(), dist.partitionCount());
+        dist.setTerminalReshuffleAggregate(step);
 
         List<String> outCols = new ArrayList<>(keys);
         for (AggregationSpec a : aggs) outCols.add(a.outputColumn());
-        PhysicalNode partialNode = new PhysicalNode(cur.name(), cur.operator(), outCols, List.of());
-        if (!keys.isEmpty()) {
-            // 协分区终态聚合：各分区输出互不相交，直接并集即结果，无需 Master 合并。
-            return partialNode;
-        }
-        PartialAggregationMergeOperator merge = new PartialAggregationMergeOperator(cur.operator(), aggs);
-        return new PhysicalNode("AggregationMerge", merge, outCols, partialNode);
+        return new PhysicalNode(cur.name(), cur.operator(), outCols, List.of());
     }
 
     /**
@@ -9038,6 +9222,8 @@ public final class Planner {
             case "collect_list" -> AggregationSpec.collectList(in, out);
             case "collect_set" -> AggregationSpec.collectSet(in, out);
             case "collect_map" -> AggregationSpec.collectMap(
+                    in, dto.valueColumn(), out, dto.mapAppend());
+            case "collect_ordered_list" -> AggregationSpec.collectOrderedList(
                     in, dto.valueColumn(), out, dto.mapAppend());
             default -> {
                 AggregateFunction<?> custom = AggregateFunctionRegistry.getGlobal(dto.aggregateName());

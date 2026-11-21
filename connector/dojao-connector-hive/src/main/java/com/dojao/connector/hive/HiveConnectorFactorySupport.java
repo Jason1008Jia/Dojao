@@ -43,6 +43,13 @@ final class HiveConnectorFactorySupport {
         props.put("catalog.hive.hadoop.user.name", "可选。HDFS / HMS 访问身份（集群侧需存在该用户）。"
                 + "per-catalog 生效：本 catalog 的 HMS 连接与 HDFS 文件系统都按此身份访问，"
                 + "同 JVM 多 hive catalog 可各用各的用户");
+        props.put("catalog.hive.write.dir.permission", "可选，默认 775（八进制）。Dojao 新建表 / 分区 / "
+                + "临时目录的 HDFS 权限。不设置会跟随进程 umask（常见 770），"
+                + "HiveServer2 的其他查询用户会读不了表目录（Unable to fetch table / Permission denied）");
+        props.put("catalog.hive.write.file.permission", "可选，默认 664（八进制）。Dojao 写出的数据文件权限"
+                + "（rename 不改权限，必须在落表前设置）");
+        props.put("catalog.hive.write.group", "可选。写入后 chgrp 的目标属组（写入身份需在该组内或具备"
+                + "超级用户权限）；默认保留写入身份的默认组");
         props.put("catalog.hive.dfs.client.use.datanode.hostname",
                 "可选，默认 true。DataNode 回连用主机名；外网部署且只能解析 IP 时设为 false");
 
