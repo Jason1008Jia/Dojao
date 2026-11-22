@@ -133,6 +133,12 @@ public final class PlanAudit {
             for (FragmentSpec.WindowStep step : carrier.windowSteps()) {
                 n += step.functions().size();
             }
+            // 派生体自身的窗口阶段（`(SELECT ..., win() OVER ... FROM t)` 作为 join 侧）——
+            // 不挂在 windowChain 上，但同样是 Worker 上执行的独立阶段。
+            if (carrier instanceof DistributedDerivedJoinOperator ddjo
+                    && ddjo.derivedWindow() != null && ddjo.derivedWindow().functions() != null) {
+                n += ddjo.derivedWindow().functions().size();
+            }
         } else if (root.operator() instanceof WindowFunctionOperator wfo) {
             n += wfo.getFunctionSpecs().size();
         }
@@ -159,8 +165,8 @@ public final class PlanAudit {
      * {@link PartialAggregationMergeOperator} 是上游分布式聚合的 final 段，与上游是
      * <b>同一逻辑聚合</b>，不重复计数；反之，{@link DistributedDerivedJoinOperator} 的
      * {@code outerAggregations}（两级聚合派生体）与载体终端
-     * {@code terminalPartialAggregate}（窗口链 / join 之后下沉的二次聚合）都是<b>独立阶段</b>，
-     * 必须计入，否则守恒检查会误报缺聚合。</p>
+     * {@code terminalPartialAggregate} / {@code terminalReshuffleAggregate}（窗口链 / join
+     * 之后下沉的二次聚合）都是<b>独立阶段</b>，必须计入，否则守恒检查会误报缺聚合。</p>
      */
     public static int physicalAggregateCount(PhysicalNode root) {
         if (root == null) return 0;
@@ -188,10 +194,16 @@ public final class PlanAudit {
         } else if (op instanceof HashAggregationOperator hao) {
             n += hao.getAggregations().size();
         }
-        // 窗口链终端二级聚合（外层全局聚合下沉，与上述载体自身阶段互斥叠加）。
-        if (op instanceof com.dojao.core.operator.AbstractDistributedOperator ado
-                && ado.terminalPartialAggregate() != null) {
-            n += ado.terminalPartialAggregate().aggregations().size();
+        // 载体终端聚合尾（外层全局聚合下沉，与上述载体自身阶段互斥叠加）：
+        // partial 尾 = 各分区 partial + Master 合并（同一逻辑聚合，只计一次）；二次 shuffle 尾
+        // = 每分区算完整聚合后直接回传（也是同一逻辑聚合，同样只计一次）。
+        if (op instanceof com.dojao.core.operator.AbstractDistributedOperator ado) {
+            if (ado.terminalPartialAggregate() != null) {
+                n += ado.terminalPartialAggregate().aggregations().size();
+            }
+            if (ado.terminalReshuffleAggregate() != null) {
+                n += ado.terminalReshuffleAggregate().aggregations().size();
+            }
         }
         for (PhysicalNode child : root.children()) {
             n += physicalAggregateCount(child);

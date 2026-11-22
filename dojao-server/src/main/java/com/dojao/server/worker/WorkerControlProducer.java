@@ -2,6 +2,7 @@ package com.dojao.server.worker;
 
 import com.dojao.common.data.Page;
 import com.dojao.core.operator.ConnectorScanOperator;
+import com.dojao.core.operator.FilterOperator;
 import com.dojao.core.operator.FragmentSpec;
 import com.dojao.core.operator.MaterializedCteConnector;
 import com.dojao.core.operator.OrderByTail;
@@ -9,6 +10,7 @@ import com.dojao.core.operator.Operator;
 import com.dojao.core.operator.ScalarProjectOperator;
 import com.dojao.core.operator.ShuffleReader;
 import com.dojao.core.planner.PlanningContext;
+import com.dojao.core.planner.SqlTextUtil;
 import com.dojao.core.rpc.control.CancelTaskRequest;
 import com.dojao.core.rpc.control.CatalogDefMsg;
 import com.dojao.core.rpc.control.ControlActions;
@@ -306,6 +308,8 @@ public final class WorkerControlProducer implements FlightProducer {
             Operator source = ConnectorScanOperator.openWithEngineFilter(conn, slice.request(), slice.split());
             if (projection != null) {
                 source = applyProjection(source, projection);
+                // 投影后谓词（外层 WHERE 引用计算列别名）：必须先于 top-N 截断与 sink 写入
+                source = applyProjectionFilter(source, projection);
             }
             op = tail != null ? OrderByTail.wrap(source, tail) : source;
             if (sink != null) {
@@ -380,6 +384,19 @@ public final class WorkerControlProducer implements FlightProducer {
                 .toList();
         return new ScalarProjectOperator(source, p.outputColumns(),
                 new java.util.LinkedHashSet<>(p.computedColumns()), items);
+    }
+
+    /**
+     * 投影后谓词：逐 AND 叶子包 {@link FilterOperator}（它只编译单个简单谓词，整串会落 UNKNOWN
+     * 静默放行全部行）。引用列 ⊆ 投影输出列、且每叶子可编译由 Planner 在折叠时校验。
+     */
+    private static Operator applyProjectionFilter(Operator source, FragmentSpec.ScanProjection p) {
+        if (!p.hasFilterAfterProjection()) return source;
+        Operator chain = source;
+        for (String cond : SqlTextUtil.splitConjuncts(p.filterAfterProjection())) {
+            chain = new FilterOperator(chain, cond);
+        }
+        return chain;
     }
 
     /** 为某个 exchange 建接收端并登记进 Worker 的交换注册表（与 LocalWorkerGateway 同构）。 */

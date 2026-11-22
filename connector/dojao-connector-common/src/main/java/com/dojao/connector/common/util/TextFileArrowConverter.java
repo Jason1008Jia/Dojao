@@ -209,7 +209,6 @@ public class TextFileArrowConverter implements AutoCloseable {
                     return line;
                 }
                 // 本块内没有行尾 → 把这段行首挪到 0、必要时扩容，再读更多字节
-                pos = start;
                 if (!fill()) {
                     String last = new String(buf, 0, limit, StandardCharsets.UTF_8);
                     lastLineBytes = limit;
@@ -280,6 +279,7 @@ public class TextFileArrowConverter implements AutoCloseable {
                                   Schema arrowSchema, int batchSize) throws IOException {
         this(allocator, path, path.getFileSystem(conf), arrowSchema, batchSize);
     }
+
 
     // ==================== 批次转换 ====================
 

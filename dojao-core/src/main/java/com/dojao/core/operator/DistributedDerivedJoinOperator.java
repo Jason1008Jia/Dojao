@@ -81,6 +81,11 @@ public class DistributedDerivedJoinOperator extends AbstractDistributedOperator
      * 最终 join 的派生侧 wire 就是它。null = 旧口径（扫描列 + 派生列）。
      */
     private final List<String> projectionOutputColumns;
+    /**
+     * A2 多层投影阶段（派生体内是若干层纯投影/过滤的嵌套链）：各阶段在同一个派生基表 Producer
+     * 片段内按序执行，层间零 shuffle；空 = 走单层 {@link #projections} 或聚合 / 窗口路径。
+     */
+    private final List<FragmentSpec.ProjectionStage> projectionStages;
     /** 窗口型派生源的单窗口组（无聚合）；null = 非窗口型派生源。 */
     private final StageScheduler.DerivedWindow window;
     /** 最终 join 的 Worker 侧算法（规划期选型：HASH 不可溢写；build 侧预估过大选 SORT_MERGE）。 */
@@ -331,6 +336,36 @@ public class DistributedDerivedJoinOperator extends AbstractDistributedOperator
                                           List<String> outerKeys,
                                           List<AggregationSpec> outerAggregations,
                                           List<String> projectionOutputColumns) {
+        this(queryId, derivedOnLeft, innerRequest, innerKeys, aggregations, caseProjections,
+                derivedJoinKeys, havingFilter, peerCatalog, peerSchema, peerTable, peerKeys, peerColumns,
+                peerFilter, joinType, memoryLimit, numPartitions, gateway, innerProbe, peerProbe,
+                workers, projections, window, joinAlgorithm, windowChain, outputAliases,
+                outerKeys, outerAggregations, projectionOutputColumns, List.of());
+    }
+
+    /** 同上 + <b>A2 多层投影阶段</b>（{@code projectionStages} 非空 ⇒ 派生体无聚合、无窗口）。 */
+    public DistributedDerivedJoinOperator(String queryId,
+                                          boolean derivedOnLeft,
+                                          ReadRequest innerRequest, List<String> innerKeys,
+                                          List<AggregationSpec> aggregations,
+                                          List<CaseProjection> caseProjections,
+                                          List<String> derivedJoinKeys, String havingFilter,
+                                          String peerCatalog, String peerSchema, String peerTable,
+                                          List<String> peerKeys, List<String> peerColumns, String peerFilter,
+                                          JoinType joinType,
+                                          long memoryLimit, int numPartitions,
+                                          WorkerGateway gateway,
+                                          DojaoConnector innerProbe, DojaoConnector peerProbe,
+                                          List<WorkerRegistration> workers,
+                                          List<StageScheduler.DerivedProjection> projections,
+                                          StageScheduler.DerivedWindow window,
+                                          FragmentSpec.JoinAlgorithm joinAlgorithm,
+                                          List<FragmentSpec.WindowStep> windowChain,
+                                          List<FragmentSpec.JoinAlias> outputAliases,
+                                          List<String> outerKeys,
+                                          List<AggregationSpec> outerAggregations,
+                                          List<String> projectionOutputColumns,
+                                          List<FragmentSpec.ProjectionStage> projectionStages) {
         super("DistributedDerivedJoin", queryId, numPartitions, gateway, workers);
         this.derivedOnLeft = derivedOnLeft;
         this.innerRequest = innerRequest;
@@ -355,6 +390,7 @@ public class DistributedDerivedJoinOperator extends AbstractDistributedOperator
         this.window = window;
         this.projectionOutputColumns = projectionOutputColumns == null || projectionOutputColumns.isEmpty()
                 ? null : List.copyOf(projectionOutputColumns);
+        this.projectionStages = projectionStages == null ? List.of() : List.copyOf(projectionStages);
         this.joinAlgorithm = joinAlgorithm == null ? FragmentSpec.JoinAlgorithm.HASH : joinAlgorithm;
         this.windowChain = windowChain == null ? List.of() : List.copyOf(windowChain);
         this.outputAliases = outputAliases == null ? List.of() : List.copyOf(outputAliases);
@@ -381,7 +417,8 @@ public class DistributedDerivedJoinOperator extends AbstractDistributedOperator
                 innerRequest, innerKeys, aggregations, caseProjections, derivedJoinKeys, havingFilter,
                 peerCatalog, peerSchema, peerTable, peerKeys, peerColumns, peerFilter, joinType,
                 memoryLimit, numPartitions, gateway, innerProbe, peerProbe, workers,
-                projections, window, joinAlgorithm, steps, aliases, outerKeys, outerAggregations);
+                projections, window, joinAlgorithm, steps, aliases, outerKeys, outerAggregations,
+                projectionOutputColumns, projectionStages);
     }
 
     /** 最末层 join 上的窗口分组链（空 = 无）。 */
@@ -403,6 +440,12 @@ public class DistributedDerivedJoinOperator extends AbstractDistributedOperator
     public List<String> outerKeys() {
         return outerKeys;
     }
+
+    /**
+     * 派生体<b>自身</b>的窗口规格（{@code window=…}；null = 非窗口型派生源）。
+     * 与 {@link #windowChain()}（join 之后追加的窗口链）是两段独立阶段 —— 审计 / EXPLAIN 只读。
+     */
+    public StageScheduler.DerivedWindow derivedWindow() { return window; }
 
     @Override
     public List<FragmentSpec.WindowStep> windowSteps() { return windowChain; }
@@ -468,7 +511,7 @@ public class DistributedDerivedJoinOperator extends AbstractDistributedOperator
                 derivedJoinKeys, havingFilter,
                 peerCatalog, peerSchema, peerTable, peerKeys, peerColumns, peerProbe, peerFilter,
                 joinType, memoryLimit, projections, window, joinAlgorithm, windowChain, outputAliases,
-                outerKeys, outerAggregations, projectionOutputColumns);
+                outerKeys, outerAggregations, projectionOutputColumns, projectionStages);
         // 片段已在 planDerivedJoin 内按反死锁顺序排好：
         // 最终 join Consumer → MiddleAggregateConsumer → Producer（build 侧先、probe 侧后）
         for (FragmentSpec fragment : withTerminal(stage.fragments())) {   // 分布式写 SinkStep + top-N 截断尾
@@ -506,6 +549,11 @@ public class DistributedDerivedJoinOperator extends AbstractDistributedOperator
         return projections == null ? List.of() : projections;
     }
 
+    /** A2 多层投影阶段（空 = 单层投影 / 聚合 / 窗口派生源）。只读访问器，供探针用。 */
+    public List<FragmentSpec.ProjectionStage> projectionStages() {
+        return projectionStages;
+    }
+
     /** 窗口型派生源的单窗口组（null = 非窗口型派生源）。只读访问器，供探针用。 */
     public StageScheduler.DerivedWindow window() {
         return window;
@@ -541,6 +589,13 @@ public class DistributedDerivedJoinOperator extends AbstractDistributedOperator
                     projections, projectionOutputColumns);
             if (pf != null) {
                 derived.addAll(pf);
+            }
+        } else if (!projectionStages.isEmpty()) {
+            // A2 多层投影阶段：扫描列 + 各阶段逐段物化（同名覆盖）+ 裁回 —— 与 StageScheduler 同源
+            List<Field> sf = StageScheduler.projectionStageSideFields(innerProbe, innerRequest,
+                    projectionStages, projectionOutputColumns);
+            if (sf != null) {
+                derived.addAll(sf);
             }
         } else {
             derived.addAll(scanFields(innerProbe,

@@ -496,22 +496,47 @@ public sealed interface FragmentSpec
     }
 
     /**
-     * 扫描分片侧投影（scan-sink 就地写）：Worker 扫完切片后先按此投影，再写 {@link SinkStep}
-     * 目标表 / 回传。{@code outputColumns} 是最终输出顺序；{@code computedColumns} 是其中由
-     * {@code expressions} 求值的列，其余为透传列。{@code expressions} 为空 = 纯列投影
-     * （{@code ProjectOperator} 语义），非空 = 标量表达式投影（{@code ScalarProjectOperator} 语义）。
+     * 扫描分片侧投影（scan-sink 就地写 / 查询路径窄列回传）：Worker 扫完切片后先按此投影，
+     * 再执行 {@code filterAfterProjection}，最后写 {@link SinkStep} 目标表 / 回传。
+     * {@code outputColumns} 是最终输出顺序；{@code computedColumns} 是其中由 {@code expressions}
+     * 求值的列，其余为透传列。{@code expressions} 为空 = 纯列投影（{@code ProjectOperator} 语义），
+     * 非空 = 标量表达式投影（{@code ScalarProjectOperator} 语义）。
+     *
+     * <p><b>{@code filterAfterProjection}</b>：投影之后、top-N / sink 之前求值的谓词（顶层 AND
+     * 合取串，null/空 = 无）。用于「外层 WHERE 引用计算列别名」——
+     * {@code SELECT * FROM (SELECT id, get_json_object(...) AS c FROM t) a WHERE length(c) > 7}：
+     * 该谓词在扫描侧找不到 {@code c}（是投影产物），过去只能留 Master 逐行过滤并把宽行全量拉回；
+     * 挂在这里后过滤与投影一起在 Worker 就地完成，回传行数/字节同时收窄。
+     * <b>语义顺序不可变</b>：先投影再过滤（谓词看到的是投影输出列），且必须先于 top-N 截断与
+     * sink 写入（SQL 语义 WHERE → ORDER BY/LIMIT → 写）。</p>
      */
     record ScanProjection(List<String> outputColumns, List<String> computedColumns,
-                          List<GroupKeyExpression> expressions) {
+                          List<GroupKeyExpression> expressions, String filterAfterProjection) {
         public ScanProjection {
             outputColumns = outputColumns == null ? List.of() : List.copyOf(outputColumns);
             computedColumns = computedColumns == null ? List.of() : List.copyOf(computedColumns);
             expressions = expressions == null ? List.of() : List.copyOf(expressions);
+            filterAfterProjection = filterAfterProjection == null || filterAfterProjection.isBlank()
+                    ? null : filterAfterProjection;
         }
 
-        /** 扫描后投影是否为空操作（输出列 == 扫描列，无计算列）—— 无需包算子。 */
+        /** 兼容构造：无投影后谓词（scan-sink 与纯投影下推的旧调用点）。 */
+        public ScanProjection(List<String> outputColumns, List<String> computedColumns,
+                              List<GroupKeyExpression> expressions) {
+            this(outputColumns, computedColumns, expressions, null);
+        }
+
+        /** 投影后谓词是否生效（non-blank）。 */
+        public boolean hasFilterAfterProjection() {
+            return filterAfterProjection != null;
+        }
+
+        /**
+         * 扫描后投影是否为空操作（输出列 == 扫描列，无计算列、无投影后谓词）—— 无需包算子；
+         * 带谓词时恒 false（即使输出列与扫描列相同，也必须保留投影阶段以承载过滤）。
+         */
         public boolean isIdentity() {
-            return expressions.isEmpty() && computedColumns.isEmpty();
+            return expressions.isEmpty() && computedColumns.isEmpty() && !hasFilterAfterProjection();
         }
     }
 
@@ -629,6 +654,28 @@ public sealed interface FragmentSpec
         }
     }
 
+    /**
+     * 一段<b>有序投影阶段</b>（A2 多层派生投影链 / B 屏障周边投影层融合）：先按 {@code filter}
+     * 逐行过滤（谓词求值于本阶段<b>输入</b>列），再按 {@code expressions} 逐行物化派生列
+     * （表达式投影器的「覆盖同名 / 追加新名」语义）。同一片段内多段顺序执行、<b>层间零 shuffle</b>。
+     *
+     * <p>{@code fields} 是各表达式的 Arrow 声明类型（与 {@code expressions} 逐项对齐，元素可为 null
+     * = 静态不可推断，仅影响 Master 侧声明列，不影响执行）。序列化不含类型（规划期产物）。</p>
+     */
+    record ProjectionStage(List<GroupKeyExpression> expressions, String filter,
+                           List<Field> fields) {
+        public ProjectionStage {
+            expressions = expressions == null ? List.of() : List.copyOf(expressions);
+            filter = filter == null || filter.isBlank() ? null : filter;
+            fields = fields == null ? List.of() : fields;   // 允许 null 元素（类型不可推断）
+        }
+
+        /** 无类型声明的阶段（线格式 / 探针用）。 */
+        public ProjectionStage(List<GroupKeyExpression> expressions, String filter) {
+            this(expressions, filter, List.of());
+        }
+    }
+
     // ==================== 两类片段 ====================
 
     /** 发送端：扫本地切片 → 哈希分区 → 推送归属 Worker（无 Master 回传）。 */
@@ -637,47 +684,61 @@ public sealed interface FragmentSpec
                     List<GroupKeyExpression> groupKeyExpressions,
                     String filterAfterProject,
                     ExpandStep expand,
-                    List<String> outputColumns) implements FragmentSpec {
+                    List<String> outputColumns,
+                    List<ProjectionStage> projectionStages) implements FragmentSpec {
         public Producer {
             outputColumns = outputColumns == null || outputColumns.isEmpty()
                     ? null : List.copyOf(outputColumns);
+            projectionStages = projectionStages == null ? List.of() : List.copyOf(projectionStages);
         }
 
         /** 无 GROUP BY 表达式（join / 窗口 / 纯扫描的常规 Producer）。 */
         public Producer(String fragmentId, String selfWorkerId,
                         ScanStep scan, PartitionStep partition) {
-            this(fragmentId, selfWorkerId, scan, partition, List.of(), null, null, null);
+            this(fragmentId, selfWorkerId, scan, partition, List.of(), null, null, null, List.of());
         }
 
         /** 无多维聚合展开（旧调用点）。 */
         public Producer(String fragmentId, String selfWorkerId,
                         ScanStep scan, PartitionStep partition,
                         List<GroupKeyExpression> groupKeyExpressions) {
-            this(fragmentId, selfWorkerId, scan, partition, groupKeyExpressions, null, null, null);
+            this(fragmentId, selfWorkerId, scan, partition, groupKeyExpressions, null, null, null,
+                    List.of());
         }
 
         /** 无多维聚合展开 + 投影后过滤（投影型派生源的外层谓词，引用派生别名）。 */
         public Producer(String fragmentId, String selfWorkerId,
                         ScanStep scan, PartitionStep partition,
                         List<GroupKeyExpression> groupKeyExpressions, String filterAfterProject) {
-            this(fragmentId, selfWorkerId, scan, partition, groupKeyExpressions, filterAfterProject, null, null);
+            this(fragmentId, selfWorkerId, scan, partition, groupKeyExpressions, filterAfterProject,
+                    null, null, List.of());
         }
 
         /**
-         * 声明输出列（<b>投影型派生源</b>）：扫描列 + {@code groupKeyExpressions} 物化的派生列，
-         * 在过滤之后<b>只保留</b>这些列（按给定顺序）。派生关系的对外 schema 是内层 SELECT 的
-         * 输出列 —— 不裁剪会让基表扫描列（同名列）泄漏到 join 页，下游按名解析会拿到错误的列。
-         * 未引用的表达式源列被裁掉（列裁剪已经保证只读需要的列）。
+         * 声明输出列（<b>投影型派生源</b>）：扫描列 + 派生列（{@code groupKeyExpressions} /
+         * {@code projectionStages} 物化），在过滤之后<b>只保留</b>这些列（按给定顺序）。派生关系的
+         * 对外 schema 是内层 SELECT 的输出列 —— 不裁剪会让基表扫描列（同名列）泄漏到 join 页，
+         * 下游按名解析会拿到错误的列。未引用的表达式源列被裁掉（列裁剪已经保证只读需要的列）。
          */
         public Producer withOutputColumns(List<String> columns) {
             return new Producer(fragmentId, selfWorkerId, scan, partition, groupKeyExpressions,
-                    filterAfterProject, expand, columns);
+                    filterAfterProject, expand, columns, projectionStages);
         }
 
         /** 附加多维聚合展开：扫描（与 GROUP BY 派生列）之后、哈希分区之前复制行。 */
         public Producer withExpand(ExpandStep e) {
             return new Producer(fragmentId, selfWorkerId, scan, partition, groupKeyExpressions,
-                    filterAfterProject, e, outputColumns);
+                    filterAfterProject, e, outputColumns, projectionStages);
+        }
+
+        /**
+         * 附加<b>有序投影阶段链</b>（A2：多层派生投影 / B：窗口基表投影链）—— 扫描后、哈希分区前
+         * 逐段「过滤 → 物化派生列」，层间零 shuffle。与 {@code groupKeyExpressions} 互不依赖，
+         * 两者同时存在时先跑阶段链。
+         */
+        public Producer withProjectionStages(List<ProjectionStage> stages) {
+            return new Producer(fragmentId, selfWorkerId, scan, partition, groupKeyExpressions,
+                    filterAfterProject, expand, outputColumns, stages);
         }
 
         @Override
@@ -694,8 +755,16 @@ public sealed interface FragmentSpec
             String post = filterAfterProject == null || filterAfterProject.isBlank() ? ""
                     : " → filter[" + filterAfterProject + "]";
             String out = outputColumns == null ? "" : " → select(" + outputColumns + ")";
+            String stages = projectionStages.isEmpty() ? ""
+                    : " → stages(" + projectionStages.stream()
+                            .map(st -> st.expressions().stream()
+                                    .map(GroupKeyExpression::derivedColumn)
+                                    .collect(java.util.stream.Collectors.joining("+", "[", "]"))
+                                    + (st.filter() == null ? "" : "*"))
+                            .collect(java.util.stream.Collectors.joining(" → ")) + ")";
             return "scan " + scan.request().schema() + "." + scan.request().table()
-                    + " → hash-partition(" + partition.keyColumns() + ")" + gk + post + out
+                    + stages + gk + post + out
+                    + " → hash-partition(" + partition.keyColumns() + ")"
                     + FragmentSpec.expandSuffix(expand);
         }
     }
@@ -955,7 +1024,8 @@ public sealed interface FragmentSpec
     record MiddleJoinConsumer(String fragmentId, String selfWorkerId,
                               ExchangeInStep leftIn, ExchangeInStep rightIn,
                               JoinStep join, PartitionStep nextPartition,
-                              ExpandStep expand, List<GroupKeyExpression> nextComputed) implements FragmentSpec {
+                              ExpandStep expand, List<GroupKeyExpression> nextComputed,
+                              String filterAfterJoin) implements FragmentSpec {
 
         public MiddleJoinConsumer {
             nextComputed = nextComputed == null ? List.of() : List.copyOf(nextComputed);
@@ -965,19 +1035,28 @@ public sealed interface FragmentSpec
         public MiddleJoinConsumer(String fragmentId, String selfWorkerId,
                                   ExchangeInStep leftIn, ExchangeInStep rightIn,
                                   JoinStep join, PartitionStep nextPartition) {
-            this(fragmentId, selfWorkerId, leftIn, rightIn, join, nextPartition, null, List.of());
+            this(fragmentId, selfWorkerId, leftIn, rightIn, join, nextPartition, null, List.of(), null);
         }
 
         /** 附加多维聚合展开：本地 join 输出之后、按分组键重哈希之前复制行。 */
         public MiddleJoinConsumer withExpand(ExpandStep e) {
             return new MiddleJoinConsumer(fragmentId, selfWorkerId, leftIn, rightIn, join, nextPartition,
-                    e, nextComputed);
+                    e, nextComputed, filterAfterJoin);
         }
 
         /** 附加下一窗口分组键表达式合成列：本地 join 输出之后、重哈希之前本机物化。 */
         public MiddleJoinConsumer withNextComputed(List<GroupKeyExpression> computed) {
             return new MiddleJoinConsumer(fragmentId, selfWorkerId, leftIn, rightIn, join, nextPartition,
-                    expand, computed);
+                    expand, computed, filterAfterJoin);
+        }
+
+        /**
+         * 附加 join 输出的行级过滤（join→Filter→聚合 下沉）：本地 join（+外连接别名）之后、
+         * 展开 / 重哈希之前逐条执行 —— 必须看到完整宽行，且不能在展开复制行之后过滤。
+         */
+        public MiddleJoinConsumer withFilterAfterJoin(String f) {
+            return new MiddleJoinConsumer(fragmentId, selfWorkerId, leftIn, rightIn, join, nextPartition,
+                    expand, nextComputed, f);
         }
 
         @Override
@@ -989,6 +1068,8 @@ public sealed interface FragmentSpec
         public String describe() {
             return "local join " + join.leftKeyColumns() + "=" + join.rightKeyColumns()
                     + FragmentSpec.joinSuffix(join)
+                    + (filterAfterJoin == null || filterAfterJoin.isBlank()
+                        ? "" : " → filter[" + filterAfterJoin + "]")
                     + FragmentSpec.expandSuffix(expand)
                     + " → repartition(" + nextPartition.keyColumns() + ")"
                     + " → " + nextPartition.exchangeId()
@@ -1087,22 +1168,37 @@ public sealed interface FragmentSpec
     record MiddleWindowConsumer(String fragmentId, String selfWorkerId,
                                 ExchangeInStep in, WindowStep window,
                                 PartitionStep nextPartition,
-                                List<GroupKeyExpression> nextComputed) implements FragmentSpec {
+                                List<GroupKeyExpression> nextComputed,
+                                List<ProjectionStage> postStages,
+                                List<String> outputColumns) implements FragmentSpec {
 
         public MiddleWindowConsumer {
             nextComputed = nextComputed == null ? List.of() : List.copyOf(nextComputed);
+            postStages = postStages == null ? List.of() : List.copyOf(postStages);
+            outputColumns = outputColumns == null || outputColumns.isEmpty()
+                    ? null : List.copyOf(outputColumns);
         }
 
         /** 无下一组键表达式合成列（普通窗口链中间层）。 */
         public MiddleWindowConsumer(String fragmentId, String selfWorkerId,
                                     ExchangeInStep in, WindowStep window,
                                     PartitionStep nextPartition) {
-            this(fragmentId, selfWorkerId, in, window, nextPartition, List.of());
+            this(fragmentId, selfWorkerId, in, window, nextPartition, List.of(), List.of(), null);
         }
 
         /** 附加下一窗口分组键表达式合成列：本地窗口输出之后、重哈希之前本机物化。 */
         public MiddleWindowConsumer withNextComputed(List<GroupKeyExpression> computed) {
-            return new MiddleWindowConsumer(fragmentId, selfWorkerId, in, window, nextPartition, computed);
+            return new MiddleWindowConsumer(fragmentId, selfWorkerId, in, window, nextPartition,
+                    computed, postStages, outputColumns);
+        }
+
+        /**
+         * 附加<b>窗口之后的投影层链</b>（B：窗口输出 → 逐段投影/过滤 → 裁回派生可见列 → 重哈希）。
+         * {@code trim} 非空时在重哈希前裁回这些列，把窗口内部临时列 / 基表多余列挡在 join 页之外。
+         */
+        public MiddleWindowConsumer withPostStages(List<ProjectionStage> stages, List<String> trim) {
+            return new MiddleWindowConsumer(fragmentId, selfWorkerId, in, window, nextPartition,
+                    nextComputed, stages, trim);
         }
 
         @Override
@@ -1112,7 +1208,9 @@ public sealed interface FragmentSpec
 
         @Override
         public String describe() {
-            return "local window partitionBy=" + window.partitionBy()
+            String post = postStages.isEmpty() ? "" : " → stages(" + postStages.size() + ")";
+            String out = outputColumns == null ? "" : " → select(" + outputColumns + ")";
+            return "local window partitionBy=" + window.partitionBy() + post + out
                     + " → repartition(" + nextPartition.keyColumns() + ")"
                     + " → " + nextPartition.exchangeId()
                     + " (in=" + in.exchangeId() + ")";

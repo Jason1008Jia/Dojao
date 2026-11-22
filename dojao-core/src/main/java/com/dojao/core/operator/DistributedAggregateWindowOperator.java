@@ -272,6 +272,8 @@ public class DistributedAggregateWindowOperator extends AbstractDistributedOpera
         //   → 中间层逆序 → 基表 Producers（build 先 probe）；scan 源：直接基表 Producers。
         boolean single = windowSteps.size() == 1;
         FragmentSpec.WindowStep first = windowSteps.get(0);
+        // 二次 shuffle 聚合尾（外层聚合不可 partial 合并 / 非协分区）：末组窗口输出按分组键重哈希。
+        FragmentSpec.AggregateStep tailAggregate = terminalReshuffleAggregate;
         JoinChainStage stage;
         if (links == null) {
             // scan 源：复算扫描生效请求（列 + 谓词，与原聚合算子 dispatchStage 一致），交给连接器再分区规划
@@ -284,23 +286,23 @@ public class DistributedAggregateWindowOperator extends AbstractDistributedOpera
                     ? StageScheduler.planAggregateWindow(
                             queryId, workers, numPartitions, effective,
                             groupKeys, aggregations, caseProjections, memoryLimit, probe,
-                            first, havingFilter, groupKeyExpressions)
+                            first, havingFilter, groupKeyExpressions, tailAggregate)
                     : StageScheduler.planAggregateWindowChain(
                             queryId, workers, numPartitions, effective,
                             groupKeys, aggregations, caseProjections, memoryLimit, probe, windowSteps,
-                            havingFilter, groupKeyExpressions);
+                            havingFilter, groupKeyExpressions, tailAggregate);
         } else {
             stage = single
                     ? StageScheduler.planJoinAggregateWindow(
                             queryId, workers, numPartitions,
                             firstCatalog, firstSchema, firstTable, firstLeftKeys, firstProbe, firstFilter,
                             links, memoryLimit, groupKeys, aggregations, caseProjections,
-                            firstColumns, first, havingFilter, groupKeyExpressions)
+                            firstColumns, first, havingFilter, groupKeyExpressions, tailAggregate)
                     : StageScheduler.planJoinAggregateWindowChain(
                             queryId, workers, numPartitions,
                             firstCatalog, firstSchema, firstTable, firstLeftKeys, firstProbe, firstFilter,
                             links, memoryLimit, groupKeys, aggregations, caseProjections,
-                            firstColumns, windowSteps, havingFilter, groupKeyExpressions);
+                            firstColumns, windowSteps, havingFilter, groupKeyExpressions, tailAggregate);
         }
         for (FragmentSpec fragment : withTerminal(stage.fragments())) {   // 分布式写 SinkStep + top-N 截断尾
 
@@ -362,7 +364,26 @@ public class DistributedAggregateWindowOperator extends AbstractDistributedOpera
             aggOut.add(aggregationOutputField(a, aggInputs));
         }
         // 逐步按声明输出列重定基再追加函数列（K 形状投影吸收见基类 helper）。
-        return windowChainOutputFields(aggOut, windowSteps);
+        List<Field> windowOut = windowChainOutputFields(aggOut, windowSteps);
+        FragmentSpec.AggregateStep tail = terminalReshuffleAggregate;
+        if (tail == null) {
+            return windowOut;
+        }
+        // 二次 shuffle 聚合尾：终端输出页 = 分组键（窗口输出里按名取）+ 聚合结果列
+        //（CASE 派生列先并入输入侧，与 Worker 侧 CaseProjectOperator 追加列同口径）。
+        List<Field> aggInput = withDerivedFields(windowOut, tail.caseProjections());
+        List<Field> out = new ArrayList<>(tail.keyColumns().size() + tail.aggregations().size());
+        out.addAll(fieldsByNames(aggInput, tail.keyColumns()));
+        for (FragmentSpec.AggregationDto dto : tail.aggregations()) {
+            out.add(dtoAggregationField(dto, aggInput));
+        }
+        return out;
+    }
+
+    /** 本算子支持在窗口输出之上追加二次 shuffle 聚合尾（见基类同名方法）。 */
+    @Override
+    public boolean supportsReshuffleAggregate() {
+        return true;
     }
 
     /** 把表达式派生分组键补成 STRING 静态列（发送端物化列，不在 join 输出里）。 */

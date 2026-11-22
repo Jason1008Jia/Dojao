@@ -325,6 +325,23 @@ public final class ControlSerde {
         return new GroupKeyExpression(m.getDerivedColumn(), m.getExprText());
     }
 
+    private static ProjectionStageMsg toProjectionStage(FragmentSpec.ProjectionStage s) {
+        ProjectionStageMsg.Builder b = ProjectionStageMsg.newBuilder();
+        for (GroupKeyExpression g : s.expressions()) {
+            b.addExpressions(toGroupKeyExpression(g));
+        }
+        if (s.filter() != null) {
+            b.setFilter(s.filter());
+        }
+        return b.build();
+    }
+
+    private static FragmentSpec.ProjectionStage fromProjectionStage(ProjectionStageMsg m) {
+        List<GroupKeyExpression> exprs = m.getExpressionsList().stream()
+                .map(ControlSerde::fromGroupKeyExpression).toList();
+        return new FragmentSpec.ProjectionStage(exprs, m.getFilter().isBlank() ? null : m.getFilter());
+    }
+
     // ==================== 多维聚合展开（ROLLUP / CUBE / GROUPING SETS） ====================
 
     private static ExpandStepMsg toExpandStep(FragmentSpec.ExpandStep e) {
@@ -485,12 +502,16 @@ public final class ControlSerde {
         for (GroupKeyExpression g : p.expressions()) {
             b.addExpressions(toGroupKeyExpression(g));
         }
+        if (p.hasFilterAfterProjection()) {
+            b.setFilterAfterProjection(p.filterAfterProjection());
+        }
         return b.build();
     }
 
     public static FragmentSpec.ScanProjection fromScanProjection(ScanProjectionMsg m) {
         return new FragmentSpec.ScanProjection(m.getOutputColumnsList(), m.getComputedColumnsList(),
-                m.getExpressionsList().stream().map(ControlSerde::fromGroupKeyExpression).toList());
+                m.getExpressionsList().stream().map(ControlSerde::fromGroupKeyExpression).toList(),
+                m.getFilterAfterProjection());
     }
 
     /** 片内 top-N 截断尾 ↔ proto（可空；空 = 不下推）。 */
@@ -532,6 +553,9 @@ public final class ControlSerde {
                 }
                 if (p.outputColumns() != null) {
                     pb.addAllOutputColumns(p.outputColumns());
+                }
+                for (FragmentSpec.ProjectionStage s : p.projectionStages()) {
+                    pb.addProjectionStages(toProjectionStage(s));
                 }
                 b.setProducer(pb.build());
             }
@@ -629,6 +653,9 @@ public final class ControlSerde {
                 if (mj.expand() != null) {
                     mjb.setExpand(toExpandStep(mj.expand()));
                 }
+                if (mj.filterAfterJoin() != null && !mj.filterAfterJoin().isBlank()) {
+                    mjb.setFilterAfterJoin(mj.filterAfterJoin());
+                }
                 for (GroupKeyExpression g : mj.nextComputed()) {
                     mjb.addNextComputed(toGroupKeyExpression(g));
                 }
@@ -662,6 +689,12 @@ public final class ControlSerde {
                 for (GroupKeyExpression g : mw.nextComputed()) {
                     mwb.addNextComputed(toGroupKeyExpression(g));
                 }
+                for (FragmentSpec.ProjectionStage s : mw.postStages()) {
+                    mwb.addPostStages(toProjectionStage(s));
+                }
+                if (mw.outputColumns() != null) {
+                    mwb.addAllOutputColumns(mw.outputColumns());
+                }
                 b.setMiddleWindowConsumer(mwb.build());
             }
         }
@@ -677,7 +710,9 @@ public final class ControlSerde {
                 FragmentSpec.Producer producer = new FragmentSpec.Producer(m.getFragmentId(),
                         m.getSelfWorkerId(), fromScanStep(m.getScan()), fromPartitionStep(m.getPartition()), gks,
                         m.getFilterAfterProject().isBlank() ? null : m.getFilterAfterProject())
-                        .withOutputColumns(m.getOutputColumnsList());
+                        .withOutputColumns(m.getOutputColumnsList())
+                        .withProjectionStages(m.getProjectionStagesList().stream()
+                                .map(ControlSerde::fromProjectionStage).toList());
                 return m.hasExpand() ? producer.withExpand(fromExpandStep(m.getExpand())) : producer;
             }
             case CONSUMER -> {
@@ -750,6 +785,9 @@ public final class ControlSerde {
                     mjc = mjc.withNextComputed(m.getNextComputedList().stream()
                             .map(ControlSerde::fromGroupKeyExpression).toList());
                 }
+                if (!m.getFilterAfterJoin().isBlank()) {
+                    mjc = mjc.withFilterAfterJoin(m.getFilterAfterJoin());
+                }
                 return mjc;
             }
             case MIDDLE_AGGREGATE_CONSUMER -> {
@@ -768,7 +806,9 @@ public final class ControlSerde {
                 return new FragmentSpec.MiddleWindowConsumer(m.getFragmentId(), m.getSelfWorkerId(),
                         fromExchangeIn(m.getIn()), fromWindowStep(m.getWindow()),
                         fromPartitionStep(m.getNextPartition()),
-                        m.getNextComputedList().stream().map(ControlSerde::fromGroupKeyExpression).toList());
+                        m.getNextComputedList().stream().map(ControlSerde::fromGroupKeyExpression).toList(),
+                        m.getPostStagesList().stream().map(ControlSerde::fromProjectionStage).toList(),
+                        m.getOutputColumnsList());
             }
             default -> throw new IllegalArgumentException("FragmentSpecMsg 缺 spec oneof: " + msg);
         }

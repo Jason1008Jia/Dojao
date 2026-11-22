@@ -244,6 +244,27 @@ public final class SqlTextUtil {
         return new PredicateSplit(List.copyOf(pushable), List.copyOf(residual));
     }
 
+    /**
+     * 扫描端是否<b>必须由引擎</b>补 {@code FilterOperator} 求值：连接器不兑现下推契约（整串由引擎求值），
+     * 或谓词中含连接器无法认领的引擎函数残差。判定口径与 {@link #splitByConnectorCapability} 完全一致，
+     * Planner 的列裁剪与 Worker 的 {@code ConnectorScanOperator.openWithEngineFilter} 共用。
+     */
+    public static boolean requiresEngineFilter(List<String> predicates, DojaoConnector conn) {
+        if (predicates == null || predicates.isEmpty()) {
+            return false;
+        }
+        if (conn == null || !conn.supportsPredicatePushdown()) {
+            return true;
+        }
+        for (String p : predicates) {
+            if (p == null || p.isBlank()) continue;
+            if (!splitByConnectorCapability(p, conn).residualLeaves().isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** 反复剥掉<b>整体包裹</b>的圆括号：{@code ((a = 1))} → {@code a = 1}；{@code (a) AND (b)} 不动。 */
     public static String stripOuterParens(String s) {
         if (s == null) {

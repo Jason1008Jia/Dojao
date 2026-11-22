@@ -167,13 +167,16 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
                 + " partitions=" + parallelism
                 + (selectedColumns.isEmpty() ? " columns=<all>" : " columns=" + selectedColumns)
                 + filter);
+        String postFilter = projection != null && projection.hasFilterAfterProjection()
+                ? " filter-after-projection=[" + projection.filterAfterProjection() + "]" : "";
         if (sink != null) {
             out.add("scan-sink " + sink.catalog() + "." + sink.schema() + "." + sink.table()
                     + " (分片就地写，不回传数据页)"
                     + (projection == null || projection.isIdentity() ? ""
-                            : " projection=" + projection.outputColumns()));
+                            : " projection=" + projection.outputColumns())
+                    + postFilter);
         } else if (projection != null && !projection.isIdentity()) {
-            out.add("scan-projection " + projection.outputColumns());
+            out.add("scan-projection " + projection.outputColumns() + postFilter);
         }
         return out;
     }
@@ -304,12 +307,13 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
     public List<String> predicates() { return List.copyOf(predicates); }
 
     /**
-     * 这些谓词是否由<b>引擎</b>执行（而非数据源）—— 连接器不兑现下推契约时为 true，此时 Worker
-     * 扫描节点会补一层 {@code FilterOperator}（见 {@link ConnectorScanOperator#withEngineFilter}），
-     * 于是谓词引用的列<b>必须</b>留在读取列清单里（列裁剪据此保留，见 Planner.pruneScanColumns）。
+     * 这些谓词是否由<b>引擎</b>执行（而非数据源）—— 连接器不兑现下推契约，或谓词含连接器无法认领的
+     * 引擎函数残差时为 true，此时 Worker 扫描节点会补一层 {@code FilterOperator}
+     * （见 {@link ConnectorScanOperator#openWithEngineFilter}），于是谓词引用的列<b>必须</b>留在
+     * 读取列清单里（列裁剪据此保留，见 Planner.pruneScanColumns）。
      */
     public boolean engineFilter() {
-        return probeConn != null && !probeConn.supportsPredicatePushdown();
+        return com.dojao.core.planner.SqlTextUtil.requiresEngineFilter(predicates, probeConn);
     }
 
     // ==================== 生命周期 ====================

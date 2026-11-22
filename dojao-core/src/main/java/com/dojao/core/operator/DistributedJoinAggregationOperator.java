@@ -62,6 +62,11 @@ public class DistributedJoinAggregationOperator extends AbstractDistributedOpera
     /** 外连接同名列消歧别名（Worker 在本地 join 后、重哈希前套用）；空 = 无别名。 */
     private final List<FragmentSpec.JoinAlias> outputAliases;
     /**
+     * join 输出行级过滤（{@code join→Filter→聚合} 下沉，已去限定符、AND 连接）；null = 无过滤。
+     * 在 Worker 最末层 join 之后、外连接别名之后、展开 / 按分组键重哈希之前执行。
+     */
+    private final String joinFilter;
+    /**
      * 二级聚合（外层全局聚合下沉）：AggregateConsumer 本地聚合输出后同 Worker 零交换再聚一次，
      * 每分区只回传 1 行 partial，Master 侧 {@code PartialAggregationMergeOperator} 合并。
      * Planner 在 doOpen 前设置；null = 无。
@@ -152,6 +157,27 @@ public class DistributedJoinAggregationOperator extends AbstractDistributedOpera
                                               List<GroupKeyExpression> groupKeyExpressions,
                                               List<StageScheduler.DerivedSource> sources,
                                               List<FragmentSpec.JoinAlias> outputAliases) {
+        this(queryId, firstCatalog, firstSchema, firstTable, firstLeftKeys, firstProbe, firstFilter,
+                links, memoryLimit, groupKeys, aggregations, caseProjections, numPartitions, gateway,
+                workers, firstColumns, expand, groupKeyExpressions, sources, outputAliases, null);
+    }
+
+    /** 完整形态 + join 输出行级过滤（{@code join→Filter→聚合} 下沉，null = 无）。 */
+    public DistributedJoinAggregationOperator(String queryId,
+                                              String firstCatalog, String firstSchema, String firstTable,
+                                              List<String> firstLeftKeys, DojaoConnector firstProbe,
+                                              String firstFilter,
+                                              List<JoinLink> links, long memoryLimit,
+                                              List<String> groupKeys, List<AggregationSpec> aggregations,
+                                              List<CaseProjection> caseProjections,
+                                              int numPartitions,
+                                              WorkerGateway gateway, List<WorkerRegistration> workers,
+                                              List<String> firstColumns,
+                                              FragmentSpec.ExpandStep expand,
+                                              List<GroupKeyExpression> groupKeyExpressions,
+                                              List<StageScheduler.DerivedSource> sources,
+                                              List<FragmentSpec.JoinAlias> outputAliases,
+                                              String joinFilter) {
         super("DistributedJoinAggregation", queryId, numPartitions, gateway, workers);
         this.firstCatalog = firstCatalog;
         this.firstSchema = firstSchema;
@@ -169,6 +195,7 @@ public class DistributedJoinAggregationOperator extends AbstractDistributedOpera
         this.groupKeyExpressions = groupKeyExpressions == null ? List.of() : List.copyOf(groupKeyExpressions);
         this.sources = sources;
         this.outputAliases = outputAliases == null ? List.of() : List.copyOf(outputAliases);
+        this.joinFilter = joinFilter == null || joinFilter.isBlank() ? null : joinFilter;
     }
 
     // ==================== 规划 spec 只读暴露 ====================
@@ -212,6 +239,9 @@ public class DistributedJoinAggregationOperator extends AbstractDistributedOpera
     /** 外连接同名列消歧别名（空 = 无别名）。 */
     public List<FragmentSpec.JoinAlias> outputAliases() { return outputAliases; }
 
+    /** join 输出行级过滤（null = 无过滤）。 */
+    public String joinFilter() { return joinFilter; }
+
     /** 桶数（聚合交换的分区数；二级聚合的槽数必须与之一致）。 */
     public int numPartitions() { return numPartitions; }
 
@@ -246,7 +276,7 @@ public class DistributedJoinAggregationOperator extends AbstractDistributedOpera
                 queryId, workers, numPartitions,
                 firstCatalog, firstSchema, firstTable, firstLeftKeys, firstProbe, firstFilter,
                 links, memoryLimit, groupKeys, aggregations, caseProjections, firstColumns, expand,
-                groupKeyExpressions, sources, outputAliases, followUp);
+                groupKeyExpressions, sources, outputAliases, followUp, joinFilter);
         // 片段已在 planJoinAggregation 内按反死锁顺序排好：
         // ① 每分区 AggregateConsumer（先注册聚合交换读端）→ ② 最末层 MiddleJoinConsumer
         // （join→按分组键重哈希→推聚合交换）→ ③ 中间层逆序 → ④ 基表 Producers（build 先 probe）
@@ -332,6 +362,9 @@ public class DistributedJoinAggregationOperator extends AbstractDistributedOpera
                     // ON 单侧残差：保留侧不能下推扫描（孤儿行仍须输出），在 Worker 匹配阶段求值
                     + (link.onLeftFilter() != null ? " onLeft=[" + link.onLeftFilter() + "]" : "")
                     + (link.onRightFilter() != null ? " onRight=[" + link.onRightFilter() + "]" : ""));
+        }
+        if (joinFilter != null) {
+            out.add("join-filter: " + joinFilter + "（最末层 join 输出上、按分组键重哈希前执行）");
         }
         out.add("aggregate: groupBy=" + groupKeys
                 + " aggs=" + aggregations.stream().map(AggregationSpec::outputColumn).toList()

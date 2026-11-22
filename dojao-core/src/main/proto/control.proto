@@ -285,6 +285,13 @@ message GroupKeyExpressionMsg {
   string expr_text = 2;
 }
 
+// 一段有序投影阶段（A2 多层派生投影 / B 屏障周边投影层）：先 filter（求值于本段输入列），
+// 再逐行物化 expressions（覆盖同名 / 追加新名）。同一片段内多段顺序执行、层间零 shuffle。
+message ProjectionStageMsg {
+  repeated GroupKeyExpressionMsg expressions = 1;
+  string filter = 2;   // 空 = 无本段过滤
+}
+
 message ExpandSetMsg {
   repeated string members = 1;                                // 该维度组合参与的维度列
 }
@@ -379,6 +386,9 @@ message ScanProjectionMsg {
   repeated string output_columns = 1;                       // 最终输出列顺序
   repeated string computed_columns = 2;                     // 其中由表达式计算出的列名
   repeated GroupKeyExpressionMsg expressions = 3;           // 表达式列：derived_column = 输出列名
+  // 投影后谓词（顶层 AND 合取串，空 = 无）：Worker 在投影之后、top-N / sink 之前逐叶子包
+  // FilterOperator 求值。承载「外层 WHERE 引用计算列别名」的过滤（别名在扫描侧不存在）。
+  string filter_after_projection = 4;
 }
 
 // 顶层 ORDER BY + LIMIT/OFFSET 的片内截断尾（top-N 下推）：挂在最终产生结果的分区流尾部，
@@ -408,6 +418,9 @@ message ProducerMsg {
   // 过滤之后只保留这些列。派生关系的对外 schema 就是它；不裁剪会让基表扫描列（含与派生列同名的
   // 列）泄漏进 join 页，下游按名解析取到错误的列（外连接孤儿行被填上错误的值）。
   repeated string output_columns = 8;
+  // 有序投影阶段链（A2：多层派生投影，层间零 shuffle）：扫描后、哈希分区前逐段「过滤 → 物化」。
+  // 空 = 无（老 Master / 单层投影）。与 group_key_expressions 同时存在时先跑阶段链。
+  repeated ProjectionStageMsg projection_stages = 9;
 }
 
 message ConsumerMsg {
@@ -483,6 +496,10 @@ message MiddleJoinConsumerMsg {
   ExpandStepMsg expand = 7;                                   // 未设置 = 无多维聚合展开
   // next_partition 的目标窗口分组键表达式合成列（重分区前本机物化）。空 = 无表达式键。
   repeated GroupKeyExpressionMsg next_computed = 8;
+  // 本地 join（+外连接别名）输出上的行级过滤（join→Filter→聚合 下沉）：按顶层 AND 拆分逐条编译，
+  // 必须在重哈希 / 展开之前执行 —— 过滤要看到完整宽行（含 __jk_* 副本），且展开复制行后
+  // 再过滤会把 count/sum 放大。
+  string filter_after_join = 9;
 }
 
 // 派生表分布式 join 的聚合中间层：own 桶原始数据 → 本地 HashAggregation →
@@ -512,6 +529,10 @@ message MiddleWindowConsumerMsg {
   PartitionStepMsg next_partition = 5;
   // next_partition 的目标窗口分组键表达式合成列（重分区前本机物化）。空 = 无表达式键。
   repeated GroupKeyExpressionMsg next_computed = 6;
+  // 窗口之后的投影层链（B：窗口输出 → 逐段投影/过滤）：在 next_computed 之后、重哈希之前执行。
+  repeated ProjectionStageMsg post_stages = 7;
+  // 重哈希前裁回派生关系对外可见列（窗口内部临时列 / 基表多余列不进 join 页）。空 = 不裁剪。
+  repeated string output_columns = 8;
 }
 
 message FragmentSpecMsg {

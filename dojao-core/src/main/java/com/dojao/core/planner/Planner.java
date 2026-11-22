@@ -6,6 +6,7 @@ import com.dojao.core.operator.expr.ExprBuiltins;
 import com.dojao.core.operator.expr.ExprEvaluator;
 import com.dojao.core.operator.expr.ExprNode;
 import com.dojao.core.operator.expr.ExprParser;
+import com.dojao.core.operator.expr.ExprPrinter;
 import com.dojao.core.operator.expr.ExprTypeInference;
 import com.dojao.core.function.scalar.ScalarExpr;
 import com.dojao.core.function.scalar.ScalarFunctionRegistry;
@@ -109,6 +110,12 @@ public final class Planner {
 
     /** 哨兵 catalog → 读取连接器（Store 形态；Worker 侧用 {@link MaterializedCteConnector#wire()}）。 */
     private final Map<String, MaterializedCteConnector> cteConnectors = new java.util.HashMap<>();
+
+    /**
+     * 派生下沉拒绝埋点去重：同一关系 + 同一原因只报一次。A-方案重试会让同一个派生关系在
+     * 一次规划里被 {@code planDerived*} 检查 2–4 次，不去重会刷屏。
+     */
+    private final Set<String> reportedDerivedRejects = new java.util.LinkedHashSet<>();
 
     /**
      * 主计划树<b>之外</b>的执行分支（物化 CTE / 物化派生体查询体）里分布式算子的 jobId。
@@ -1781,19 +1788,30 @@ public final class Planner {
      * </ul>
      */
     private PhysicalNode fuseScanProjection(PhysicalNode node) {
-        Operator top = node.operator();
+        // 顶层可能是若干层 Filter（外层 WHERE 逐叶子各包一层）—— 把这些谓词随投影一起下沉为
+        // 「投影后谓词」（见 FragmentSpec.ScanProjection#filterAfterProjection）：它们引用的
+        // 是计算列别名，扫描侧没有、Master 侧逐行求值还得先收全宽行。先剥掉 Filter 再按原规则
+        // 找语义投影 + 扫描；找不到可折叠的投影就原样返回（Filter 留在 Master）。
+        List<String> postFilters = new ArrayList<>();
+        PhysicalNode cur = node;
+        while (cur.operator() instanceof FilterOperator f) {
+            if (cur.children().size() != 1) return node;
+            postFilters.add(f.filterExpression());
+            cur = cur.children().get(0);
+        }
+        Operator top = cur.operator();
         if (top instanceof ProjectOperator p && p.isAliased()) return node;
         if (!(top instanceof ScalarProjectOperator) && !(top instanceof ProjectOperator)) return node;
 
         // 从顶往下穿过「非改名、无 *」的普通 Project，定位最底下的分布式扫描。
-        PhysicalNode cur = node;
         while (true) {
             if (cur.children().size() != 1) return node;
             PhysicalNode child = cur.children().get(0);
             Operator co = child.operator();
             if (co instanceof DistributedScanOperator scan) {
                 if (scan.projection() != null) return node;
-                return fuseOntoScan(top, child);
+                PhysicalNode fused = fuseOntoScan(top, child, postFilters);
+                return fused == null ? node : fused;
             }
             if (co instanceof ProjectOperator pp && !pp.isAliased() && !pp.columns().contains("*")) {
                 cur = child;   // 继续穿过中间收窄列 Project
@@ -1803,8 +1821,12 @@ public final class Planner {
         }
     }
 
-    /** 把最外层投影 {@code top} 挂到 {@code scanNode}，返回以投影列声明输出的扫描节点（无子节点）。 */
-    private PhysicalNode fuseOntoScan(Operator top, PhysicalNode scanNode) {
+    /**
+     * 把最外层投影 {@code top}（+ 其上的 {@code postFilters}）挂到 {@code scanNode}，返回以投影列
+     * 声明输出的扫描节点（无子节点）。<b>不能折叠时返回 {@code null}</b>（调用方保留原计划）——
+     * 绝不能返回裸扫描节点，那会把投影 / 过滤算子整个丢掉。
+     */
+    private PhysicalNode fuseOntoScan(Operator top, PhysicalNode scanNode, List<String> postFilters) {
         DistributedScanOperator scan = (DistributedScanOperator) scanNode.operator();
         FragmentSpec.ScanProjection projection;
         List<String> outCols;
@@ -1819,11 +1841,30 @@ public final class Planner {
             outCols = p.columns();
             projection = new FragmentSpec.ScanProjection(outCols, List.of(), List.of());
         }
-        if (outCols.isEmpty() || outCols.contains("*")) return scanNode;
+        if (outCols.isEmpty() || outCols.contains("*")) return null;
+        String filterAfter = null;
+        if (!postFilters.isEmpty()) {
+            // 谓词必须在投影之后求值 ⇒ 引用列必须全部出现在投影输出里；每个叶子还须能被
+            // FilterOperator 编译（UNKNOWN 会静默放行全部行）—— 任一不满足就整条留在 Master。
+            for (String cond : postFilters) {
+                List<String> refs = FilterOperator.referencedColumnsOf(cond);
+                if (refs.isEmpty()) return null;
+                for (String ref : refs) {
+                    if (!outCols.contains(ref)) return null;
+                }
+            }
+            filterAfter = String.join(" AND ", postFilters);
+            projection = new FragmentSpec.ScanProjection(outCols,
+                    projection.computedColumns(), projection.expressions(), filterAfter);
+        }
         if (projection.isIdentity() && outCols.equals(scanNode.outputColumns())) return scanNode;
+        if (filterAfter != null) {
+            // 谓词会减行：源端前缀截断（fetch-limit）不再等于「结果前缀」，撤销它
+            scan.setFetchLimit(0L);
+        }
         scan.setProjection(projection);
-        System.err.printf("[Planner] 投影下推到扫描分片（回传只剩窄列）: %s <- %s%n",
-                outCols, scanNode.name());
+        System.err.printf("[Planner] 投影下推到扫描分片（回传只剩窄列）: %s <- %s%s%n",
+                outCols, scanNode.name(), filterAfter == null ? "" : "，投影后谓词=" + filterAfter);
         // 扫描节点同时承担投影：声明输出列改为投影列，Master 侧不再有这些投影算子
         return new PhysicalNode(scanNode.name(), scan, outCols, List.of(),
                 scanNode.estimatedRows(), scanNode.sources());
@@ -2048,9 +2089,12 @@ public final class Planner {
     }
 
     /**
-     * 去重节点 —— 复用「空聚合规格」的 {@link HashAggregationOperator}（输出 = 分组键 + 空聚合列 =
-     * 每组一行），与 {@code UNION DISTINCT} 的 {@code distinctOver} 同一套机制，零新算子。
-     * 键 = 上游全部输出列。刻意走 Master 本地：空规格的分布式片元路径未在真集群验证过。
+     * 去重节点 —— 复用「空聚合规格」聚合（输出 = 分组键 + 空聚合列 = 每组一行），与
+     * {@code UNION DISTINCT} 的 {@code distinctOver} 同一套机制，零新算子。键 = 上游全部输出列。
+     *
+     * <p>扫描载体走分布式空规格聚合、join 载体走二次 shuffle 聚合（每个键只落一个分区 ⇒
+     * 各分区结果的并集即全局去重集，无需 Master 合并）；改名投影 / 表达式投影 / 子查询等
+     * 无法把键下发给 Worker 的形态保持 Master 本地区重。</p>
      */
     private PhysicalNode buildDedupeNode(PhysicalNode upstream) {
         List<String> keys = new ArrayList<>(upstream.outputColumns());
@@ -2058,10 +2102,45 @@ public final class Planner {
             // 无具体列可作键（理论不出现）→ 不插去重节点，保持原计划而非抛错。
             return upstream;
         }
+        if (context.distributedExecution() && !hasRenamingProject(upstream)) {
+            List<WorkerRegistration> healthy = WorkerRegistry.get().healthy(context.workerHealthTimeoutMs());
+            if (!healthy.isEmpty()) {
+                PhysicalNode distributed = tryBuildDistributedAggregation(
+                        upstream, keys, List.of(), List.of(), List.of(), healthy, null);
+                if (distributed != null) {
+                    return distributed;
+                }
+                PhysicalNode shuffled = tryBuildShuffledJoinAggregation(
+                        upstream, keys, List.of(), List.of(), List.of(), healthy, null);
+                if (shuffled != null) {
+                    return shuffled;
+                }
+            }
+        }
         long distinctMemoryLimit = Math.min(context.memoryLimit(), ResourceConfig.masterAggregationMemoryBytes());
         HashAggregationOperator dedupe = new HashAggregationOperator(
                 upstream.operator(), keys, List.of(), distinctMemoryLimit);
         return new PhysicalNode("HashAggregation[Distinct]", dedupe, keys, upstream);
+    }
+
+    /**
+     * 提取路径上是否存在<b>改名投影</b>（{@code ProjectOperator.aliased}）。
+     *
+     * <p>{@code SELECT DISTINCT a AS x} 的去重键是投影输出名 {@code x}，而分布式聚合把键直接
+     * 当扫描列下发 —— 改名层之后扫描端不存在 {@code x}（报「列不存在」）。改名形态一律回退
+     * Master 本地去重；纯列选择（键是扫描列名的子集）不受影响。</p>
+     */
+    private static boolean hasRenamingProject(PhysicalNode node) {
+        Operator op = node.operator();
+        if (op instanceof ProjectOperator p) {
+            if (p.isAliased()) return true;
+        } else if (!(op instanceof CaseProjectOperator) && !(op instanceof ExpressionProjectOperator)) {
+            return false;
+        }
+        for (PhysicalNode child : node.children()) {
+            if (hasRenamingProject(child)) return true;
+        }
+        return false;
     }
 
     // ==================== UNNEST 行展开 ====================
@@ -2368,20 +2447,23 @@ public final class Planner {
      * @param outputColumns  派生体可见输出列（分组键 + 聚合输出列，与聚合算子输出序一致）
      * @param projections    投影型派生源的逐行表达式派生列（无聚合）；空 = 聚合型派生源
      * @param window         窗口型派生源的单窗口组（无聚合）；null = 非窗口型派生源
+     * @param projectionStages A2 多层投影阶段链（派生体内若干层纯投影/过滤，单个 Producer 内就地
+     *                        逐段执行、层间零 shuffle）；空 = 非阶段型派生源
      */
     private record DerivedPlan(ReadRequest innerRequest, List<String> innerKeys,
                                List<AggregationSpec> aggregations, List<CaseProjection> caseProjections,
                                String havingFilter, List<String> outputColumns,
                                List<StageScheduler.DerivedProjection> projections,
                                StageScheduler.DerivedWindow window,
-                               List<String> outerKeys, List<AggregationSpec> outerAggregations) {
+                               List<String> outerKeys, List<AggregationSpec> outerAggregations,
+                               List<FragmentSpec.ProjectionStage> projectionStages) {
 
         /** 聚合型派生源的便捷构造（无投影列）。 */
         DerivedPlan(ReadRequest innerRequest, List<String> innerKeys,
                     List<AggregationSpec> aggregations, List<CaseProjection> caseProjections,
                     String havingFilter, List<String> outputColumns) {
             this(innerRequest, innerKeys, aggregations, caseProjections, havingFilter, outputColumns,
-                    List.of(), null, List.of(), List.of());
+                    List.of(), null, List.of(), List.of(), List.of());
         }
 
         /** 投影型派生源的便捷构造（无窗口）。 */
@@ -2390,7 +2472,7 @@ public final class Planner {
                     String havingFilter, List<String> outputColumns,
                     List<StageScheduler.DerivedProjection> projections) {
             this(innerRequest, innerKeys, aggregations, caseProjections, havingFilter, outputColumns,
-                    projections, null, List.of(), List.of());
+                    projections, null, List.of(), List.of(), List.of());
         }
 
         /** 窗口型派生源的便捷构造（无二级聚合）。 */
@@ -2400,12 +2482,20 @@ public final class Planner {
                     List<StageScheduler.DerivedProjection> projections,
                     StageScheduler.DerivedWindow window) {
             this(innerRequest, innerKeys, aggregations, caseProjections, havingFilter, outputColumns,
-                    projections, window, List.of(), List.of());
+                    projections, window, List.of(), List.of(), List.of());
         }
 
-        /** true = 投影型派生源（无聚合，逐行表达式投影）。 */
+        /** 阶段化投影型派生源的便捷构造（A2）。 */
+        DerivedPlan(ReadRequest innerRequest, List<String> outputColumns,
+                    List<FragmentSpec.ProjectionStage> projectionStages) {
+            this(innerRequest, List.of(), List.of(), List.of(), null, outputColumns,
+                    List.of(), null, List.of(), List.of(), projectionStages);
+        }
+
+        /** true = 投影型派生源（无聚合，逐行表达式投影 或 A2 多层投影阶段链）。 */
         boolean isProjection() {
-            return projections != null && !projections.isEmpty();
+            return (projections != null && !projections.isEmpty())
+                    || (projectionStages != null && !projectionStages.isEmpty());
         }
 
         /** true = 窗口型派生源（无聚合，单窗口组窗口函数）。 */
@@ -2593,31 +2683,21 @@ public final class Planner {
         scan.setFetchLimit(scanFetchRows);   // 顶层 LIMIT 下推（0 = 不下推）
         if (!rel.columns().isEmpty()) scan.setColumns(rel.columns());
         // 谓词归属（谁执行这条 WHERE）：一律写进扫描请求的 filterExpression，由「数据所在地」执行 ——
-        //   ① 连接器兑现下推契约 → 数据源自己在扫描时过滤（推给它）；
-        //   ② 不兑现（如 Hive：只按切片读文件、不求值 filterExpression）→ 执行者换成引擎自己，
-        //      落在扫描节点（Worker）的 FilterOperator 上，见 WorkerControlProducer.scanAndSend /
-        //      FragmentExecutor.executeProducer（判定依据 = 连接器的 supportsPredicatePushdown()）。
+        //   ① 连接器兑现下推契约 → 数据源自己在扫描时过滤（推一部分或全部）；
+        //   ② 连接器不兑现 / 只认领了一部分（引擎函数未翻译，见 SqlTextUtil.splitByConnectorCapability）
+        //      → 残差由执行者（Worker）的引擎侧 FilterOperator 就地求值，见
+        //      ConnectorScanOperator.openWithEngineFilter / FragmentExecutor.executeProducer。
+        // 两段（rel.filter 与 extraPredicate）都以「完整谓词」写入：切分契约在 Planner 与 Worker
+        // 两侧同源（SqlTextUtil.splitByConnectorCapability），双份 split 结果必然一致。
         // ★ 分布式路径绝不在此处再包一层 Master 侧 Filter：那等于把整表拉回 Master 过滤（派发扫描
         //   的意义全丢 —— 大表直接打爆 Master 堆，曾实测 ~880MB 触发 OutOfMemoryError），而且
         //   extractBaseTable 遇 FilterOperator 即返回 null → 分布式聚合/窗口全部不成立。
-        List<String> localParts = new ArrayList<>(2);
-        if (pushdownCapable(probeConn)) {
-            rel.filter().ifPresent(f -> scan.pushdown(SqlTextUtil.stripQualifiers(f.text())));
-            if (extraPredicate.isPresent()) {
-                ScanPredicate sp = splitScanPredicate(extraPredicate.get(), probeConn);
-                if (sp.pushdown() != null) {
-                    scan.pushdown(sp.pushdown());
-                }
-                if (sp.residual() != null) {
-                    // 谓词含引擎注册函数且连接器未认领（renderFunctionPredicate 返回空）→ 数据源
-                    // 求不了值，只能本侧 Filter。能翻译成数据源方言的（如 CK 的 to_date→toDate）
-                    // 已在上面的 pushdown 里交给数据源。
-                    localParts.add(sp.residual());
-                }
-            }
-        } else {
-            rel.filter().ifPresent(f -> scan.pushdown(SqlTextUtil.stripQualifiers(f.text())));
-            extraPredicate.ifPresent(scan::pushdown);
+        rel.filter().ifPresent(f -> scan.pushdown(SqlTextUtil.stripQualifiers(f.text())));
+        extraPredicate.ifPresent(scan::pushdown);
+        if (SqlTextUtil.requiresEngineFilter(scan.predicates(), probeConn)) {
+            // 扫描之上将由 Worker 就地挂引擎侧过滤（会减行）→ 截断下推的前缀不再等于「结果前缀」，
+            // 撤销它（早停交给顶层 LimitOperator）。见 scanRowsAreOneToOne 同一不变量的另一侧。
+            scan.setFetchLimit(0L);
         }
         String name = "DistributedScan[" + schema + "." + table
                 + ", workers=" + workers.size()
@@ -2626,16 +2706,7 @@ public final class Planner {
         long estimatedRows = JoinCardinality.sideRows(statsProbe(probeConn),
                 rel.catalog(), schema, table,
                 estimateFilter(relScanFilter(rel), extraPredicate.orElse(null)));
-        PhysicalNode node = new PhysicalNode(name, scan, outCols, List.of()).withEstimate(estimatedRows);
-        if (!localParts.isEmpty()) {
-            String residualFilter = String.join(" AND ", localParts);
-            FilterOperator filter = new FilterOperator(scan, residualFilter);
-            node = new PhysicalNode("Filter[" + residualFilter + "]", filter, outCols, node);
-            // 扫描之上挂了会减行的算子（本侧 Filter）→ 截断下推的前缀不再等于「结果前缀」，
-            // 撤销它（早停交给顶层 LimitOperator）。见 scanRowsAreOneToOne 同一不变量的另一侧。
-            scan.setFetchLimit(0L);
-        }
-        return node;
+        return new PhysicalNode(name, scan, outCols, List.of()).withEstimate(estimatedRows);
     }
 
     // ==================== JOIN ====================
@@ -3522,14 +3593,16 @@ public final class Planner {
                 relScanFilter(peerRel),
                 jt, context.memoryLimit(), partitions,
                 context.workerGateway(), innerProbe, peerProbe, workers, dp.projections(), dp.window(),
-                dp.outerKeys(), dp.outerAggregations(), dp.isProjection() ? dp.outputColumns() : null,
-                joinAlgorithm);
+                joinAlgorithm, List.of(), List.of(),
+                dp.outerKeys(), dp.outerAggregations(),
+                dp.isProjection() ? dp.outputColumns() : null, dp.projectionStages());
 
         List<String> outCols = leftIsDerived
                 ? joinOutputColumns(jt, dp.outputColumns(), peerCols, derivedKeys, peerKeys)
                 : joinOutputColumns(jt, peerCols, dp.outputColumns(), peerKeys, derivedKeys);
         String name = "DistributedDerivedJoin[" + jt + (leftIsDerived ? ", derived=L" : ", derived=R")
-                + (dp.isProjection() ? ", projection=" + dp.projections().size() : "")
+                + (dp.isProjection() ? ", projection=" + dp.projections().size()
+                        + (dp.projectionStages().isEmpty() ? "" : "+stages=" + dp.projectionStages().size()) : "")
                 + (dp.isWindow() ? ", window=" + dp.window().functions().size() : "")
                 + (dp.isTwoLevel() ? ", twoLevel=true" : "")
                 + (dp.isProjection() || dp.isWindow() ? "" : ", groupBy=" + dp.innerKeys())
@@ -3617,7 +3690,7 @@ public final class Planner {
         // 派生内层限定：单裸基表 + 无 join/标量子查询 + 非空 groupBy（WHERE/HAVING 扩展①支持）
         if (inner.fromRelations().size() != 1 || !inner.joins().isEmpty()
                 || !inner.scalarSubqueries().isEmpty()) {
-            return null;
+            return rejectDerived(derivedRel, "聚合型", "派生体内层是多表 / 含 join / 含标量子查询");
         }
         if (inner.groupBy().isEmpty()) {
             // 无 GROUP BY 但含聚合函数 = <b>全局聚合</b>（恒 1 行）—— 非相关标量子查询去相关后的派生体
@@ -3627,10 +3700,10 @@ public final class Planner {
             if (!globalAgg) {
                 // 先试「窗口型派生表」—— `(SELECT 裸列, win() OVER (PARTITION BY k ORDER BY o)
                 // FROM 基表 WHERE p)` 语义等价于「基表扫描 + 按 k 分区 + 分区内本地窗口」，同样可完全分布式。
-                for (LogicalPlan.SelectItem item : inner.selectItems()) {
-                    if (item.expression() instanceof Expression.WindowFunction) {
-                        return planDerivedWindow(derivedRel, inner);
-                    }
+                // 窗口在<b>嵌套链的内层</b>（外层只是投影层）同样走窗口路径：屏障之上/之下的投影层
+                // 分别压进 Producer / MiddleWindowConsumer（B：任意投影层）。
+                if (chainHasWindow(inner)) {
+                    return planDerivedWindow(derivedRel, inner);
                 }
                 // 再试「投影型派生表」—— `(SELECT 裸列, 表达式 AS 别名 FROM 基表 WHERE p)`
                 // 语义等价于「基表扫描 + 逐行表达式物化派生列」，同样可完全分布式（无需拉回 Master）。
@@ -3648,7 +3721,12 @@ public final class Planner {
                 // 两级聚合派生体（max(sum(x))）：内层自身是「单裸表 + GROUP BY」，与外层分组键相同
                 // ⇒ 分区键 = 分组键，两级都能在分区内算成终态（DA 中间层跑两段聚合）。
                 DerivedPlan twoLevel = planDerivedTwoLevel(derivedRel, inner, flattened);
-                return twoLevel;   // 不支持的形态 → null（回退单机）
+                if (twoLevel == null) {
+                    // 内层派生体（聚合 / 投影 / 窗口）既展不平也接不成两级聚合 → 回退单机
+                    rejectDerived(derivedRel, "聚合型",
+                            "基表是未展平的嵌套派生 " + baseRel.table() + "（含聚合/表达式/改名/窗口层）");
+                }
+                return twoLevel;
             }
             baseRel = flattened;
         }
@@ -3954,7 +4032,7 @@ public final class Planner {
         }
         return new DerivedPlan(innerPlan.innerRequest(), innerPlan.innerKeys(),
                 innerPlan.aggregations(), innerPlan.caseProjections(),
-                null, outerCols, List.of(), null, outerKeys, outerAggs);
+                null, outerCols, List.of(), null, outerKeys, outerAggs, List.of());
     }
 
     /**
@@ -4000,6 +4078,182 @@ public final class Planner {
         return cur;
     }
 
+    /** {@link #inlineDerivedLayer} 的结果：折叠后的叶子基表 + 该层输出列 → 已内联表达式的替换表。 */
+    private record InlinedDerivedLayer(LogicalPlan.ResolvedRelation leaf,
+                                       Map<String, ExprNode> outputs) { }
+
+    /**
+     * 派生投影链<b>表达式内联</b>（阶段 2，A1 方案）：把「派生表套派生表、每层带表达式 / 过滤」的
+     * 嵌套体折叠成<b>等价的单层投影体</b>，交回 {@link #planDerivedProjection} 的既有 Producer
+     * 通道承接（零新算子 / 零新片段类型）。
+     *
+     * <p><b>做法</b>：从最内层往外，把每层 SELECT 项的表达式替换进外层对它的列引用
+     * （{@link ExprNode} 级替换、{@link ExprPrinter} 还原文本）；各层 WHERE 与关系谓词
+     * （{@code rel.filter()}）用同一替换表下推成「只引用叶子基表列」的谓词串，作为重写后
+     * {@code Select} 的 WHERE 交给扫描过滤 / 投影后过滤分类（见 planDerivedProjection 尾段）。
+     * <b>求值顺序天然正确</b>：合并谓词全部先于投影求值，内层过滤对外层表达式的门控不变。</p>
+     *
+     * <p><b>白名单</b>：单 FROM、无 join、无 GROUP BY / HAVING / DISTINCT / ORDER BY / LIMIT /
+     * OFFSET / 标量子查询、无窗口、无聚合、无 {@code *}、每层输出列名不重复、表达式可被
+     * {@link ExprParser} 解析。任一不满足 → 返回 {@code null}（调用方沿用原拒绝路径并显式回退
+     * Master，绝不静默改变语义）。</p>
+     */
+    private LogicalPlan.Select inlineDerivedProjection(LogicalPlan.Select outer,
+                                                       LogicalPlan.ResolvedRelation nestedBase) {
+        List<String> whereParts = new ArrayList<>();
+        InlinedDerivedLayer chain = inlineDerivedLayer(nestedBase, whereParts);
+        if (chain == null) return null;
+        List<LogicalPlan.SelectItem> items = new ArrayList<>(outer.selectItems().size());
+        for (LogicalPlan.SelectItem item : outer.selectItems()) {
+            String text = item.expression().text().trim();
+            if (notInlinableItem(item, text)) return null;
+            ExprNode node = parseForInline(text);
+            if (node == null) return null;
+            // 输出名必须是<b>内联前</b>的名字（外层派生关系的声明列）：替换后的表达式文本
+            // （如 `x` → `id + 1`）会变，不能让下游按新文本重新推导列名。
+            String outName = item.alias().orElseGet(() -> SqlTextUtil.isColumnRef(text)
+                    ? SqlTextUtil.stripQualifier(text) : SqlTextUtil.normalize(text));
+            items.add(new LogicalPlan.SelectItem(
+                    new Expression.OpaqueExpr(ExprPrinter.print(substituteColumns(node, chain.outputs()))),
+                    Optional.of(outName)));
+        }
+        if (outer.where().isPresent()) {
+            ExprNode node = parseForInline(outer.where().get().text());
+            if (node == null) return null;
+            whereParts.add("(" + ExprPrinter.print(substituteColumns(node, chain.outputs())) + ")");
+        }
+        Optional<Expression> where = whereParts.isEmpty() ? Optional.empty()
+                : Optional.of(new Expression.OpaqueExpr(String.join(" AND ", whereParts)));
+        return new LogicalPlan.Select(items, List.of(chain.leaf()), List.of(), where,
+                List.of(), Optional.empty(), List.of(), List.of(),
+                Optional.empty(), Optional.empty(), false);
+    }
+
+    /** 逐层内联（{@link #inlineDerivedProjection} 的递归主体）；不可内联返回 {@code null}。 */
+    private InlinedDerivedLayer inlineDerivedLayer(LogicalPlan.ResolvedRelation rel,
+                                                   List<String> whereParts) {
+        if (rel.subquery().isEmpty()) {
+            // 叶子基表：谓词直接引用基表列，无需替换。谓词一并后即从关系上摘下，
+            // 避免 planDerivedProjection 再把 baseRel.filter() 并进扫描谓词（重复求值）。
+            if (rel.filter().isEmpty()) {
+                return new InlinedDerivedLayer(rel, Map.of());
+            }
+            whereParts.add("(" + rel.filter().get().text() + ")");
+            return new InlinedDerivedLayer(new LogicalPlan.ResolvedRelation(rel.catalog(),
+                    rel.schema(), rel.table(), rel.alias(), rel.columns(),
+                    Optional.empty(), Optional.empty()), Map.of());
+        }
+        if (!(rel.subquery().get() instanceof LogicalPlan.Select s)) return null;
+        if (!s.joins().isEmpty() || s.fromRelations().size() != 1
+                || !s.scalarSubqueries().isEmpty() || s.distinct() || s.having().isPresent()
+                || !s.groupBy().isEmpty() || !s.orderBy().isEmpty()
+                || s.limit().isPresent() || s.offset().isPresent()) {
+            return null;
+        }
+        InlinedDerivedLayer inner = inlineDerivedLayer(s.fromRelations().get(0), whereParts);
+        if (inner == null) return null;
+        if (s.where().isPresent()) {
+            ExprNode node = parseForInline(s.where().get().text());
+            if (node == null) return null;
+            whereParts.add("(" + ExprPrinter.print(substituteColumns(node, inner.outputs())) + ")");
+        }
+        Map<String, ExprNode> outputs = new HashMap<>();
+        for (LogicalPlan.SelectItem item : s.selectItems()) {
+            String text = item.expression().text().trim();
+            if (notInlinableItem(item, text) || hasAggregateCall(text)) return null;
+            ExprNode node = parseForInline(text);
+            if (node == null) return null;
+            String outName = item.alias().orElseGet(() -> SqlTextUtil.isColumnRef(text)
+                    ? SqlTextUtil.stripQualifier(text) : SqlTextUtil.normalize(text));
+            if (outputs.put(outName.toLowerCase(Locale.ROOT),
+                    substituteColumns(node, inner.outputs())) != null) {
+                return null;   // 同层输出重名：外层引用有歧义，拒绝
+            }
+        }
+        // 关系层谓词（引用本层输出列）→ 替换后并入 WHERE（AND 交换律，顺序无关）
+        if (rel.filter().isPresent()) {
+            ExprNode node = parseForInline(rel.filter().get().text());
+            if (node == null) return null;
+            whereParts.add("(" + ExprPrinter.print(substituteColumns(node, outputs)) + ")");
+        }
+        return new InlinedDerivedLayer(inner.leaf(), outputs);
+    }
+
+    /** 内联白名单：{@code *} / 窗口参与表达式 / 整项窗口函数 → 不是逐行投影，拒绝内联。 */
+    private static boolean notInlinableItem(LogicalPlan.SelectItem item, String text) {
+        return isStarExpansion(text) || !item.windowCalls().isEmpty()
+                || item.expression() instanceof Expression.WindowFunction;
+    }
+
+    private static ExprNode parseForInline(String text) {
+        try {
+            return ExprParser.parse(text);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 列引用替换（大小写不敏感）：命中替换表 → 换入已内联的表达式 AST。<b>按层遮蔽</b>由调用方
+     * 保证 —— 每层只拿「下一层输出列」的表，派生表输出对其外层天然遮蔽基表同名列。
+     */
+    private static ExprNode substituteColumns(ExprNode node, Map<String, ExprNode> outputs) {
+        if (outputs.isEmpty()) return node;
+        if (node instanceof ExprNode.Column c) {
+            ExprNode repl = outputs.get(c.name().toLowerCase(Locale.ROOT));
+            return repl != null ? repl : node;
+        }
+        if (node instanceof ExprNode.Arith a) {
+            return new ExprNode.Arith(a.op(),
+                    substituteColumns(a.left(), outputs), substituteColumns(a.right(), outputs));
+        }
+        if (node instanceof ExprNode.Negate n) {
+            return new ExprNode.Negate(substituteColumns(n.operand(), outputs));
+        }
+        if (node instanceof ExprNode.Compare c) {
+            return new ExprNode.Compare(c.op(),
+                    substituteColumns(c.left(), outputs), substituteColumns(c.right(), outputs));
+        }
+        if (node instanceof ExprNode.IsNull n) {
+            return new ExprNode.IsNull(substituteColumns(n.operand(), outputs), n.negated());
+        }
+        if (node instanceof ExprNode.InList in) {
+            List<ExprNode> values = new ArrayList<>(in.values().size());
+            for (ExprNode v : in.values()) values.add(substituteColumns(v, outputs));
+            return new ExprNode.InList(substituteColumns(in.operand(), outputs), values, in.negated());
+        }
+        if (node instanceof ExprNode.Like l) {
+            return new ExprNode.Like(substituteColumns(l.operand(), outputs),
+                    substituteColumns(l.pattern(), outputs), l.negated());
+        }
+        if (node instanceof ExprNode.BoolOp b) {
+            return new ExprNode.BoolOp(b.op(),
+                    substituteColumns(b.left(), outputs), substituteColumns(b.right(), outputs));
+        }
+        if (node instanceof ExprNode.Not n) {
+            return new ExprNode.Not(substituteColumns(n.operand(), outputs));
+        }
+        if (node instanceof ExprNode.Cast c) {
+            return new ExprNode.Cast(substituteColumns(c.operand(), outputs), c.type(),
+                    c.precision(), c.scale(), c.tryCast());
+        }
+        if (node instanceof ExprNode.Case c) {
+            List<ExprNode.WhenThen> branches = new ArrayList<>(c.branches().size());
+            for (ExprNode.WhenThen wt : c.branches()) {
+                branches.add(new ExprNode.WhenThen(substituteColumns(wt.cond(), outputs),
+                        substituteColumns(wt.then(), outputs)));
+            }
+            return new ExprNode.Case(branches, c.elseExpr() == null ? null
+                    : substituteColumns(c.elseExpr(), outputs));
+        }
+        if (node instanceof ExprNode.FuncCall f) {
+            List<ExprNode> args = new ArrayList<>(f.args().size());
+            for (ExprNode a : f.args()) args.add(substituteColumns(a, outputs));
+            return new ExprNode.FuncCall(f.name(), args);
+        }
+        return node;   // Literal
+    }
+
     /**
      * 解析<b>投影型</b>派生表 —— {@code (SELECT 裸列…, 表达式 AS 别名… FROM 单裸基表 WHERE p)}：无分组、
      * 无聚合，仅逐行物化表达式派生列。语义等价于「基表扫描 + 投影 + 过滤」，但派生列在 Worker
@@ -4031,8 +4285,27 @@ public final class Planner {
         }
         LogicalPlan.ResolvedRelation baseRel = inner.fromRelations().get(0);
         if (baseRel.subquery().isPresent()) {
-            // 嵌套派生：应由 tryFlattenSimpleDerived 逐层展平（不在此重复）
-            return rejectProjection(derivedRel, "基表是未展平的嵌套派生 " + baseRel.table());
+            // 嵌套派生：先按 join 链同款逐层展平（单裸表 + 裸列投影 + WHERE 的中间层全部可剥）；
+            // 展平不了（中间层有表达式 / 改名）再走阶段 2「表达式内联」—— 把整条嵌套链替换成
+            // 等价的单层投影体（各层表达式代入外层引用、各层谓词合并），仍由本方法既有通道承接。
+            LogicalPlan.ResolvedRelation flattened = tryFlattenSimpleDerived(baseRel);
+            if (flattened.subquery().isPresent()) {
+                LogicalPlan.Select inlined = inlineDerivedProjection(inner, baseRel);
+                if (inlined == null) {
+                    // 阶段 3（A2）：行级内联表达不了（中间层 SELECT * / 跨层重名 / 别名改写）时，
+                    // 把各层原样编成「有序投影阶段链」压进单个派生基表 Producer —— 层间零 shuffle，
+                    // 求值顺序 = 子查询层序（本层 WHERE 先于本层表达式）。
+                    DerivedPlan staged = planDerivedChain(derivedRel, inner, false);
+                    if (staged != null) {
+                        return staged;
+                    }
+                    return rejectProjection(derivedRel, "基表是未展平的嵌套派生 " + baseRel.table()
+                            + "（含聚合/窗口/不可解析表达式层）");
+                }
+                inner = inlined;
+                flattened = inner.fromRelations().get(0);
+            }
+            baseRel = flattened;
         }
         // 派生关系上的谓词（外层 WHERE 下推所致）：先解析出引用列集，投影项分析完后再判定
         // 「并入扫描过滤（纯基表裸列）」还是「投影后过滤（引用派生别名）」。否则外层谓词一出现
@@ -4318,6 +4591,22 @@ public final class Planner {
     }
 
     /**
+     * 派生表分布式下沉<b>放弃</b>的统一埋点（聚合 / 窗口 / 两级聚合等此前静默 {@code return null}
+     * 的路径）：恒返回 {@code null} 供调用方直接 {@code return}。同一关系 + 同一原因只报一次
+     * （{@link #reportedDerivedRejects}），避免 A-方案重试刷屏。
+     */
+    private DerivedPlan rejectDerived(LogicalPlan.ResolvedRelation derivedRel, String stage, String reason) {
+        String name = derivedRel.table() == null || derivedRel.table().isBlank()
+                ? "subquery" : derivedRel.table();
+        String key = stage + "|" + derivedRel.catalog() + "." + derivedRel.schema() + "." + name
+                + "|" + reason;
+        if (reportedDerivedRejects.add(key)) {
+            System.err.printf("[Planner] %s派生源无法下沉（%s）：%s → 回退 Master%n", stage, name, reason);
+        }
+        return null;
+    }
+
+    /**
      * 解析<b>窗口型</b>派生表 —— {@code (SELECT 裸列…, win() OVER (PARTITION BY k ORDER BY o) FROM 单裸基表 WHERE p)}：
      * 无分组、无聚合，仅按 {@code k} 哈希分区后由每分区本地排序 + 逐行计算（{@code MiddleWindowConsumer}），
      * 随后按该层 join 键分区进交换 —— 派生体留在 Worker 侧流向 join，数据不回流 Master。
@@ -4331,16 +4620,51 @@ public final class Planner {
      */
     private DerivedPlan planDerivedWindow(LogicalPlan.ResolvedRelation derivedRel,
                                           LogicalPlan.Select inner) {
+        boolean outerHasWindow = false;
+        for (LogicalPlan.SelectItem item : inner.selectItems()) {
+            if (item.expression() instanceof Expression.WindowFunction) {
+                outerHasWindow = true;
+                break;
+            }
+        }
+        if (!outerHasWindow) {
+            // 窗口在<b>嵌套层</b>、外层只是投影层：屏障 + 上下投影层整链编排（B）。
+            DerivedPlan chained = planDerivedChain(derivedRel, inner, true);
+            if (chained != null) {
+                return chained;
+            }
+            return rejectDerived(derivedRel, "窗口型", "窗口在嵌套层且链路含不支持形态");
+        }
+        // 窗口在派生体外层：老路径（裸列 + 窗口 + 可展平基表，已验证）优先；它拒绝的形态
+        // （表达式 / 改名投影项、未展平的嵌套基表、派生关系谓词）交 B 整链兜底 ——
+        // 屏障上下的投影层分别压进 Producer / MiddleWindowConsumer，一律留在 Worker。
+        DerivedPlan legacy = planDerivedWindowLegacy(derivedRel, inner);
+        if (legacy != null) {
+            return legacy;
+        }
+        return planDerivedChain(derivedRel, inner, true);
+    }
+
+    /** 窗口在派生体外层的<b>老路径</b>（不处理投影层链）；不支持的形态返回 {@code null}。 */
+    private DerivedPlan planDerivedWindowLegacy(LogicalPlan.ResolvedRelation derivedRel,
+                                                LogicalPlan.Select inner) {
         if (inner.distinct() || inner.having().isPresent()
                 || !inner.orderBy().isEmpty() || inner.limit().isPresent() || inner.offset().isPresent()) {
-            return null;   // DISTINCT / HAVING / 排序·分页：窗口型无法表达 → 回退单机
-        }
-        if (derivedRel.filter().isPresent()) {
-            return null;   // 派生关系上的谓词：要在窗口之后再过滤 → 后置
+            // DISTINCT / HAVING / 排序·分页：窗口型无法表达 → 回退单机
+            return rejectDerived(derivedRel, "窗口型", "DISTINCT / HAVING / ORDER BY / LIMIT / OFFSET");
         }
         LogicalPlan.ResolvedRelation baseRel = inner.fromRelations().get(0);
         if (baseRel.subquery().isPresent()) {
-            return null;   // 嵌套派生：应由 tryFlattenSimpleDerived 逐层展平（不在此重复）
+            // 嵌套派生：先逐层展平（与投影型同口径）；展平不了 → 交给 B 整链（调用方兜底）
+            LogicalPlan.ResolvedRelation flattened = tryFlattenSimpleDerived(baseRel);
+            if (flattened.subquery().isPresent()) {
+                return null;
+            }
+            baseRel = flattened;
+        }
+        if (derivedRel.filter().isPresent()) {
+            // 派生关系上的谓词：老路径不支持窗口后过滤 → 交给 B 整链（尾阶段），此处不报「回退」
+            return null;
         }
         DojaoConnector probe = connectorFor(baseRel.catalog());
         if (probe == null) {
@@ -4508,6 +4832,583 @@ public final class Planner {
                 List.of(), window);
     }
 
+    // ============ A2 / B：派生多级嵌套链（任意投影层 + 至多一个窗口屏障） ============
+
+    /**
+     * 派生链的一层：{@code body} = 该层 {@code Select}，{@code input} = 其唯一 FROM 关系
+     * （下层派生或裸基表）。{@code items} 是需要物化的表达式 / 改名列（裸列透传不进该表），
+     * {@code windows} 是整项窗口函数，{@code byOut} 是本层全部输出名 → 项的解析表。
+     */
+    private record ChainLayer(LogicalPlan.Select body, LogicalPlan.ResolvedRelation input,
+                              boolean star, List<ChainLayerItem> items,
+                              List<ChainLayerItem> windows,
+                              Map<String, ChainLayerItem> byOut) {
+    }
+
+    /**
+     * 派生链某层的一个 SELECT 项。
+     *
+     * @param outName      该层对外输出名（裸列 = 列名；改名 / 表达式 = 别名或规范化文本）
+     * @param exprText     逐行求值表达式文本（裸列透传 / 窗口项为 null）
+     * @param passThrough  裸列原样透传（无需物化）
+     * @param windowOutput 整项窗口函数（由窗口屏障产出）
+     * @param srcCols      该层输入页上的来源列名（透传项 = 自身；窗口项为空）
+     * @param window       窗口函数 AST（仅 windowOutput = true）
+     */
+    private record ChainLayerItem(String outName, String exprText, boolean passThrough,
+                                  boolean windowOutput, List<String> srcCols,
+                                  Expression.WindowFunction window) {
+    }
+
+    /** 窗口屏障：单组窗口函数（PARTITION BY / ORDER BY 全链一致）+ 输入列清单（含到扫描投影）。 */
+    private record ChainWindow(List<String> partitionBy, List<String> orderBy, List<Boolean> ascending,
+                               List<WindowFunctionSpec> specs, List<String> windowColumns,
+                               List<String> inputs) {
+    }
+
+    /** 派生链（任意层）是否含「整项窗口函数」；窗口嵌在表达式里不算（下沉不支持，交由下层拒绝）。 */
+    private static boolean chainHasWindow(LogicalPlan.Select select) {
+        for (LogicalPlan.SelectItem item : select.selectItems()) {
+            if (item.expression() instanceof Expression.WindowFunction) {
+                return true;
+            }
+        }
+        if (select.fromRelations().size() == 1) {
+            LogicalPlan.ResolvedRelation from = select.fromRelations().get(0);
+            if (from.subquery().isPresent() && from.subquery().get() instanceof LogicalPlan.Select s) {
+                return chainHasWindow(s);
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 收集「纯投影链」：自最外层（{@code inner}）沿唯一 FROM 的派生关系逐层向下，直到裸基表。
+     * 每层限：单 FROM / 无 join / 无标量子查询 / 空 GROUP BY / 无 DISTINCT / HAVING / ORDER BY /
+     * LIMIT / OFFSET / 无聚合调用 / 无「窗口嵌在表达式里」；{@code *} 的限定符须指向本层 FROM。
+     * 任一层不满足 → {@code null}（调用方回退 Master，本地完整支持）。
+     */
+    private List<ChainLayer> collectDerivedChain(LogicalPlan.Select inner) {
+        List<ChainLayer> layers = new ArrayList<>();
+        LogicalPlan.Select body = inner;
+        LogicalPlan.ResolvedRelation input = inner.fromRelations().get(0);
+        while (true) {
+            ChainLayer layer = parseChainLayer(body, input);
+            if (layer == null) {
+                return null;
+            }
+            layers.add(layer);
+            if (input.subquery().isEmpty()) {
+                return layers;   // 到达裸基表
+            }
+            if (!(input.subquery().get() instanceof LogicalPlan.Select s)
+                    || s.fromRelations().size() != 1) {
+                return null;
+            }
+            body = s;
+            input = s.fromRelations().get(0);
+        }
+    }
+
+    /** 解析链上的一层（{@link #collectDerivedChain} 的白名单实现）；不支持返回 {@code null}。 */
+    private ChainLayer parseChainLayer(LogicalPlan.Select body, LogicalPlan.ResolvedRelation input) {
+        if (!body.joins().isEmpty() || body.fromRelations().size() != 1
+                || !body.scalarSubqueries().isEmpty() || body.distinct() || body.having().isPresent()
+                || !body.groupBy().isEmpty() || !body.orderBy().isEmpty()
+                || body.limit().isPresent() || body.offset().isPresent()) {
+            return null;
+        }
+        boolean star = false;
+        List<ChainLayerItem> items = new ArrayList<>();
+        List<ChainLayerItem> windows = new ArrayList<>();
+        Map<String, ChainLayerItem> byOut = new LinkedHashMap<>();
+        for (LogicalPlan.SelectItem item : body.selectItems()) {
+            String text = item.expression().text().trim();
+            if (isStarExpansion(text)) {
+                if (!starQualifierMatchesBase(text, input)) {
+                    return null;
+                }
+                star = true;
+                continue;
+            }
+            if (item.expression() instanceof Expression.WindowFunction wf) {
+                String out = windowOutputName(item, wf);
+                // 窗口列是「追加」物化的：与输入列同名 ⇒ 页内两份同名列，按名解析取到基表那份 → 拒绝
+                if (containsIgnoreCase(input.columns(), out)) {
+                    return null;
+                }
+                ChainLayerItem ci = new ChainLayerItem(out, null, false, true, List.of(), wf);
+                if (byOut.putIfAbsent(out.toLowerCase(Locale.ROOT), ci) != null) {
+                    return null;   // 同层输出重名
+                }
+                windows.add(ci);
+                continue;
+            }
+            if (!item.windowCalls().isEmpty() || hasAggregateCall(text)) {
+                return null;
+            }
+            if (SqlTextUtil.isColumnRef(text)) {
+                String col = SqlTextUtil.stripQualifier(text);
+                int idx = indexOfIgnoreCase(input.columns(), col);
+                if (idx < 0) {
+                    return null;
+                }
+                String canonical = input.columns().get(idx);
+                boolean renamed = item.alias().isPresent()
+                        && !item.alias().get().equalsIgnoreCase(canonical);
+                if (!renamed) {
+                    ChainLayerItem ci = new ChainLayerItem(canonical, null, true, false,
+                            List.of(canonical), null);
+                    if (byOut.putIfAbsent(canonical.toLowerCase(Locale.ROOT), ci) != null) {
+                        return null;
+                    }
+                } else {
+                    String out = item.alias().get();
+                    if (containsIgnoreCase(input.columns(), out)) {
+                        return null;   // 改名撞输入列 → 页内歧义
+                    }
+                    ChainLayerItem ci = new ChainLayerItem(out, canonical, false, false,
+                            List.of(canonical), null);
+                    if (byOut.putIfAbsent(out.toLowerCase(Locale.ROOT), ci) != null) {
+                        return null;
+                    }
+                    items.add(ci);
+                }
+                continue;
+            }
+            String out = item.alias().orElseGet(() -> SqlTextUtil.normalize(text));
+            if (!SqlTextUtil.isSingleIdentifier(out) || containsIgnoreCase(input.columns(), out)) {
+                return null;   // 默认名不是标识符 / 别名撞输入列 → 回退
+            }
+            ExprNode node;
+            List<String> src;
+            try {
+                node = ExprParser.parse(text);
+                src = new ArrayList<>(new ExprEvaluator(node).columnArgs());
+            } catch (RuntimeException e) {
+                return null;
+            }
+            for (String c : src) {
+                if (indexOfIgnoreCase(input.columns(), c) < 0) {
+                    return null;   // 表达式引用列不在本层输入
+                }
+            }
+            ChainLayerItem ci = new ChainLayerItem(out, text, false, false, src, null);
+            if (byOut.putIfAbsent(out.toLowerCase(Locale.ROOT), ci) != null) {
+                return null;
+            }
+            items.add(ci);
+        }
+        return new ChainLayer(body, input, star, items, windows, byOut);
+    }
+
+    /**
+     * A2 / B 的统一实现：把「投影层链（可含至多一个窗口屏障）」编成一份派生源计划。
+     *
+     * <pre>
+     *   扫描(最内层 WHERE + 基表谓词) ─► 屏障下投影层#k(过滤→物化) ─…─► 屏障下投影层#1
+     *       ─► 按窗口 PARTITION BY 分区 ─► MiddleWindowConsumer 本地窗口
+     *       ─► 屏障上投影层#1(过滤→物化) ─…─► 屏障上投影层#m ─► [派生关系谓词] ─► 裁回对外列
+     * </pre>
+     *
+     * <p>无窗口时即 A2：全链阶段压进<b>同一个</b>派生基表 Producer（层间零 shuffle）。
+     * 有窗口时即 B：投影层分别压进屏障下的 Producer 与屏障上的 MiddleWindowConsumer，
+     * <b>shuffle 次数 = 屏障 / 分区键变化次数，与嵌套深度无关</b>。</p>
+     *
+     * @param requireWindow true = 只接受含窗口屏障的链（窗口型路由）；false = 只接受无窗口的链
+     * @return {@code null} = 形态不支持 / 类型不可静态推断 → 调用方回退 Master（本地完整支持）
+     */
+    private DerivedPlan planDerivedChain(LogicalPlan.ResolvedRelation derivedRel,
+                                         LogicalPlan.Select inner, boolean requireWindow) {
+        if (derivedRel.subquery().isPresent()
+                && materializedCtes.containsKey(derivedRel.subquery().get())) {
+            return null;
+        }
+        List<ChainLayer> layers = collectDerivedChain(inner);
+        if (layers == null) {
+            return null;
+        }
+        int windowIdx = -1;
+        for (int i = 0; i < layers.size(); i++) {
+            if (!layers.get(i).windows().isEmpty()) {
+                if (windowIdx >= 0) {
+                    return null;   // 两个窗口屏障（多层窗口）：单次分区表达不了
+                }
+                windowIdx = i;
+            }
+        }
+        if (requireWindow != (windowIdx >= 0)) {
+            return null;
+        }
+        LogicalPlan.ResolvedRelation baseRel = layers.get(layers.size() - 1).input();
+        DojaoConnector probe = connectorFor(baseRel.catalog());
+        if (probe == null) {
+            return null;
+        }
+        // 基表列清单 + 类型：链上所有表达式的静态类型推断都以此为准
+        List<String> baseCols = new ArrayList<>(baseRel.columns());
+        try {
+            for (Column c : probe.getTableColumns(
+                    baseRel.catalog(), baseRel.schema(), baseRel.table())) {
+                if (c != null && c.name() != null && !containsIgnoreCase(baseCols, c.name())) {
+                    baseCols.add(c.name());
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // 元数据不可得 → 仅用语义层列清单
+        }
+        Map<String, Field> baseTypes = new HashMap<>();
+        try {
+            for (Field f : AbstractDistributedOperator.scanFields(probe,
+                    baseRel.catalog(), baseRel.schema(), baseRel.table(), baseCols)) {
+                if (f != null && f.getName() != null) {
+                    baseTypes.put(f.getName().toLowerCase(Locale.ROOT), f);
+                }
+            }
+        } catch (RuntimeException e) {
+            return null;   // 类型不可得 → 不猜，回退单机
+        }
+        ChainWindow win = null;
+        if (windowIdx >= 0) {
+            win = buildChainWindow(layers.get(windowIdx));
+            if (win == null) {
+                return null;
+            }
+        }
+
+        // 1) 需求列走查（自外向內）：每层输出页上「被上层引用」的列 → 该层输入的来源列
+        Set<String> needOut = new HashSet<>(lowerSet(derivedRel.columns()));
+        String outerFilter = derivedRel.filter().isPresent()
+                ? SqlTextUtil.stripQualifiers(derivedRel.filter().get().text()) : null;
+        if (outerFilter != null) {
+            Set<String> parsed = predicateColumns(outerFilter);
+            if (parsed == null) {
+                return null;
+            }
+            for (String c : parsed) {
+                needOut.add(c.toLowerCase(Locale.ROOT));
+            }
+        }
+        List<Set<String>> needAt = new ArrayList<>(layers.size());
+        List<Set<String>> inputNeedAt = new ArrayList<>(layers.size());
+        for (int j = 0; j < layers.size(); j++) {
+            ChainLayer layer = layers.get(j);
+            needAt.add(needOut);
+            Set<String> inputNeed = new HashSet<>();
+            if (needOut.isEmpty()) {
+                // 外层不加约束（列裁剪不可用）→ 本层全部表达式都物化、来源全部进扫描
+                for (ChainLayerItem it : layer.items()) {
+                    for (String s : it.srcCols()) {
+                        inputNeed.add(s.toLowerCase(Locale.ROOT));
+                    }
+                }
+            } else {
+                for (String name : needOut) {
+                    ChainLayerItem it = layer.byOut().get(name);
+                    if (it == null) {
+                        // 星号层的「未显式列出的输出」= 输入原样透传
+                        if (!layer.star() || indexOfIgnoreCase(layer.input().columns(), name) < 0) {
+                            return null;   // 上层要的名字本层产不出
+                        }
+                        inputNeed.add(name);
+                        continue;
+                    }
+                    if (it.windowOutput()) {
+                        continue;   // 屏障产出；输入需求见下方窗口块
+                    }
+                    if (it.passThrough()) {
+                        inputNeed.add(name);
+                    } else {
+                        for (String s : it.srcCols()) {
+                            inputNeed.add(s.toLowerCase(Locale.ROOT));
+                        }
+                    }
+                }
+            }
+            // 本层 WHERE（求值于本层输入页）
+            if (layer.body().where().isPresent()) {
+                Set<String> refs = predicateColumns(
+                        SqlTextUtil.stripQualifiers(layer.body().where().get().text()));
+                if (refs == null) {
+                    return null;
+                }
+                for (String c : refs) {
+                    inputNeed.add(c.toLowerCase(Locale.ROOT));
+                }
+            }
+            // 本层 FROM 关系上挂的谓词（同样求值于本层输入页；裸基表的并入扫描请求）
+            if (layer.input().filter().isPresent()) {
+                Set<String> refs = predicateColumns(
+                        SqlTextUtil.stripQualifiers(layer.input().filter().get().text()));
+                if (refs == null) {
+                    return null;
+                }
+                for (String c : refs) {
+                    inputNeed.add(c.toLowerCase(Locale.ROOT));
+                }
+            }
+            if (j == windowIdx) {
+                for (String c : win.inputs()) {
+                    inputNeed.add(c.toLowerCase(Locale.ROOT));
+                }
+            }
+            inputNeedAt.add(inputNeed);
+            needOut = inputNeed;
+        }
+        List<String> needed = new ArrayList<>();
+        if (inputNeedAt.get(layers.size() - 1).isEmpty()) {
+            return null;   // 链上无任何列可读（纯常量链）→ 既有路径承接
+        }
+        for (String name : inputNeedAt.get(layers.size() - 1)) {
+            int idx = indexOfIgnoreCase(baseCols, name);
+            if (idx < 0) {
+                return null;   // 引用列不在基表（含中间层漏产出）
+            }
+            String canonical = baseCols.get(idx);
+            if (!containsIgnoreCase(needed, canonical)) {
+                needed.add(canonical);
+            }
+        }
+
+        // 2) 扫描请求（最内层 WHERE + 基表谓词并入，连接器可做分区裁剪 / 引擎 Filter 兜底）
+        List<String> whereParts = new ArrayList<>(2);
+        ChainLayer innermost = layers.get(layers.size() - 1);
+        innermost.body().where().ifPresent(e -> whereParts.add(SqlTextUtil.stripQualifiers(e.text())));
+        innermost.input().filter().ifPresent(e -> whereParts.add(SqlTextUtil.stripQualifiers(e.text())));
+        String innerFilter = whereParts.isEmpty() ? null : String.join(" AND ", whereParts);
+        ReadRequest innerRequest = probe.pruneColumns(
+                ReadRequest.of(baseRel.catalog(), baseRel.schema(), baseRel.table()), needed);
+        innerRequest = (innerFilter == null || innerFilter.isBlank())
+                ? innerRequest : innerRequest.withFilter(innerFilter);
+
+        // 3) 自内向外构造阶段（执行序；单层内恒为「本层过滤 → 本层表达式」）
+        List<FragmentSpec.ProjectionStage> stages = new ArrayList<>();
+        List<FragmentSpec.ProjectionStage> preStages = new ArrayList<>();
+        List<FragmentSpec.ProjectionStage> postStages = new ArrayList<>();
+        Map<String, Field> page = new LinkedHashMap<>();
+        for (String c : needed) {
+            Field f = baseTypes.get(c.toLowerCase(Locale.ROOT));
+            if (f == null) {
+                return null;
+            }
+            page.put(c.toLowerCase(Locale.ROOT), f);
+        }
+        boolean windowBuilt = false;
+        for (int j = layers.size() - 1; j >= 0; j--) {
+            ChainLayer layer = layers.get(j);
+            boolean isWindowLayer = j == windowIdx;
+            String filter = chainStageFilter(layer, j == layers.size() - 1);
+            if (filter != null) {
+                Set<String> refs = predicateColumns(filter);
+                if (refs == null) {
+                    return null;
+                }
+                for (String c : refs) {
+                    if (!page.containsKey(c.toLowerCase(Locale.ROOT))) {
+                        return null;
+                    }
+                }
+            }
+            List<FragmentSpec.ProjectionStage> target = windowBuilt ? postStages
+                    : (windowIdx >= 0 ? preStages : stages);
+            if (isWindowLayer) {
+                // 屏障：本层 WHERE（+ 输入关系谓词）在窗口<b>之前</b>求值
+                if (filter != null) {
+                    preStages.add(new FragmentSpec.ProjectionStage(List.of(), filter, List.of()));
+                }
+                // 窗口函数把结果列追加在本层输入页尾部（先入页，屏障上的表达式阶段再求值）
+                for (WindowFunctionSpec spec : win.specs()) {
+                    Field input = spec.inputColumn() == null ? null
+                            : page.get(spec.inputColumn().toLowerCase(Locale.ROOT));
+                    if (spec.inputColumn() != null && input == null) {
+                        return null;
+                    }
+                    page.put(spec.outputColumn().toLowerCase(Locale.ROOT),
+                            new Field(spec.outputColumn(),
+                                    FieldType.nullable(spec.outputArrowType(input)), null));
+                }
+                windowBuilt = true;
+                FragmentSpec.ProjectionStage stat = buildChainStage(layer, needAt.get(j), page);
+                if (stat == null) {
+                    return null;
+                }
+                if (!stat.expressions().isEmpty()) {
+                    postStages.add(stat);
+                    applyChainStage(page, stat);
+                }
+                continue;
+            }
+            FragmentSpec.ProjectionStage stat = buildChainStage(layer, needAt.get(j), page);
+            if (stat == null) {
+                return null;
+            }
+            if (!stat.expressions().isEmpty() || filter != null) {
+                FragmentSpec.ProjectionStage withFilter = new FragmentSpec.ProjectionStage(
+                        stat.expressions(), filter, stat.fields());
+                target.add(withFilter);
+                applyChainStage(page, withFilter);
+            }
+        }
+        List<String> outputColumns = new ArrayList<>(derivedRel.columns());
+        for (String c : outputColumns) {
+            if (!page.containsKey(c.toLowerCase(Locale.ROOT))) {
+                return null;   // 对外列产出不了
+            }
+        }
+        // 派生关系上的谓词：全链投影之后再过滤（引用对外列名，页内均存在）
+        if (outerFilter != null) {
+            FragmentSpec.ProjectionStage tail = new FragmentSpec.ProjectionStage(
+                    List.of(), outerFilter, List.of());
+            (windowIdx >= 0 ? postStages : stages).add(tail);
+        }
+
+        if (windowIdx >= 0) {
+            StageScheduler.DerivedWindow dw = new StageScheduler.DerivedWindow(
+                    win.partitionBy(), win.orderBy(), win.ascending(), win.specs(), win.windowColumns(),
+                    preStages, null, postStages, outputColumns);
+            return new DerivedPlan(innerRequest, List.of(), List.of(), List.of(), null, outputColumns,
+                    List.of(), dw);
+        }
+        if (stages.isEmpty()) {
+            return null;   // 纯透传链（无表达式 / 无过滤）→ 既有路径承接
+        }
+        return new DerivedPlan(innerRequest, outputColumns, stages);
+    }
+
+    /** 本层「屏障前 / 本层前置」过滤：最内层并入扫描请求（此处返回 null），其余层 = WHERE + 输入关系谓词。 */
+    private static String chainStageFilter(ChainLayer layer, boolean innermost) {
+        if (innermost) {
+            return null;
+        }
+        List<String> parts = new ArrayList<>(2);
+        layer.body().where().ifPresent(e -> parts.add("(" + SqlTextUtil.stripQualifiers(e.text()) + ")"));
+        if (layer.input().subquery().isPresent() && layer.input().filter().isPresent()) {
+            parts.add("(" + SqlTextUtil.stripQualifiers(layer.input().filter().get().text()) + ")");
+        }
+        return parts.isEmpty() ? null : String.join(" AND ", parts);
+    }
+
+    /**
+     * 构造一层的物化阶段（不含过滤）：只物化「上层还需要」的项（需要集为空 = 不裁剪）。
+     * 声明类型必须静态推断出 —— 推断不出返回 {@code null}（不猜，回退 Master）。
+     */
+    private FragmentSpec.ProjectionStage buildChainStage(ChainLayer layer, Set<String> neededFromLayer,
+                                                          Map<String, Field> page) {
+        List<GroupKeyExpression> exprs = new ArrayList<>();
+        List<Field> fields = new ArrayList<>();
+        for (ChainLayerItem it : layer.items()) {
+            if (!neededFromLayer.isEmpty()
+                    && !neededFromLayer.contains(it.outName().toLowerCase(Locale.ROOT))) {
+                continue;
+            }
+            Field f;
+            if (SqlTextUtil.isColumnRef(it.exprText())) {
+                Field src = page.get(it.srcCols().get(0).toLowerCase(Locale.ROOT));
+                if (src == null) {
+                    return null;
+                }
+                f = new Field(it.outName(), src.getFieldType(), null);
+            } else {
+                ExprNode node;
+                try {
+                    node = ExprParser.parse(it.exprText());
+                } catch (RuntimeException e) {
+                    return null;
+                }
+                Map<String, Field> srcFields = new HashMap<>(it.srcCols().size());
+                for (String c : it.srcCols()) {
+                    Field sf = page.get(c.toLowerCase(Locale.ROOT));
+                    if (sf == null) {
+                        return null;
+                    }
+                    srcFields.put(c, sf);
+                }
+                f = inferExprField(it.outName(), node, srcFields);
+                if (f == null) {
+                    return null;   // 类型不可静态推断
+                }
+            }
+            exprs.add(new GroupKeyExpression(it.outName(), it.exprText()));
+            fields.add(f);
+        }
+        return new FragmentSpec.ProjectionStage(exprs, null, fields);
+    }
+
+    /** 阶段执行后的页布局（与 {@code ExpressionProjectOperator} 同口径：同名覆盖、新名追加）。 */
+    private static void applyChainStage(Map<String, Field> page, FragmentSpec.ProjectionStage stage) {
+        for (GroupKeyExpression e : stage.expressions()) {
+            page.remove(e.derivedColumn().toLowerCase(Locale.ROOT));
+        }
+        for (int i = 0; i < stage.expressions().size(); i++) {
+            Field f = stage.fields() != null && i < stage.fields().size() ? stage.fields().get(i) : null;
+            page.put(stage.expressions().get(i).derivedColumn().toLowerCase(Locale.ROOT), f);
+        }
+    }
+
+    /** 窗口屏障规格：单组窗口函数（同 PARTITION BY / ORDER BY）+ 分区 / 排序 / 输入列。 */
+    private ChainWindow buildChainWindow(ChainLayer layer) {
+        List<ChainLayerItem> windows = layer.windows();
+        Expression.WindowFunction first = windows.get(0).window();
+        String groupKey = first.partitionBy() + "§" + first.orderBy();
+        for (ChainLayerItem it : windows) {
+            Expression.WindowFunction wf = it.window();
+            if (!(wf.partitionBy() + "§" + wf.orderBy()).equals(groupKey)) {
+                return null;   // 多窗口组：分区键不同，单次哈希分区表达不了
+            }
+        }
+        List<String> partitionBy = new ArrayList<>();
+        for (String p : first.partitionBy()) {
+            String col = SqlTextUtil.stripQualifier(p);
+            int idx = indexOfIgnoreCase(layer.input().columns(), col);
+            if (idx < 0) {
+                return null;
+            }
+            String canonical = layer.input().columns().get(idx);
+            if (!containsIgnoreCase(partitionBy, canonical)) {
+                partitionBy.add(canonical);
+            }
+        }
+        List<String> orderBy = new ArrayList<>();
+        List<Boolean> ascending = new ArrayList<>();
+        for (String o : first.orderBy()) {
+            SqlTextUtil.OrderKey ok = SqlTextUtil.parseOrderKey(o);
+            int idx = indexOfIgnoreCase(layer.input().columns(), ok.column());
+            if (idx < 0) {
+                return null;
+            }
+            orderBy.add(layer.input().columns().get(idx));
+            ascending.add(ok.ascending());
+        }
+        List<WindowFunctionSpec> specs = new ArrayList<>();
+        List<String> windowColumns = new ArrayList<>();
+        for (ChainLayerItem it : windows) {
+            WindowFunctionSpec spec;
+            try {
+                spec = toWindowSpec(it.window(), it.outName());
+            } catch (RuntimeException e) {
+                return null;   // 不支持的窗口函数 / 参数形态
+            }
+            if (spec.inputColumn() != null
+                    && indexOfIgnoreCase(layer.input().columns(), spec.inputColumn()) < 0) {
+                return null;
+            }
+            specs.add(spec);
+            windowColumns.add(it.outName());
+        }
+        List<String> inputs = new ArrayList<>(partitionBy);
+        for (String o : orderBy) {
+            if (!containsIgnoreCase(inputs, o)) {
+                inputs.add(o);
+            }
+        }
+        for (WindowFunctionSpec s : specs) {
+            if (s.inputColumn() != null && !containsIgnoreCase(inputs, s.inputColumn())) {
+                inputs.add(s.inputColumn());
+            }
+        }
+        return new ChainWindow(partitionBy, orderBy, ascending, specs, windowColumns, inputs);
+    }
+
     /**
      * 静态推断表达式的 Arrow 列（供投影型派生源的<b>声明列</b>）—— 返回 {@code null} = 推断不出。
      *
@@ -4562,6 +5463,11 @@ public final class Planner {
 
     /** {@link DerivedPlan} → 舞台层的派生源描述（{@link StageScheduler.DerivedSource}）。 */
     private static StageScheduler.DerivedSource derivedSource(DerivedPlan dp, DojaoConnector innerProbe) {
+        if (dp.projectionStages() != null && !dp.projectionStages().isEmpty()) {
+            return new StageScheduler.DerivedSource(innerProbe, dp.innerRequest(), dp.innerKeys(),
+                    dp.aggregations(), dp.caseProjections(), dp.havingFilter(),
+                    dp.projectionStages(), dp.outputColumns());
+        }
         return new StageScheduler.DerivedSource(innerProbe, dp.innerRequest(), dp.innerKeys(),
                 dp.aggregations(), dp.caseProjections(), dp.havingFilter(), dp.projections(), dp.window(),
                 dp.outputColumns());
@@ -6580,11 +7486,24 @@ public final class Planner {
         }
 
         // ★DISTINCT：必须放在上面两处派生列包装<b>之后</b>（分组键可能是派生列名，得先在流里存在）。
-        //   刻意走 Master 本地聚合而非分布式下推：分布式聚合的片元协议 / 终端汇总路径此前只在
-        //   「至少一个聚合函数」下验证过，空聚合规格（去重）那条路未在真集群上跑过 —— 不做未验证的
-        //   优化。去重的哈希表通常很小（city×province 这类分组的基数低），Master 侧内存可控；
-        //   待分布式空规格路径在集群上验证通过后，再把它接进下面的分布式分支。
+        //   空聚合规格（去重）与「每分区完整聚合」共用同一套片元机制（UNION DISTINCT 已在生产用它）：
+        //   扫描载体走分布式聚合，join 载体走二次 shuffle 聚合；都不成立才回退 Master 本地去重。
         if (distinctOnly) {
+            if (context.distributedExecution()) {
+                List<WorkerRegistration> healthy = WorkerRegistry.get().healthy(context.workerHealthTimeoutMs());
+                if (!healthy.isEmpty()) {
+                    PhysicalNode distributed = tryBuildDistributedAggregation(
+                            upstream, keys, List.of(), caseProjections, groupKeyExpressions, healthy, expand);
+                    if (distributed != null) {
+                        return distributed;
+                    }
+                    PhysicalNode shuffled = tryBuildShuffledJoinAggregation(
+                            upstream, keys, List.of(), caseProjections, groupKeyExpressions, healthy, expand);
+                    if (shuffled != null) {
+                        return shuffled;
+                    }
+                }
+            }
             long distinctMemoryLimit = Math.min(context.memoryLimit(), ResourceConfig.masterAggregationMemoryBytes());
             HashAggregationOperator dedupe = new HashAggregationOperator(
                     upstream.operator(), keys, List.of(), distinctMemoryLimit);
@@ -7422,7 +8341,7 @@ public final class Planner {
             for (CaseProjection cp : caseProjections) {
                 addCaseReferencedColumns(cp, upstream.outputColumns(), needed);
             }
-            if (!probe.supportsPredicatePushdown()) {
+            if (SqlTextUtil.requiresEngineFilter(base.predicates, probe)) {
                 for (String c : engineFilterColumns(base.predicates)) {
                     if (!needed.contains(c)) needed.add(c);
                 }
@@ -7802,7 +8721,10 @@ public final class Planner {
         // 穿投影 / CASE 派生列 / GROUP BY 表达式派生列 / <b>外连接同名列消歧（ColumnAlias）</b>
         // 取分布式 join 基。别名必须随舞台转交：Worker 在本地 join 后、按分组键重哈希前套用
         // （分组键常引用 __jk_<col>_<k>，否则重建后找不到列 → 只能回退 Master）。
-        WindowChainJoinBase probe = probeWindowChainJoinBase(upstream);
+        // ★join 之上的 Filter（WHERE）不再一票否决：收集各层过滤叶子，随舞台下发到最末层
+        //   Worker，在 join 输出（含外连接别名）上、展开 / 重哈希之前执行。
+        List<String> joinFilters = new ArrayList<>();
+        WindowChainJoinBase probe = probeWindowChainJoinBase(upstream, joinFilters);
         DistributedJoinOperator djo = probe == null ? null : probe.join();
         if (djo == null || djo.links().isEmpty()) {
             return null;
@@ -7825,6 +8747,20 @@ public final class Planner {
                 return null;
             }
         }
+        // join 之上的过滤只能在「join 输出列」上求值（Worker 最末层 join 之后执行）。引用列
+        // 无法解析 / 不在 join 输出（改名投影的别名、聚合 / 窗口派生列等）→ 回退 Master 本地聚合。
+        for (String filter : joinFilters) {
+            List<String> refs = FilterOperator.referencedColumnsOf(filter);
+            if (refs.isEmpty()) {
+                return null;
+            }
+            for (String ref : refs) {
+                if (!joinCols.contains(ref.toLowerCase(java.util.Locale.ROOT))) {
+                    return null;
+                }
+            }
+        }
+        String joinFilter = joinFilters.isEmpty() ? null : String.join(" AND ", joinFilters);
         // 派生源（子查询 / CTE 的迷你流水线）由本算子原样转交 StageScheduler（sources 参数）——
         // 链上 CROSS 环节的 build 侧单值广播同样随 sources 生效，不再回退 Master 单机聚合。
         int partitions = djo.numPartitions();
@@ -7838,7 +8774,7 @@ public final class Planner {
                 StageScheduler.downgradeBroadcast(djo.links()), djo.memoryLimit(),
                 keys, aggs, caseProjections, partitions,
                 djo.gateway(), djo.workers(), djo.firstColumns(), expand,
-                groupKeyExpressions, djo.sources(), aliases);
+                groupKeyExpressions, djo.sources(), aliases, joinFilter);
 
         List<String> outCols = new ArrayList<>(keys);
         outCols.addAll(aggs.stream().map(AggregationSpec::outputColumn).toList());
@@ -8698,10 +9634,22 @@ public final class Planner {
      * join + 窗口链完整留在 Worker，不再回退。</p>
      */
     private WindowChainJoinBase probeWindowChainJoinBase(PhysicalNode node) {
+        return probeWindowChainJoinBase(node, null);
+    }
+
+    /**
+     * 同 {@link #probeWindowChainJoinBase(PhysicalNode)}，但当 {@code filterSink} 非 null 时<b>允许
+     * 穿过 FilterOperator</b> 并把每个过滤叶子收集进去（join→Filter→聚合 下沉）。
+     *
+     * <p>{@code applyFilterIfSimple} 对每个顶层 AND 合取项各包一层 Filter，故必须逐层下探、
+     * 不能只解一层。收集到的谓词由调用方校验「引用列 ⊆ join 输出列」后在 Worker 最末层 join
+     * 之后执行 —— 窗口链路径传 null 保持「遇 Filter 即回退」的既有口径。</p>
+     */
+    private WindowChainJoinBase probeWindowChainJoinBase(PhysicalNode node, List<String> filterSink) {
         Operator op = node.operator();
         if (op instanceof ColumnAliasOperator ca) {
             if (node.children().size() != 1) return null;
-            WindowChainJoinBase inner = probeWindowChainJoinBase(node.children().get(0));
+            WindowChainJoinBase inner = probeWindowChainJoinBase(node.children().get(0), filterSink);
             if (inner == null) return null;
             List<FragmentSpec.JoinAlias> all = new ArrayList<>(inner.outputAliases());
             List<String> cols = new ArrayList<>(inner.columns());
@@ -8713,11 +9661,21 @@ public final class Planner {
         }
         if (op instanceof ProjectOperator || op instanceof CaseProjectOperator
                 || op instanceof ExpressionProjectOperator) {
-            return node.children().size() == 1 ? probeWindowChainJoinBase(node.children().get(0)) : null;
+            return node.children().size() == 1
+                    ? probeWindowChainJoinBase(node.children().get(0), filterSink) : null;
         }
-        // 残余谓词须在 join 之后执行，窗口前还有过滤 → 上游形状无法重建（保持既有回退口径）
+        // 残余谓词须在 join 之后执行，窗口前还有过滤 → 上游形状无法重建（保持既有回退口径）；
+        // 二次 shuffle 聚合路径（filterSink 非空）则把过滤收集起来，交给最末层 Worker 就地执行。
         if (op instanceof FilterOperator) {
-            return null;
+            if (filterSink == null) {
+                return null;
+            }
+            FilterOperator f = (FilterOperator) op;
+            if (node.children().size() != 1 || f.filterExpression() == null) {
+                return null;
+            }
+            filterSink.add(SqlTextUtil.stripQualifiers(f.filterExpression()));
+            return probeWindowChainJoinBase(node.children().get(0), filterSink);
         }
         // 携带后续阶段（聚合 / 窗口）的算子是不可再重建的边界：窗口链只能挂在纯 join 之上，
         // 否则 withWindowChain 会把内层聚合 / 已有窗口整段顶掉（聚合后开窗 → 窗口挂在明细行上）。
@@ -8932,9 +9890,10 @@ public final class Planner {
         List<String> winOutCols = inputColumns.subList(upstream.outputColumns().size(), inputColumns.size());
 
         DojaoConnector probe = connectorFor(base.catalog);
-        // 生产者扫描只取窗口前的输出列；连接器不兑现下推时把引擎过滤列并进扫描投影。
+        // 生产者扫描只取窗口前的输出列；连接器不兑现下推、或谓词含未认领的函数残差时，
+        // 把引擎过滤列并进扫描投影（Worker 侧引擎过滤就地求值）。
         List<String> projection = new ArrayList<>(upstream.outputColumns());
-        if (probe != null && !probe.supportsPredicatePushdown()) {
+        if (SqlTextUtil.requiresEngineFilter(base.predicates, probe)) {
             for (String c : engineFilterColumns(base.predicates)) {
                 if (!projection.contains(c)) projection.add(c);
             }

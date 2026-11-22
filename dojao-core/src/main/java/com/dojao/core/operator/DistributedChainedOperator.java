@@ -205,7 +205,8 @@ public class DistributedChainedOperator extends AbstractDistributedOperator
                     leftCatalog, leftSchema, leftTable, leftKeys,
                     rightCatalog, rightSchema, rightTable, rightKeys,
                     joinType, memoryLimit, leftProbe, rightProbe, windowChain,
-                    leftFilter, rightFilter, leftColumns, rightColumns, outputAliases);
+                    leftFilter, rightFilter, leftColumns, rightColumns, outputAliases,
+                    terminalReshuffleAggregate);
 
             List<FragmentSpec> fragments = withTerminal(stage.fragments());   // 仅终端组挂 sink / top-N
             for (FragmentSpec fragment : fragments) {
@@ -237,6 +238,16 @@ public class DistributedChainedOperator extends AbstractDistributedOperator
     protected void closeProbes() {
         try { leftProbe.closeRead(); } catch (Throwable ignored) { }
         try { rightProbe.closeRead(); } catch (Throwable ignored) { }
+    }
+
+    /**
+     * 仅<b>多组窗口链</b>（{@code windowChain != null}）支持二次 shuffle 聚合尾 —— 该形态走
+     * {@link StageScheduler#planJoinWindowChain}，末组窗口可改为中间层。单组 followUp 形态走
+     * {@code planChainedJoin}（窗口与 join 同片段），本批不扩展，返回 false 保持回退 Master。
+     */
+    @Override
+    public boolean supportsReshuffleAggregate() {
+        return windowChain != null;
     }
 
     /**
@@ -300,7 +311,20 @@ public class DistributedChainedOperator extends AbstractDistributedOperator
         if (windowChain != null) {
             // 每组窗口在其输入页后追加本组函数列（输入 = 上一组输出）。LAG/LEAD 的镜像列
             // 必须按「当前累计列」解析（引用的是 join 输出列，不会引用窗口函数结果）。
-            return windowChainOutputFields(wire, windowChain);
+            List<Field> windowOut = windowChainOutputFields(wire, windowChain);
+            FragmentSpec.AggregateStep tail = terminalReshuffleAggregate;
+            if (tail == null) {
+                return windowOut;
+            }
+            // 二次 shuffle 聚合尾：终端输出页 = 分组键（窗口输出里按名取）+ 聚合结果列
+            //（CASE 派生列先并入输入侧，与 Worker 侧 CaseProjectOperator 追加列同口径）。
+            List<Field> aggInput = withDerivedFields(windowOut, tail.caseProjections());
+            List<Field> out = new ArrayList<>(tail.keyColumns().size() + tail.aggregations().size());
+            out.addAll(fieldsByNames(aggInput, tail.keyColumns()));
+            for (FragmentSpec.AggregationDto dto : tail.aggregations()) {
+                out.add(dtoAggregationField(dto, aggInput));
+            }
+            return out;
         }
         return switch (followUp) {
             case FragmentSpec.WindowStep w -> {

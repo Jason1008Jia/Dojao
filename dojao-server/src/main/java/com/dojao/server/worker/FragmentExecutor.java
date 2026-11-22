@@ -323,6 +323,20 @@ public final class FragmentExecutor {
             // 谓词在数据所在地执行：连接器认识的推给数据源，引擎注册函数谓词在<b>本节点</b>补 Filter
             // ——位置在派生列 / 哈希分区之前（少过滤 = 多 shuffle，且分区前过滤语义与单机一致）
             Operator scan = ConnectorScanOperator.openWithEngineFilter(conn, scanStep.request(), scanStep.split());
+            // 有序投影阶段链（A2 多层派生投影 / B 窗口基表投影链）：逐段「过滤（求值于本段输入）→
+            // 物化派生列」，层间零 shuffle —— 多层派生表在单个 Worker 片段内就地收敛成最终列。
+            for (FragmentSpec.ProjectionStage stage : spec.projectionStages()) {
+                if (stage.filter() != null) {
+                    for (String cond : SqlTextUtil.splitConjuncts(stage.filter())) {
+                        if (!cond.isBlank()) {
+                            scan = new FilterOperator(scan, cond);
+                        }
+                    }
+                }
+                if (!stage.expressions().isEmpty()) {
+                    scan = new ExpressionProjectOperator(scan, stage.expressions());
+                }
+            }
             // GROUP BY 表达式派生列：分组键是分区键，须在哈希分区前先物化派生列，否则同值行散到不同桶
             if (!spec.groupKeyExpressions().isEmpty()) {
                 scan = new ExpressionProjectOperator(scan, spec.groupKeyExpressions());
@@ -446,11 +460,21 @@ public final class FragmentExecutor {
         // 外连接同名列消歧：join 输出先补 __jk_* 副本，再按下一层键重分区 —— 下一层窗口 / join
         // 键（经 aliasOuterJoinKeyRefs 改写）引用这些副本，缺了在 Worker 侧解析不到列。
         Operator aliased = applyJoinAliases(join, joinStep);
-        // 多维聚合展开（最末层才有）：join 输出之后、按 (维度…, gid) 重哈希之前复制行 ——
+        // join 之上的行级谓词（join→Filter→聚合 下沉）：在别名之后、展开 / 重哈希之前逐条执行。
+        // 顺序不可变 —— 过滤要看到完整宽行（含 __jk_* 副本）；放在展开之后会把 count/sum 放大。
+        Operator filtered = aliased;
+        if (spec.filterAfterJoin() != null && !spec.filterAfterJoin().isBlank()) {
+            for (String cond : SqlTextUtil.splitConjuncts(spec.filterAfterJoin())) {
+                if (!cond.isBlank()) {
+                    filtered = new FilterOperator(filtered, cond);
+                }
+            }
+        }
+        // 多维聚合展开（最末层才有）：join 输出（+过滤）之后、按 (维度…, gid) 重哈希之前复制行 ——
         // 整条 join 链只跑一次，基表只扫一次
         Operator expand = spec.expand() == null ? null
-                : new ExpandOperator(aliased, spec.expand().dimColumns(), spec.expand().groupingSets());
-        Operator downstream = expand != null ? expand : aliased;
+                : new ExpandOperator(filtered, spec.expand().dimColumns(), spec.expand().groupingSets());
+        Operator downstream = expand != null ? expand : filtered;
         // 下一层窗口 / join 键含表达式：重分区前物化合成列
         downstream = applyComputed(downstream, spec.nextComputed());
         // 分区级实时遥测（Join 框 n 个分区任务）：Hash / SortMerge 两种算法都实现了分区访问器
@@ -602,6 +626,23 @@ public final class FragmentExecutor {
         // 键表达式合成列 / 排序 / 窗口 / 收窄 → 下一组窗口键的合成列（重分区前物化）
         Operator win = buildWindow(spec.fragmentId(), src, w, spec.in().ownedCount());
         Operator feed = applyComputed(win, spec.nextComputed());
+        // 窗口之后的投影层链（B）：窗口输出 → 逐段「过滤 → 物化」→ 裁回派生可见列 → 重哈希。
+        // 物理页里窗口内部临时列 / 基表多余列不进 join 页（下游按声明列组装）。
+        for (FragmentSpec.ProjectionStage stage : spec.postStages()) {
+            if (stage.filter() != null) {
+                for (String cond : SqlTextUtil.splitConjuncts(stage.filter())) {
+                    if (!cond.isBlank()) {
+                        feed = new FilterOperator(feed, cond);
+                    }
+                }
+            }
+            if (!stage.expressions().isEmpty()) {
+                feed = new ExpressionProjectOperator(feed, stage.expressions());
+            }
+        }
+        if (spec.outputColumns() != null) {
+            feed = new ProjectOperator(feed, spec.outputColumns());
+        }
         HashPartitionOperator part = null;
         boolean completed = false;
         try {
