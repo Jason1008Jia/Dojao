@@ -3297,7 +3297,10 @@ function renderSqlTable(r) {
     // 每个表头都可点排序：图标恒在（未排 = 淡显，升/降 = 亮显 + 降序翻转 180°）。
     // data-name 存「纯列名」：右键「复制列名」直接取它，不用去刨末端的排序箭头。
     // 行号列：显示区专用（不参与排序 / 导出 / 复制）—— 无 data-col，故右键不弹列名菜单。
-    var ths = '<th class="row-num-th" title="\u884c\u53f7">#</th>';
+    var ths = '';
+    // show detail 列（行号左侧）：仅普通视图。转置视图里每行是一个字段，不存在「单行全字段」明细。
+    if (!sqlTransposed) ths += '<th class="row-detail-th" title="show detail"></th>';
+    ths += '<th class="row-num-th" title="\u884c\u53f7">#</th>';
     for (var i = 0; i < view.width; i++) {
         var active = (sqlSortCol === i && sqlSortDir !== 0);
         var cls = 'th-sort' + (active ? (sqlSortDir > 0 ? ' asc' : ' desc') : '');
@@ -3309,7 +3312,8 @@ function renderSqlTable(r) {
     headEl.innerHTML = '<tr>' + ths + '</tr>';
 
     if (!view.rows.length) {
-        bodyEl.innerHTML = '<tr><td style="color:' + UI.faint + '" colspan="' + (view.width + 1) + '">'
+        var emptySpan = view.width + 1 + (sqlTransposed ? 0 : 1);
+        bodyEl.innerHTML = '<tr><td style="color:' + UI.faint + '" colspan="' + emptySpan + '">'
             + (running ? '\u6b63\u5728\u8ba1\u7b97\u2026' : '\uff08\u7ed3\u679c\u96c6\u4e3a\u7a7a\uff09')
             + '</td></tr>';
         syncResultTools();
@@ -3318,7 +3322,13 @@ function renderSqlTable(r) {
 
     bodyEl.innerHTML = view.rows.map(function (row, idx) {
         // 行号按「显示顺序」给（排序后即为新位置 1..N）；无 res-cell / data-col，不参与导出与右键复制
-        var cells = ['<td class="row-num" title="\u884c\u53f7">' + (idx + 1) + '</td>'];
+        var cells = [];
+        if (!sqlTransposed) {
+            cells.push('<td class="row-detail-cell"><button type="button" class="row-detail-btn"'
+                + ' title="show detail" aria-label="show detail"'
+                + ' onclick="openRowDetail(' + idx + ')">' + rowDetailIcon() + '</button></td>');
+        }
+        cells.push('<td class="row-num" title="\u884c\u53f7">' + (idx + 1) + '</td>');
         for (var i = 0; i < view.width; i++) {
             var v = (row && row[i] !== undefined && row[i] !== null) ? row[i] : '';
             // res-cell 标记「真数据格」：右键菜单据此区分数据区与「（结果集为空）」占位行。
@@ -3331,6 +3341,45 @@ function renderSqlTable(r) {
         return '<tr>' + cells.join('') + '</tr>';
     }).join('');
     syncResultTools();
+}
+
+// ---------------- 行内 show detail（单行数据明细：列转行弹窗） ----------------
+
+/** 行内「show detail」按钮图标：两条对角箭头（右上 + 左下），即 Hue 同款的「展开明细」图标。 */
+function rowDetailIcon() {
+    return '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor"'
+        + ' stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+        + '<polyline points="10 2 14 2 14 6"/><line x1="14" y1="2" x2="9" y2="7"/>'
+        + '<polyline points="6 14 2 14 2 10"/><line x1="2" y1="14" x2="7" y2="9"/>'
+        + '</svg>';
+}
+
+/** 明细单元格取值：NULL 淡色标注，其余完整展示（不截断，换行交给 CSS）。 */
+function rowDetailValue(v) {
+    if (v === undefined || v === null) return '<span class="row-detail-null">NULL</span>';
+    return esc(v);
+}
+
+/**
+ * 打开某行的「数据明细」：把该行的所有字段<b>列转行</b>成 字段 → 值 两列，弹窗完整展示
+ * （Hue 数据展示区 show detail 同款语义）。行号取「显示顺序」（排序后的位置），与表格所见一致。
+ */
+function openRowDetail(idx) {
+    if (!sqlLastResult || !(sqlLastResult.rows || []).length) return;
+    if (sqlTransposed) return;   // 转置视图里每行是一个字段，无「单行全字段」明细
+    var view = sqlResultView();
+    var row = view.rows[idx];
+    if (!row) return;
+    var cols = view.cols;
+    var tbody = '';
+    for (var i = 0; i < cols.length; i++) {
+        tbody += '<tr><th>' + esc(cols[i]) + '</th><td>' + rowDetailValue(row[i]) + '</td></tr>';
+    }
+    var body = '<div class="row-detail-table-wrap"><table class="row-detail-table"><tbody>'
+        + tbody + '</tbody></table></div>';
+    mgModal('\u6570\u636e\u660e\u7ec6 \u00b7 \u7b2c ' + (idx + 1) + ' \u884c', body);
+    var modal = document.querySelector('#mg-overlay .mg-modal');
+    if (modal) modal.classList.add('mg-modal-wide');
 }
 
 // ---------------- 结果手动出图（ECharts）----------------

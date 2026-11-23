@@ -182,7 +182,7 @@ public final class ExprEvaluator {
 
         out.setInitialCapacity(rowCount);
         out.allocateNew();
-        // LIST 结果（split / from_str_to_array）：startNewValue 记录本行 list 起点 →
+        // LIST 结果（split / from_str_to_array / json_array_explode）：startNewValue 记录本行 list 起点 →
         // 子列按累积下标连续写 → endValue
         ListVector listOut = out instanceof ListVector lv ? lv : null;
         VarCharVector listChild = null;
@@ -254,6 +254,7 @@ public final class ExprEvaluator {
             "md5", "sha1", "sha2", "uuid",
             // 日期时间（返回 LocalDate/LocalDateTime，运行时统一按文本落 Utf8）
             "date_format", "from_unixtime", "to_date", "current_date", "current_timestamp",
+            "now", "current_date_time",
             "date_add", "date_sub", "add_months", "last_day", "next_day",
             "from_utc_timestamp", "to_utc_timestamp");
 
@@ -263,7 +264,7 @@ public final class ExprEvaluator {
 
     /** 静态返回数组的内置标量函数（整批全 NULL 时据此落 LIST 向量，而不是 Int64 兜底）。 */
     private static final Set<String> LIST_RETURNING_FUNCTIONS =
-            Set.of("split", "from_str_to_array");
+            Set.of("split", "from_str_to_array", "json_array_explode");
 
     /** 全 NULL 结果的静态类型类别（决定输出向量类型）。 */
     private enum NullKind { NONE, STRING, DOUBLE, DECIMAL, BIGINT, BIT, LIST }

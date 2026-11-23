@@ -12,7 +12,8 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * 单个分区的状态：3 个槽位、Arrow 文件、内存索引。
+ * 单个分区的状态：若干卡槽（默认 3；单槽预算过小时算子会降为 2，见
+ * {@code AbstractSpillableOperator#selectSlotCount()}）、Arrow 文件、内存索引。
  *
  * @param <S> 槽位类型
  * @author jiaxin
@@ -176,7 +177,12 @@ public class PartitionState<S extends Slot> {
     void awaitIdleSlot() {
         slotLock.lock();
         try {
-            while (spillingSlots.size() >= slotCount - 1) {
+            // 等待条件 = 全部卡槽都在写（而不是「只剩一个空闲」）：
+            // 3 槽 ⇒ 最多 2 写 + 1 收（设计峰值）；2 槽 ⇒ 1 写 + 1 收。
+            // 若沿用 >= slotCount - 1，2 槽会在每次提交后立刻等待刚提交的那次溢写 ——
+            // 「异步」退化成逐槽同步；而拉取线程是跨分区共享的（窗口算子 5 个分区一个线程），
+            // 单个分区的同步化会把整条流水线一起停摆。
+            while (spillingSlots.size() >= slotCount) {
                 if (cancelled) throw new CancellationException("溢写等待槽位时被取消");
                 try { slotAvailable.await(1, TimeUnit.SECONDS); }
                 catch (InterruptedException e) {

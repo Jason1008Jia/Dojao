@@ -136,17 +136,17 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
         if (pa.batchFiles.isEmpty()) {
             // 纯内存路径：数据没溢写
             RowAccumulator theAcc = null;
-            int slotCount = 0;
-            for (int s = 0; s < SLOT_COUNT; s++) {
+            int filled = 0;
+            for (int s = 0; s < pa.slots.size(); s++) {
                 checkCancelled();
                 RowAccumulator acc = pa.slots.get(s);
                 if (acc == null || acc.isEmpty()) continue;
                 if (theAcc == null) theAcc = acc;
-                slotCount++;
+                filled++;
             }
-            if (slotCount == 0) return;
+            if (filled == 0) return;
 
-            if (slotCount == 1 && theAcc != null) {
+            if (filled == 1 && theAcc != null) {
                 // ★ 零拷贝路径：只出排序索引，不拷贝数据
                 pa.sortedIndices = buildSortedIndices(theAcc);
                 pa.indexSource = theAcc;
@@ -157,7 +157,7 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
                 // 多 slot：回退原有拷贝路径（罕见）
                 List<VectorSchemaRoot> sortedRoots = new ArrayList<>();
                 try {
-                    for (int s = 0; s < SLOT_COUNT; s++) {
+                    for (int s = 0; s < pa.slots.size(); s++) {
                         checkCancelled();
                         RowAccumulator acc = pa.slots.get(s);
                         if (acc == null || acc.isEmpty()) continue;
@@ -186,7 +186,7 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
         } else {
             // 有溢写文件：剩余 slot 数据写成 Arrow 文件（补充到 batchFiles），
             // 后续 compactPartition 归并成 key 连续文件
-            for (int s = 0; s < SLOT_COUNT; s++) {
+            for (int s = 0; s < pa.slots.size(); s++) {
                 checkCancelled();
                 RowAccumulator acc = pa.slots.get(s);
                 if (acc == null || acc.isEmpty()) continue;

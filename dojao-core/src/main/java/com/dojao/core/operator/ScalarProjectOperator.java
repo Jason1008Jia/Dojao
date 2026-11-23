@@ -152,10 +152,24 @@ public final class ScalarProjectOperator extends AbstractMeasurableOperator {
 
             // 1. 求值所有标量表达式 → 计算列向量（先全部求完，再统一组装，避免重复读上游）
             Map<String, FieldVector> computed = new HashMap<>();
-            for (int i = 0; i < projections.size(); i++) {
-                Projection p = projections.get(i);
-                computed.put(p.outputName(),
-                        evaluators.get(i).evaluate(inRoot, allocator, p.outputName()));
+            try {
+                for (int i = 0; i < projections.size(); i++) {
+                    Projection p = projections.get(i);
+                    computed.put(p.outputName(),
+                            evaluators.get(i).evaluate(inRoot, allocator, p.outputName()));
+                }
+            } catch (RuntimeException | Error e) {
+                // 求值失败（参数个数错 / 非法输入等）：已算出的计算列与上游页必须就地释放。
+                // 否则查询报错后收尾时的 "Memory was leaked by query" 会盖住真正的异常原因。
+                for (FieldVector v : computed.values()) {
+                    try {
+                        v.close();
+                    } catch (RuntimeException ignored) {
+                        // 释放失败不能盖住原始异常
+                    }
+                }
+                input.close();
+                throw e;
             }
 
             // 2. 按 outputColumns 顺序组装：透传列整页拷贝，计算列取求值结果

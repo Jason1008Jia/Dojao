@@ -178,6 +178,15 @@ public final class ResourceConfig {
      * 不得超过单算子堆外上限），不会把内存撑爆。</p>
      */
     public static final String QUERY_SPILL_MIN_PARTITION_BYTES = "query.spill.minPartitionBytes";
+    /**
+     * 卡槽数自适应判据（{@code query.spill.slot.minBytes}，默认 32M，0 = 关闭、恒用 3 槽）。
+     *
+     * <p>单桶单槽的目标预算低于该值时，分区的 3 个卡槽实际利用率很低：槽小 ⇒ 一次溢写（排序 + 写盘）
+     * 只占几毫秒~几百毫秒，而攒满下一个槽要几秒 —— 第三槽永远等着，白占 1/3 的峰值额度。
+     * 此时算子自动降到 2 槽，并把省出的额度折进单槽阈值（×1.5）：文件更少、内存优先，
+     * 设计峰值 {@code 槽数 × 单槽预算} 不变。见 {@code AbstractSpillableOperator}。</p>
+     */
+    public static final String QUERY_SPILL_SLOT_MIN_BYTES = "query.spill.slot.minBytes";
     /** 单个溢写算子的 Arrow 直接内存上限（{@code query.direct.limit}，字节；0/未配 = 由 slot.memory 派生）。 */
     public static final String QUERY_DIRECT_LIMIT = "query.direct.limit";
     public static final String QUERY_DEFAULT_PARALLELISM = "query.default.parallelism";
@@ -308,6 +317,8 @@ public final class ResourceConfig {
     public static final double DEFAULT_SPILL_RATIO = 0.8;
     /** 单分区单槽溢写阈值下限默认 16M（一批数据量级）。 */
     public static final long DEFAULT_SPILL_MIN_PARTITION_BYTES = 16L * 1024 * 1024;
+    /** 卡槽数自适应判据默认 32M：单桶单槽目标预算低于此值 ⇒ 3 槽降为 2 槽并等比放大单槽预算。 */
+    public static final long DEFAULT_SPILL_SLOT_MIN_BYTES = 32L * 1024 * 1024;
     /** 默认溢写目录名（相对安装根目录）：{@code <DOJAO_HOME>/spill}。 */
     public static final String DEFAULT_SPILL_DIR_NAME = "spill";
     /** 默认溢写盘使用率上限 0.8：用满 80% 的盘不再承接溢写。 */
@@ -941,6 +952,18 @@ public final class ResourceConfig {
     /** 单分区单槽溢写阈值下限（{@code query.spill.minPartitionBytes}，默认 16M，可为 0 = 不设下限）。 */
     public static long spillMinPartitionBytes() {
         long v = sizeValue(QUERY_SPILL_MIN_PARTITION_BYTES, DEFAULT_SPILL_MIN_PARTITION_BYTES);
+        return Math.max(0L, v);
+    }
+
+    /**
+     * 卡槽数自适应判据（{@code query.spill.slot.minBytes}，默认 32M；0 = 关闭、恒用 3 槽）。
+     *
+     * <p>单桶单槽目标预算低于该值时，溢写占空比极低（写盘远快于攒批），第三槽纯属浪费；
+     * 算子降到 2 槽并把单槽预算放大 1.5 倍，峰值不变、文件更少。见
+     * {@code AbstractSpillableOperator#selectSlotCount()}。</p>
+     */
+    public static long spillSlotMinBytes() {
+        long v = sizeValue(QUERY_SPILL_SLOT_MIN_BYTES, DEFAULT_SPILL_SLOT_MIN_BYTES);
         return Math.max(0L, v);
     }
 

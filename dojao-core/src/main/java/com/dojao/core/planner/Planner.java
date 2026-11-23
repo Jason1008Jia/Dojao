@@ -1150,6 +1150,12 @@ public final class Planner {
             throw unsupported("可物化的派生体仅支持 SELECT / 集合运算，实际: "
                     + body.getClass().getSimpleName());
         }
+        // ★ 物化体与主查询走<b>同一条优化链</b>：列裁剪收窄扫描列 + 投影下推到分片。
+        //   漏掉这两步时，「A 方案」物化的派生体里 ScalarProject(get_json_object×N) 仍留在 Master，
+        //   分布式扫描把全宽 raw_json_data 回传 Master → Flight 入站 OOM（线上 141 列派生 join：
+        //   派生列与基表列重名 → 下沉被拒 → 物化兜底，但物化体照旧把投影留在 Master）。
+        node = optimizeColumns(node);
+        node = pushdownScanProjection(node);
         node = applyOrderLimit(node, orderBy, limit, offset);
         // 查询体的分布式算子不在主计划树内，但会以自己的 jobId 派发片段 —— 登记给 QueryManager，
         // 否则 Master 的僵尸片段回收会把它们当成「已不认查询」的残留就地取消。

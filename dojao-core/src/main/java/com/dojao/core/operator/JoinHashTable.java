@@ -237,9 +237,16 @@ public class JoinHashTable extends RowHashTable {
 
     @Override
     public long estimateMemoryBytes() {
-        long total = super.estimateMemoryBytes();
+        // ★key/build 向量必须按 getBufferSizeFor(行数) 估算，不能用 getBufferSize()：
+        //   后者按 valueCount 换算，而本表的向量从不 setValueCount（直接拷贝不推进变长列的 lastSet，
+        //   setValueCount 的 fillHoles 会把偏移压平），getBufferSize() 恒为 0 ⇒ 闸门只看得见
+        //   Java 堆数组、看不见全部数据（实测 40000 行 × 200B 实占 8.2MB 却只报 0.28MB），
+        //   memoryLimit 摊薄出来的逐桶 build 预算形同虚设。
+        long total = (long) buckets.length * Integer.BYTES;
+        total += (long) rowHashes.length * Integer.BYTES;
+        for (FieldVector vec : keyVectors) total += vec.getBufferSizeFor(groupCount);
         if (buildVectors != null)
-            for (FieldVector vec : buildVectors) total += vec.getBufferSize();
+            for (FieldVector vec : buildVectors) total += vec.getBufferSizeFor(buildRowCount);
         // 行索引是 Java 堆（Arrow 分配器看不见），必须如实计入 —— 否则 build 闸门放行后堆先炸。
         total += (long) groupHead.length * Integer.BYTES;
         total += (long) groupTail.length * Integer.BYTES;

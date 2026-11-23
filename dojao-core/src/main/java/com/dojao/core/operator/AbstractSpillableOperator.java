@@ -41,8 +41,9 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongConsumer;
 
 /**
- * 三槽异步溢写算子基类 —— 抽取 {@link HashAggregationOperator} 和
- * {@link WindowSortOperator} 共有管线。
+ * 异步溢写算子基类 —— 抽取 {@link HashAggregationOperator} 和
+ * {@link WindowSortOperator} 共有管线。每个分区默认 3 个卡槽轮转，单槽预算过小时自动降为 2 槽
+ * （见 {@link #selectSlotCount()}）。
  *
  * <h3>子类需实现的差异点</h3>
  * <ol>
@@ -68,7 +69,15 @@ public abstract class AbstractSpillableOperator<S extends Slot>
 
     /** 聚合算子 Phase 2 每批聚合的 key 数（query.agg.perBatchKeys 可配）：collect-evaluate 每批交付给 Python 的 key 数。 */
     protected static final int AGG_PER_BATCH_KEYS = ResourceConfig.aggPerBatchKeys();
+    /** 默认卡槽数（也是设计峰值口径：{@code SLOT_COUNT × memoryLimit × spillRatio}）。 */
     protected static final int SLOT_COUNT = 3;
+    /**
+     * 自适应后的最小卡槽数：一槽接收、一槽异步写。再少就退化成同步溢写的流水线。
+     *
+     * <p>降为 2 槽时单槽预算放大 {@code SLOT_COUNT / MIN_SLOT_COUNT = 1.5} 倍，
+     * 保证 {@code 槽数 × 单槽预算} 与 3 槽设计峰值一致。</p>
+     */
+    protected static final int MIN_SLOT_COUNT = 2;
     /** 溢写/拉取批次不在此处定义：聚合用 query.agg.spill.perBatchKeys，窗口用 query.window.spill.perBatchRows（写）与 query.window.spill.fetchPerKeys（读），各子类独立。 */
     protected static final int DEFAULT_PARTITIONS = 4;
     /**
@@ -104,6 +113,12 @@ public abstract class AbstractSpillableOperator<S extends Slot>
      * {@code ExchangeInStep.owned()} 设为该片段实际拥有的桶数，最低 1。
      */
     protected volatile int budgetPartitions;
+    /**
+     * 本实例每分区的卡槽数（3 或 2，见 {@link #selectSlotCount()}）。分区在首次累积时按此创建，
+     * 故 {@link #setBudgetPartitions(int)} 必须在 {@code open()} 之前调用。
+     */
+    protected volatile int slotCount = SLOT_COUNT;
+    private boolean slotChoiceLogged;
     protected final BufferAllocator allocator;
     protected final int numPartitions;
 
@@ -210,13 +225,14 @@ public abstract class AbstractSpillableOperator<S extends Slot>
         this.upstream = upstream;
         this.memoryLimit = memoryLimit;
         // 单槽阈值 = 算子预算 × 溢写比例 ÷ 桶数（下限见 computeSlotBytesThreshold）：
-        // 本算子同时持有 numPartitions 个分区，每个分区各 3 个槽 —— 预算得<b>摊到各分区</b>，
-        // 否则 P 个分区各按「整个算子预算」累积，总占用 = P × 3槽 × 阈值，会先撞「按单分区派生的」
+        // 本算子同时持有 numPartitions 个分区，每个分区若干个槽 —— 预算得<b>摊到各分区</b>，
+        // 否则 P 个分区各按「整个算子预算」累积，总占用 = P × 槽数 × 阈值，会先撞「按单分区派生的」
         // 分配器硬上限（query.direct.limit），此时任一单槽都还没到阈值 ⇒ 触发的是 Arrow OOM 而非溢写
         // （表现：row_number() over(partition by …) 直接把 Worker 撑挂）。
         // 真实桶数在分发时由 setBudgetPartitions 修正（只拥有 1 个桶的片段按 1 摊薄）。
         this.numPartitions = numPartitions;
         this.budgetPartitions = Math.max(1, numPartitions);
+        selectSlotCount();
         this.slotBytesThreshold = computeSlotBytesThreshold();
         // 实例序号：溢写目录名要按实例唯一（同 JVM 内多个同类算子并发时，目录重名会互相覆盖/误删）。
         // 子分配器的 Arrow 名字由 NodeMemory 内部按序自增，无需外部保证唯一。
@@ -259,23 +275,60 @@ public abstract class AbstractSpillableOperator<S extends Slot>
     public void setBudgetPartitions(int owned) {
         if (owned <= 0) return;
         this.budgetPartitions = Math.min(owned, Math.max(1, numPartitions));
+        selectSlotCount();
         this.slotBytesThreshold = computeSlotBytesThreshold();
+        if (slotCount == MIN_SLOT_COUNT && !slotChoiceLogged) {
+            slotChoiceLogged = true;
+            log.info("[溢写] {} 卡槽自适应 3 → 2：单桶单槽预算 {} < 下限 {}（owned={}），"
+                            + "单槽阈值抬到 {}；设计峰值不变，溢写文件数约少三分之一",
+                    getStats().getOperatorId(),
+                    formatBytes((long) (memoryLimit * ResourceConfig.spillRatio() / budgetPartitions)),
+                    formatBytes(ResourceConfig.spillSlotMinBytes()),
+                    budgetPartitions, formatBytes(slotBytesThreshold));
+        }
+    }
+
+    /**
+     * 按单桶单槽目标预算选择卡槽数：低于 {@code query.spill.slot.minBytes} 用 2 槽（否则 3 槽）。
+     *
+     * <p>为什么不是恒 3 槽：单槽预算十几 MB 时，一次溢写（排序 + 写盘）只要几十~几百毫秒，而攒满
+     * 下一槽要几秒 —— 溢写占空比通常 &lt;20%，第 3 槽永远等不到「两写一收」同时发生的场景，
+     * 等于白占 1/3 峰值额度。降到 2 槽后单槽预算 ×1.5（{@code SLOT_COUNT / MIN_SLOT_COUNT}），
+     * 攒批更快满、但每次写的批次更大 ⇒ 溢写次数与文件数约少 1/3，峰值
+     * {@code 槽数 × 单槽预算 × ratio} 与 3 槽设计完全一致。</p>
+     *
+     * <p>反例（保留 3 槽）：单槽预算本就很大（低并发 / 少桶），或慢盘上写盘时间接近攒批时间 ——
+     * 此时确实需要「两槽写、一槽收」的额外缓冲。配置 0 则关闭本自适应，恒用 3 槽。</p>
+     */
+    private void selectSlotCount() {
+        long min = ResourceConfig.spillSlotMinBytes();
+        if (min <= 0) {
+            slotCount = SLOT_COUNT;
+            return;
+        }
+        int parts = Math.max(1, budgetPartitions);
+        long perSlot = (long) (memoryLimit * ResourceConfig.spillRatio() / parts);
+        slotCount = perSlot < min ? MIN_SLOT_COUNT : SLOT_COUNT;
     }
 
     /** 当前单槽阈值（监控/日志可读）。 */
     public long slotBytesThreshold() { return slotBytesThreshold; }
 
     /**
-     * 单分区单槽溢写阈值：{@code memoryLimit × spillRatio ÷ 桶数}，再抬到
+     * 单分区单槽溢写阈值：{@code 单槽预算 × spillRatio ÷ 桶数}，再抬到
      * {@code query.spill.minPartitionBytes} 下限（下限只抬高，不会压低已更大的 base）。
      *
-     * <p>抬高下限时必须约束峰值。算子的设计峰值 = {@code 桶数 × 3槽 × 阈值}，硬上限是
+     * <p>单槽预算 = {@code memoryLimit}（3 槽）或 {@code memoryLimit × 3/2}（2 槽，见
+     * {@link #selectSlotCount()}），故设计峰值 {@code 槽数 × 单槽预算 × ratio} 恒等于
+     * {@code SLOT_COUNT × memoryLimit × ratio} —— 减槽不降预算，只是把第三槽的额度折进前两槽。</p>
+     *
+     * <p>抬高下限时必须约束峰值。算子的设计峰值 = {@code 桶数 × 槽数 × 阈值}，硬上限是
      * {@code query.direct.limit}（算子分配器上限，撞上即 Arrow OOM —— 此时任一槽都还没到阈值，
      * 溢写根本不会触发）。两个封顶各管一件事：</p>
      * <ul>
-     *   <li><b>峰值封顶</b>：严格边界是 {@code T ≤ direct.limit ÷ (3 × 桶数)}；实现再乘
+     *   <li><b>峰值封顶</b>：严格边界是 {@code T ≤ direct.limit ÷ (槽数 × 桶数)}；实现再乘
      *       {@code spillRatio}（与 base 同一安全系数）⇒ 峰值最多用掉硬上限的 80%。</li>
-     *   <li><b>单槽封顶</b>：一个槽的阈值不得超过算子可用预算 {@code memoryLimit × spillRatio}。
+     *   <li><b>单槽封顶</b>：一个槽的阈值不得超过算子可用预算 {@code 单槽预算 × spillRatio}。
      *       这一条与峰值无关，只防「单槽比整个算子还能用」的荒谬值。</li>
      * </ul>
      *
@@ -286,13 +339,16 @@ public abstract class AbstractSpillableOperator<S extends Slot>
     private long computeSlotBytesThreshold() {
         int parts = Math.max(1, budgetPartitions);
         double ratio = ResourceConfig.spillRatio();
-        long threshold = (long) (memoryLimit * ratio / parts);
+        long effectiveLimit = slotCount >= SLOT_COUNT
+                ? memoryLimit
+                : (long) (memoryLimit * (double) SLOT_COUNT / slotCount);
+        long threshold = (long) (effectiveLimit * ratio / parts);
         long floor = ResourceConfig.spillMinPartitionBytes();
         if (floor > 0) {
             long cap = (long) (ResourceConfig.queryDirectLimit() * ratio
-                    / ((long) SLOT_COUNT * parts));
+                    / ((long) slotCount * parts));
             floor = Math.min(floor, cap);
-            floor = Math.min(floor, Math.max(1L, (long) (memoryLimit * ratio)));
+            floor = Math.min(floor, Math.max(1L, (long) (effectiveLimit * ratio)));
             threshold = Math.max(threshold, floor);
         }
         return Math.max(1L, threshold);
@@ -640,12 +696,12 @@ public abstract class AbstractSpillableOperator<S extends Slot>
         }
         // ★与监控同一口径：直接读统计数据（Σ dataFileSize 曾是另一套口径，归并重写后会对不上）。
         long spilledBytes = getStats().getSpilledBytes();
-        System.err.printf("[%s] Spilled: %s（分区 %d，触发 %d 次，单槽阈值 %s = memoryLimit %s × ratio %.2f ÷ owned %d）%n",
+        System.err.printf("[%s] Spilled: %s（分区 %d，触发 %d 次，单槽阈值 %s = memoryLimit %s × ratio %.2f ÷ owned %d，slots %d）%n",
                 getClass().getSimpleName(),
                 spilledBytes > 0 ? formatBytes(spilledBytes) : "0 (all in-memory)",
                 partitions.length, getStats().getSpillTriggers(),
                 formatBytes(slotBytesThreshold), formatBytes(memoryLimit),
-                ResourceConfig.spillRatio(), budgetPartitions);
+                ResourceConfig.spillRatio(), budgetPartitions, slotCount);
 
         int activeCount = 0;
         for (PartitionState<S> pa : partitions) {
@@ -838,10 +894,10 @@ public abstract class AbstractSpillableOperator<S extends Slot>
             // 每次溢写都打印「本槽实际内存 / 本次阈值」：阈值 = memoryLimit × ratio ÷ owned 桶数，
             // 再受 query.spill.minPartitionBytes 下限与 direct.limit 封顶（见 computeSlotBytesThreshold）。
             long slotBytes = active.estimateMemoryBytes();
-            log.info("[溢写] {} 分区 {} 第 {} 次：槽位 {} ≥ 阈值 {}（owned={}，memoryLimit={} × ratio {}）",
+            log.info("[溢写] {} 分区 {} 第 {} 次：槽位 {} ≥ 阈值 {}（owned={}，slots={}，memoryLimit={} × ratio {}）",
                     getStats().getOperatorId(), pid, getStats().getSpillTriggers(),
                     formatBytes(slotBytes), formatBytes(slotBytesThreshold),
-                    budgetPartitions, formatBytes(memoryLimit),
+                    budgetPartitions, slotCount, formatBytes(memoryLimit),
                     String.format("%.2f", ResourceConfig.spillRatio()));
             pa.submitSpill(spillExecutor, this, pid);
             pa.awaitIdleSlot();
@@ -872,7 +928,7 @@ public abstract class AbstractSpillableOperator<S extends Slot>
 
     protected void ensurePartition(int pid) {
         if (partitions[pid] == null) {
-            partitions[pid] = new PartitionState<>(SLOT_COUNT);
+            partitions[pid] = new PartitionState<>(slotCount);
         }
     }
 
@@ -1161,7 +1217,7 @@ public abstract class AbstractSpillableOperator<S extends Slot>
     }
 
     protected void flushRemainingSlots(PartitionState<S> pa, int pid) {
-        for (int s = 0; s < SLOT_COUNT; s++) {
+        for (int s = 0; s < pa.slots.size(); s++) {
             S slot = pa.slots.get(s);
             if (slot != null && !slot.isEmpty()) {
                 spillSlotSync(pa, s, slot, pid);

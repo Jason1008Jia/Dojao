@@ -311,7 +311,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
 
     @Override
     protected void outputMemory(PartitionState<Slot> pa, int pid) throws Exception {
-        for (int s = 0; s < SLOT_COUNT; s++) {
+        for (int s = 0; s < pa.slots.size(); s++) {
             checkCancelled();
             Slot slot = pa.slots.get(s);
             if (slot == null || slot.isEmpty()) continue;

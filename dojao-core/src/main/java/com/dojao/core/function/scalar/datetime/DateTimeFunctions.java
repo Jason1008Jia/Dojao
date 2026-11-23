@@ -44,6 +44,14 @@ public final class DateTimeFunctions {
             ScalarSupport.requireArity("current_timestamp", args, 0);
             return LocalDateTime.now();
         });
+        reg("now", "当前时间（yyyy-MM-dd HH:mm:ss）", args -> {
+            ScalarSupport.requireArity("now", args, 0);
+            return LocalDateTime.now().format(DateTimeFormatter.ofPattern(DEFAULT_TS_FORMAT));
+        });
+        reg("current_date_time", "当前时间（yyyy-MM-dd HH:mm:ss）", args -> {
+            ScalarSupport.requireArity("current_date_time", args, 0);
+            return LocalDateTime.now().format(DateTimeFormatter.ofPattern(DEFAULT_TS_FORMAT));
+        });
         reg("unix_timestamp", "unix 秒：unix_timestamp() 当前；unix_timestamp(s[,fmt]) 解析", args -> {
             ScalarSupport.requireArity("unix_timestamp", args, 0, 1, 2);
             if (args.length == 0) return Instant.now().getEpochSecond();

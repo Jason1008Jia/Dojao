@@ -90,6 +90,50 @@ public final class PredicatePushdown implements OptimizerRule {
                             select.offset(), select.distinct());
                 }
             }
+            // 逗号连接 / UNNEST 横向展开（`FROM a, b` / `FROM t, UNNEST(expr) AS u`）不登记
+            // JoinInfo（SemanticAnalyzer 对 lateralCross 直接按逗号连接返回），上面那条标量子查询
+            // 分支覆盖不到 ⇒ 整条 WHERE 都留在展开之后，基表扫描拿不到任何谓词：Hive 分区裁剪失效
+            // （dt 谓词到不了连接器）、Worker 把分区内每一行全宽回传 Master（staging_es_to_skb_info
+            // 宽行 TEXT 实测 OOM）。这里把「不含子查询 + 只引用单个基表」的合取项搬进该表 rel.filter
+            // —— 逗号连接是内连接语义，先过滤再交叉/展开与展开后过滤逐行等价；引用派生表 / UNNEST
+            // 输出 / 多个关系的谓词仍留在 WHERE（在展开之后求值）。
+            if (where.isPresent() && relations.size() > 1) {
+                Map<String, List<Expression>> pushed = new LinkedHashMap<>();
+                List<Expression> keep = new ArrayList<>();
+                for (Expression pred : splitPredicates(where.get(), relations)) {
+                    Set<String> aliases = referencedAliases(pred, relations);
+                    if (!mentionsSubquery(pred) && aliases.size() == 1) {
+                        String alias = aliases.iterator().next();
+                        if (isBaseRelation(alias, relations)) {
+                            pushed.computeIfAbsent(alias, k -> new ArrayList<>()).add(pred);
+                            continue;
+                        }
+                    }
+                    keep.add(pred);
+                }
+                if (!pushed.isEmpty()) {
+                    List<LogicalPlan.ResolvedRelation> newRelations =
+                            new ArrayList<>(relations.size());
+                    for (LogicalPlan.ResolvedRelation rel : relations) {
+                        List<Expression> relPreds =
+                                pushed.get(normalizeAlias(rel.alias().orElse(rel.table())));
+                        if (relPreds == null || relPreds.isEmpty()) {
+                            newRelations.add(rel);
+                            continue;
+                        }
+                        newRelations.add(new LogicalPlan.ResolvedRelation(
+                                rel.catalog(), rel.schema(), rel.table(), rel.alias(),
+                                rel.columns(), Optional.of(combineWithExisting(rel.filter(), relPreds)),
+                                rel.subquery()));
+                    }
+                    Optional<Expression> remaining = keep.isEmpty()
+                            ? Optional.empty() : Optional.of(combinePredicates(keep));
+                    return new LogicalPlan.Select(select.selectItems(), newRelations,
+                            select.joins(), remaining, select.groupBy(), select.having(),
+                            select.scalarSubqueries(), select.orderBy(), select.limit(),
+                            select.offset(), select.distinct());
+                }
+            }
             // 没有任何 JOIN：单表查询，WHERE 由扫描端自己处理
             return select;
         }

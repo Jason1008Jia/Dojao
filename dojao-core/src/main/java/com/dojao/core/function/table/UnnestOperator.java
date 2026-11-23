@@ -33,6 +33,8 @@ import java.util.List;
  *   <li>上游值为 SQL NULL、空串，或 JSON {@code null} → 该输入行产出 <b>0 行</b>（与 SQL UNNEST 一致）；</li>
  *   <li>JSON 数组 → 每个元素一行；元素是标量时输出其文本（字符串不带引号），
  *       对象/数组输出 JSON 文本；JSON {@code null} 元素输出 NULL；</li>
+ *   <li>表达式结果是引擎数组（LIST，如 {@code json_array_explode(...)} / {@code split(...)}）时，
+ *       直接按其元素展开（等价于等值的 JSON 数组文本）；</li>
  *   <li>非法 JSON 或非数组的 JSON 值（对象/标量）→ <b>立即报错</b>（不静默丢行，避免「结果莫名少行」）。</li>
  * </ul>
  */
@@ -158,26 +160,12 @@ public final class UnnestOperator extends AbstractMeasurableOperator {
 
             int outRow = 0;
             for (int row = 0; row < input.getRowCount(); row++) {
-                String json = readJson(exprVector, row);
-                if (json == null || json.isBlank()) {
+                List<String> expanded = readElements(exprVector, row);
+                if (expanded == null) {
                     continue;
-                }
-                JsonNode node;
-                try {
-                    node = MAPPER.readTree(json);
-                } catch (Exception e) {
-                    throw new IllegalStateException("UNNEST 的输入不是合法 JSON（表达式："
-                            + expressionText + "，值：" + abbreviate(json) + "）", e);
-                }
-                if (node == null || node.isNull()) {
-                    continue;
-                }
-                if (!node.isArray()) {
-                    throw new IllegalStateException("UNNEST 的输入必须是 JSON 数组（表达式："
-                            + expressionText + "，值：" + abbreviate(json) + "）");
                 }
                 int ord = 1;
-                for (JsonNode element : node) {
+                for (String text : expanded) {
                     for (int c = 0; c < inVectors.size(); c++) {
                         FieldVector src = inVectors.get(c);
                         FieldVector dst = outVectors.get(c);
@@ -187,7 +175,6 @@ public final class UnnestOperator extends AbstractMeasurableOperator {
                             dst.copyFromSafe(row, outRow, src);
                         }
                     }
-                    String text = elementText(element);
                     if (text == null) {
                         elements.setNull(outRow);
                     } else {
@@ -222,11 +209,42 @@ public final class UnnestOperator extends AbstractMeasurableOperator {
         }
     }
 
-    /** 表达式结果 → JSON 文本；SQL NULL → null。 */
-    private static String readJson(FieldVector vector, int row) {
+    /**
+     * 表达式结果 → 待展开的元素文本列表；SQL NULL / 空串 / JSON {@code null} → null（该输入行产出 0 行）。
+     * <p><b>两条来源</b>：</p>
+     * <ul>
+     *   <li>JSON 数组文本（列 / {@code json_extract} 等）→ {@link #MAPPER} 解析，元素口径见
+     *       {@link #elementText}；非法 JSON / 非数组 → 立即报错；</li>
+     *   <li>引擎数组（LIST，如 {@code json_array_explode(...)} / {@code split(...)}）→ 直接按元素展开，
+     *       <b>不做 JSON 文本往返</b>（{@code List.toString()} 得到的 {@code [a, b]} 不是合法 JSON）。</li>
+     * </ul>
+     */
+    private List<String> readElements(FieldVector vector, int row) {
         if (vector.isNull(row)) return null;
         Object value = vector.getObject(row);
-        return value == null ? null : value.toString();
+        if (value == null) return null;
+        if (value instanceof List<?> list) {
+            List<String> out = new ArrayList<>(list.size());
+            for (Object o : list) out.add(o == null ? null : o.toString());
+            return out;
+        }
+        String json = value.toString();
+        if (json.isBlank()) return null;
+        JsonNode node;
+        try {
+            node = MAPPER.readTree(json);
+        } catch (Exception e) {
+            throw new IllegalStateException("UNNEST 的输入不是合法 JSON（表达式："
+                    + expressionText + "，值：" + abbreviate(json) + "）", e);
+        }
+        if (node == null || node.isNull()) return null;
+        if (!node.isArray()) {
+            throw new IllegalStateException("UNNEST 的输入必须是 JSON 数组（表达式："
+                    + expressionText + "，值：" + abbreviate(json) + "）");
+        }
+        List<String> out = new ArrayList<>(node.size());
+        for (JsonNode element : node) out.add(elementText(element));
+        return out;
     }
 
     /** JSON 元素 → 输出文本：标量取文本（字符串不带引号）、对象/数组取 JSON、null → NULL。 */

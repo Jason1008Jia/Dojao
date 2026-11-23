@@ -51,7 +51,8 @@ public final class BuiltinFunctionCatalog {
             "find_in_set",
             "elt", "initcap", "printf", "translate",
             // —— 日期时间（BuiltinScalars / DateTimeFunctions）——
-            "current_date", "current_timestamp", "unix_timestamp", "from_unixtime", "to_date",
+            "current_date", "current_timestamp", "now", "current_date_time",
+            "unix_timestamp", "from_unixtime", "to_date",
             "hour", "minute", "second", "dayofmonth", "weekofyear", "dayofweek", "datediff",
             "date_add", "date_sub", "add_months", "months_between", "last_day", "next_day",
             "trunc", "date_format", "from_utc_timestamp", "to_utc_timestamp",

@@ -43,7 +43,9 @@ import java.util.function.Supplier;
  * （每分区独立有界队列 + 后台分发线程）；分布式 = {@link ShuffleReader}（跨机灌入本地有界队列）。
  * 相同 join key 按同一哈希函数落同一分区 → 分区间互不相关。每个工作线程只消费自己的分区流：
  * <ol>
- *   <li><b>Build</b>：从右表分区队列建 {@link JoinHashTable}，超过 {@code memoryLimit / N} 报错</li>
+ *   <li><b>Build</b>：从右表分区队列建 {@link JoinHashTable}，超过单桶 build 预算报错
+ *       （默认 {@code memoryLimit / numPartitions}，分布式按本片段 owned 桶数摊薄，
+ *       见 {@link #setBuildBudgetPartitions(int)}）</li>
  *   <li><b>Probe</b>：从左表分区队列逐行探测，匹配对攒满 {@link #JOIN_SEND_BATCH_SIZE}(5W) 即组装输出；
  *       收到该分区 {@link Page#partitionEnd(int)} 立即把残余也发走（小分区不阻塞）</li>
  *   <li><b>Unmatched</b>（RIGHT/FULL）：补发该分区未匹配的右表行，左列置 NULL</li>
@@ -105,6 +107,18 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
     private final boolean needNullRight;
     private final long memoryLimit;
     private final int numPartitions;
+    /**
+     * build 侧预算摊薄所用的桶数（默认 = {@link #numPartitions}）。
+     *
+     * <p><b>可变</b>：分布式哈希 join 由 FragmentExecutor 在 {@code open()} 前设为本片段 build 侧
+     * <b>实际拥有</b>的桶数。多 Worker 时本机只 own P/W 个桶，若仍按布局分区数 P 除，每个桶只拿到
+     * 1/P 的 build 预算，未 own 的桶不会来数据、预算被白白闲置。</p>
+     *
+     * <p>单机（全部桶在本地）与广播 join 保持默认：广播的 {@code numPartitions} = Worker 数、
+     * 每台只 own 1 个桶，但该桶里是<b>完整</b>右表副本，build 量不随 owned 摊薄
+     * （见 {@code StageScheduler.planBroadcastJoin} 的 memoryLimit × w 口径）。</p>
+     */
+    private volatile int buildBudgetPartitions;
     private final BufferAllocator allocator;
     /**
      * 右表（build 侧）<b>声明列</b>，来自计划期（{@code JoinStep.declaredRightFields}）；null/空 = 未声明。
@@ -275,6 +289,7 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
         this.needNullRight = (joinType == JoinType.LEFT || joinType == JoinType.FULL);
         this.memoryLimit = memoryLimit;
         this.numPartitions = Math.max(1, numPartitions);
+        this.buildBudgetPartitions = this.numPartitions;
         this.tagPartitionIds = tagPartitionIds;
         this.declaredRightFields = (declaredRightFields == null || declaredRightFields.isEmpty())
                 ? null : List.copyOf(declaredRightFields);
@@ -295,7 +310,7 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
         // 并受共享根硬上限约束：build 表超预算时抛 OOM 让该查询失败，而非被内核 OOM-killer 杀进程。
         this.allocator = NodeMemory.shared()
                 .newOperatorAllocator("hashjoin", ResourceConfig.queryDirectLimit());
-        // 输出缓冲字节预算：allocator 上限扣掉 build 预算（buildSide 已按 memoryLimit/N 逐分区强制，
+        // 输出缓冲字节预算：allocator 上限扣掉 build 预算（buildSide 已按 memoryLimit/摊薄桶数 逐桶强制，
         // 总和 ≤ memoryLimit）后按比例留给输出。分配器无上限时不设闸（离线探针）。
         this.outputByteBudget = computeOutputByteBudget(this.allocator.getLimit());
         // 分区源恒定并行（单机每分区队列 + 后台分发线程；分布式跨机灌入），本算子的执行形态依赖它
@@ -361,6 +376,16 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
     /** 分区数 = 内部分区工作线程数（上层片段的任务数只有 1，监控据此展开）。 */
     public int numPartitions() { return numPartitions; }
 
+    /**
+     * 按本片段 build 侧<b>实际拥有的桶数</b>摊薄单桶 build 预算（须在 {@code open()} 前调用）。
+     *
+     * <p>不调用 = 保持默认（{@link #numPartitions}），单机路径零改动。传 0/负数按 1 处理，
+     * 超过 {@link #numPartitions} 时封顶（owned 是布局子集，正常不会超）。</p>
+     */
+    public void setBuildBudgetPartitions(int owned) {
+        this.buildBudgetPartitions = Math.min(Math.max(1, owned), numPartitions);
+    }
+
     /** 分区 {@code pid} 已发出的行数（并发安全；越界/未开始 → 0）。 */
     public long partitionRowsOut(int pid) {
         return (pid >= 0 && pid < numPartitions) ? partitionRowsOut[pid].get() : 0L;
@@ -396,8 +421,8 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
             final int p = pid;
             workers.submit(() -> runPartition(p));
         }
-        System.err.printf("[HashJoin] %d worker(s) started, joinType=%s, partitions=%d%n",
-                numPartitions, joinType, numPartitions);
+        System.err.printf("[HashJoin] %d worker(s) started, joinType=%s, partitions=%d, buildBudgetParts=%d%n",
+                numPartitions, joinType, numPartitions, buildBudgetPartitions);
     }
 
     @Override
@@ -520,7 +545,7 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
     /** Build：消费右表分区队列，建该分区的 {@link JoinHashTable}。 */
     private void buildSide(PartitionJoin j) throws Exception {
         BlockingQueue<Page> rightQ = rightPart.partitionQueue(j.pid);
-        long memBudget = memoryLimit / Math.max(1, numPartitions);
+        long memBudget = memoryLimit / Math.max(1, buildBudgetPartitions);
         while (true) {
             Page page = rightQ.take();
             if (page.isEndOfPartition()) {

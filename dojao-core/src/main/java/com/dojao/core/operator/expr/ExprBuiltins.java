@@ -43,6 +43,7 @@ public final class ExprBuiltins {
             "concat", "upper", "ucase", "lower", "lcase", "length", // 字符串
             "split",                                 // 分隔符切分 → 数组
             "from_str_to_array",                     // JSON 数组文本 → 数组
+            "json_array_explode",                    // JSON 数组文本 + 字段名 → 字段值数组
             "size");                                 // 数组长度（字符串长度用 length）
 
     /**
@@ -52,7 +53,7 @@ public final class ExprBuiltins {
     private static final java.util.Map<String, java.util.regex.Pattern> SPLIT_PATTERN_CACHE =
             new java.util.concurrent.ConcurrentHashMap<>();
 
-    /** from_str_to_array 的 JSON 解析器（ObjectMapper 线程安全，与 StringFunctions 同款）。 */
+    /** from_str_to_array / json_array_explode 的 JSON 解析器（ObjectMapper 线程安全，与 StringFunctions 同款）。 */
     private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
 
     private ExprBuiltins() {
@@ -164,6 +165,15 @@ public final class ExprBuiltins {
                 if (args[0] == null) return null;
                 return jsonTextArray(ExprEvaluator.string(args[0]));
             }
+            case "json_array_explode": {
+                // json_array_explode(arr, key) —— JSON 数组文本 + 首层对象字段名 → 字段值数组，
+                // 例如 '[{"jobName":"储备干部"},{"jobName":"装机工"}]' + 'jobName' → ['储备干部','装机工']。
+                // 非法 JSON / 非数组 → NULL；非对象元素或缺少该字段 → NULL 元素（保留下标对齐，
+                // 便于配合 UNNEST WITH ORDINALITY 逐条对应原数组位置）。
+                require(name, args, 2);
+                if (args[0] == null || args[1] == null) return null;
+                return jsonFieldArray(ExprEvaluator.string(args[0]), ExprEvaluator.string(args[1]));
+            }
             default:
                 throw new IllegalArgumentException("未内置函数: " + name);
         }
@@ -202,6 +212,28 @@ public final class ExprBuiltins {
         for (JsonNode el : node) {
             out.add(el == null || el.isNull() ? null
                     : el.isValueNode() ? el.asText() : el.toString());
+        }
+        return out;
+    }
+
+    /**
+     * JSON 数组文本 + 首层对象字段名 → 字段值列表；非法 JSON 或非数组 → null。
+     * 元素口径与 {@link #jsonTextArray} 一致（标量取 {@code asText()}，对象/数组保留 JSON 文本，
+     * JSON null → null）；元素不是对象或没有该字段 → null（保留下标对齐）。
+     */
+    private static List<String> jsonFieldArray(String text, String key) {
+        JsonNode node;
+        try {
+            node = JSON_MAPPER.readTree(text);
+        } catch (Exception e) {
+            return null;
+        }
+        if (node == null || !node.isArray()) return null;
+        List<String> out = new ArrayList<>(node.size());
+        for (JsonNode el : node) {
+            JsonNode v = el != null && el.isObject() ? el.get(key) : null;
+            out.add(v == null || v.isNull() ? null
+                    : v.isValueNode() ? v.asText() : v.toString());
         }
         return out;
     }

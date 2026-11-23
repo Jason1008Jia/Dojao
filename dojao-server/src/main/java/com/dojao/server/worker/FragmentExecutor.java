@@ -937,11 +937,19 @@ public final class FragmentExecutor {
         // 剩余算法 HASH / BROADCAST：同一个分区哈希 join（广播只改分区方式，不改算子）。
         // declaredRightFields：Master 规划期下发的右表声明列。哈希分区对空桶一页不发，没有它
         // 该分区就会吐「只有左列」的短 schema（详见 ArrowSchemaIpc / HashJoinOperator）。
-        return new HashJoinOperator(left, right,
+        HashJoinOperator hashJoin = new HashJoinOperator(left, right,
                 joinStep.leftKeyColumns(), joinStep.rightKeyColumns(),
                 joinStep.joinType(), joinStep.memoryLimit(), joinStep.numPartitions(),
                 joinStep.declaredRightFields(), joinStep.declaredLeftFields(), tagPartitionIds,
                 joinStep.onLeftFilter(), joinStep.onRightFilter());
+        // build 预算按本片段 build 侧（右侧）真实拥有的桶数摊薄：多 Worker 时本机只 own P/W 个桶，
+        // 仍按布局分区数 P 除会让 build 只用上 memoryLimit 的 P 分之 owned，其余预算闲置。
+        // 广播 join 例外：numPartitions=Worker 数、每台只 own 1 个桶，但该桶里是<完整>右表副本，
+        // memoryLimit 已按 × 该桶数下发（见 StageScheduler.planBroadcastJoin），须保持 /numPartitions。
+        if (joinStep.algorithm() != FragmentSpec.JoinAlgorithm.BROADCAST) {
+            hashJoin.setBuildBudgetPartitions(rightOwned);
+        }
+        return hashJoin;
     }
 
     /**

@@ -1,14 +1,15 @@
 # 内存模型与溢写卡槽：待解决问题
 
-> 状态：**未实施，待排期**。本文只记录问题、现状推导与候选方向，不代表已确定的设计。
-> 记录日期：2026-11-12
+> 状态：**P2 已落地（2026-11-22：动态卡槽 2/3）；其余问题待排期**。本文只记录问题、现状推导与候选方向，
+> 不代表已确定的设计 —— 已落地项在对应小节标注实现与验收。
+> 记录日期：2026-11-12（P2 更新：2026-11-22）
 
 ## 1. 结论摘要
 
 | # | 问题 | 性质 | 建议优先级 |
 |---|---|---|---|
 | P1 | `query.slot.memory` 名字有歧义，实为**单算子总预算** | 命名 | 高（纯改名，风险低） |
-| P2 | 三卡槽「三份平分」看似公平，实际常低估可用内存、加剧溢写 | 设计 | 中（需实测支撑） |
+| P2 | 三卡槽「三份平分」看似公平，实际常低估可用内存、加剧溢写 | 设计 | **已落地（2026-11-22）**：单桶单槽预算 < 32M 自动降 2 槽、单槽预算 ×1.5，峰值不变 |
 | P3 | 阈值的 `÷ numPartitions` 按**配置**分区数摊薄，数据倾斜时内存大量闲置 | 设计 | 中 |
 | P4 | `maxConcurrentFragments = 2 × worker.parallelism` 是保守假设，可能过度压低每片段份额 | 参数 | 低（可配置覆盖） |
 | P5 | 链式片段（join+窗口）里多个溢写算子各拿一份完整预算，实际超订 ~2× | 缺陷/口径 | 中 |
@@ -35,6 +36,7 @@ query.slot.memory = fragmentDirect / (3 × spill.ratio)   = 341 / 2.4 ≈ 142MB
 ```
 
 自洽性校验：`P 个分区 × 3 槽 × 阈值 = 3 × 142 × 0.8 = 341MB = fragmentDirect`。
+动态降为 2 槽时阈值 ×1.5，`P × 2 × (1.5 × 阈值)` 仍是同一数值（见 P2）。
 
 代码锚点：
 
@@ -44,8 +46,15 @@ query.slot.memory = fragmentDirect / (3 × spill.ratio)   = 341 / 2.4 ≈ 142MB
   - `slotMemoryBytes()` :668
   - `queryDirectLimit()` :751
 - `dojao-server/.../master/MasterServer.java:159` — `ctxBuilder.memoryLimit(ResourceConfig.slotMemoryBytes())`
-- `dojao-core/.../operator/AbstractSpillableOperator.java:199` — `slotBytesThreshold = memoryLimit × spillRatio / numPartitions`
-- `dojao-core/.../operator/AbstractSpillableOperator.java:71` — `SLOT_COUNT = 3`
+- `dojao-core/.../operator/AbstractSpillableOperator.java` — `slotBytesThreshold = memoryLimit × spillRatio / owned`
+  （`owned` = 本片段实际拥有的桶数，`setBudgetPartitions` 在 open 前重算）
+- `dojao-core/.../operator/AbstractSpillableOperator.java:71` — `SLOT_COUNT = 3`（默认/设计峰值口径；
+  实例实际槽数 `slotCount` 可为 2，见 P2）
+- `dojao-core/.../operator/HashJoinOperator.java` — `setBuildBudgetPartitions(owned)`：
+  单桶 build 预算 = `memoryLimit / owned`（广播 join 保持 `/ numPartitions`）
+- `dojao-core/.../operator/JoinHashTable.java` — `estimateMemoryBytes()` 用 `getBufferSizeFor(行数)`
+  统计 key/build 向量（`getBufferSize()` 按 `valueCount` 换算，而本表从不设 valueCount ⇒ 原先恒报 0）
+- `dojao-server/.../worker/FragmentExecutor.java` — `localJoin(...)` 按 build 侧 `ownedCount()` 下发
 - `conf/dojao.conf` — 派生链注释
 
 ---
@@ -87,7 +96,24 @@ query.slot.memory = fragmentDirect / (3 × spill.ratio)   = 341 / 2.4 ≈ 142MB
 
 ---
 
-## 4. P2：三卡槽「三份平分」是否合理
+## 4. P2：三卡槽「三份平分」是否合理 —— 已落地：动态卡槽 2/3（2026-11-22）
+
+### 已落地方案（先看这里）
+
+实测溢写占空比只有 4%~15%（攒批 4.4~5.7s vs 排序+写盘 0.2~0.7s），快盘上第三槽永远等不到"两写并存"，
+却按 `3 × 单槽预算` 记峰值。现在的规则：
+
+- 判据：`单桶单槽预算 = memoryLimit × spillRatio ÷ owned`；低于 `query.spill.slot.minBytes`（默认 32M）⇒ 2 槽，否则 3 槽；
+  配 0 关闭自适应。
+- 重分配：2 槽时单槽预算 ×`SLOT_COUNT / MIN_SLOT_COUNT = 1.5`，保证 `槽数 × 单槽预算` 不变 ⇒
+  设计峰值仍是 `3 × memoryLimit × spillRatio`，溢写触发次数/文件数约 -33%。
+- 语义修正：`PartitionState.awaitIdleSlot()` 条件由 `>= slotCount - 1` 改为 `>= slotCount`（全部槽都在写才等）。
+  旧条件在两槽时等于每次提交后都等自己刚提交的溢写（异步退化成同步），而拉取线程跨分区共享，
+  会把整条算子（如 5 个分区的窗口）一起停摆。
+- 验收：两槽/三槽（`-Dquery.spill.slot.minBytes=0`）路径均全绿；`ProbeRunner` 23 探针 0 FAIL。
+  详见设计手册第一篇第 3 节与 `spill-and-disk` 记忆。
+
+### 原问题记录（历史）
 
 ### 现象
 
@@ -121,14 +147,36 @@ query.slot.memory = fragmentDirect / (3 × spill.ratio)   = 341 / 2.4 ≈ 142MB
 
 ---
 
-## 5. P3：按「配置分区数」摊薄 → 倾斜时闲置
+## 5. P3：桶间预算不均 —— 真实桶数摊薄已修；跨桶借用推迟到下一版本
 
-`slotBytesThreshold` 用的是构造时确定的 `numPartitions`，与实际活跃分区数无关。
+**已修部分**：`slotBytesThreshold` 不再按构造时的 `numPartitions` 摊薄，而是由调度层按片段
+**实际拥有的桶数**（`ExchangeInStep.owned()` → `setBudgetPartitions(owned)`）重算 ——
+只拥 1 个桶的片段拿到完整额度，不再被布局分区数白白除小。
+
+**同一口径已推广到 HashJoin（2026-11-22）**：内存驻留的 `HashJoinOperator` 原先固定按
+`memoryLimit ÷ numPartitions` 给单桶 build 预算，多 Worker 时本机只 own P/W 个桶 ⇒ 实际只能用
+约 1/W 的预算。现由 `FragmentExecutor.localJoin` 在 open 前调用
+`setBuildBudgetPartitions(owned)`（build 侧），单桶预算 = `memoryLimit ÷ owned`，总量仍封顶
+`memoryLimit`；只影响 HASH 路径。**广播 join 例外**（`BROADCAST` 跳过）：其 `numPartitions` =
+Worker 数、每台 own 1 个桶但桶里是完整右表副本，`memoryLimit` 已按 ×该桶数 下发，保持原口径。
+单机路径（全部桶在本地）默认值不变。
+
+同时修正了闸门的**估算口径**：`JoinHashTable.estimateMemoryBytes()` 原用 `getBufferSize()` 统计向量，
+而 Arrow 按 `valueCount` 换算、本表从不设 valueCount（避免 `setValueCount` 的 fillHoles 压平直接拷贝的
+变长偏移）⇒ build 侧全部数据恒报 0（实测 40000 行 × 200B 实占 8.2MB 只报 0.28MB），预算再大也拦不住。
+现改用只读的 `getBufferSizeFor(行数)`；验收 `HashJoinBuildBudgetProbeTest` 4/0（默认 3MB 预算在第 2 页
+4.12MB 失败、`setBuildBudgetPartitions(1)` 12MB 通过且行数守恒）、`JoinHashTableRowIndexProbeTest` 15/0。
+
+**未修部分**：同一算子内**桶与桶之间**仍是静态平分 —— 热桶用满自份额度后频繁溢写，
+冷桶 / 空桶的额度闲置（全算子明明还有内存）。
 
 候选方向（均未验证）：
 
-- **按活跃分区数动态摊薄**：`阈值 = 算子剩余预算 × ratio / max(1, 活跃分区数)`，分区激活/完成时重算。需保证所有活跃分区的阈值之和不超过算子预算。
-- **槽位借用**：空闲分区的额度可被活跃分区临时占用，需要一个算子级的全局额度池。
+- **按活跃桶数动态摊薄**：`阈值 = 算子剩余预算 × ratio / max(1, 活跃桶数)`，桶激活/完成时重算。
+  需保证所有活跃桶的阈值之和不超过算子预算。
+- **槽位借用 / 跨桶共享预算**：空闲桶的额度可被热桶临时占用，需要算子级全局额度池 + 滞回。
+  **2026-11-22 决定：本版本不做，下一版本设计**；它与"动态卡槽数"正交，落地前需要
+  `fill / spill / await` 占空比遥测 —— 正确判据是"谁在等、谁在闲"，而不是单槽目标字节。
 - 两者都需要避免抖动（反复扩缩阈值导致溢写/回拉抖动）。
 
 ---
@@ -164,10 +212,10 @@ query.slot.memory = fragmentDirect / (3 × spill.ratio)   = 341 / 2.4 ≈ 142MB
    - 单个 Worker 上活跃片段峰值（主池 + 叶子池）
    - 分区级倾斜度（各 `PartitionState` 行数/字节）
    依据：`NodeMemoryProbeTest`、`SpillTelemetryProbeTest`、`SpillDiskProbeTest`、`WorkerManager` 心跳指标。
-2. 依据实测结果选择方向：
-   - 利用率高、倾斜小 → 维持三卡槽，只做 P1 改名；
-   - 溢写文件过多但内存有富余 → 优先评估双卡槽 70/30 或整体调大 `query.operator.memory`；
-   - 倾斜严重 → 优先做 P3 动态摊薄。
+2. 依据实测结果选择方向（P2 已于 2026-11-22 落地：动态卡槽 2/3）：
+   - 溢写文件仍过多但内存有富余 → 调大 `query.operator.memory`，或调大 `query.spill.slot.minBytes`
+     （慢盘保守保留三槽）；
+   - 桶间倾斜严重 → 下一版本做 P3 跨桶共享预算。
 3. 任何改动都必须同步更新：
    - `ResourceConfig.queryDirectLimit()` 的 `SLOT_PIPELINE` 因子
    - `docs/deploy-linux.md` 与 `conf/dojao.conf` 的派生链

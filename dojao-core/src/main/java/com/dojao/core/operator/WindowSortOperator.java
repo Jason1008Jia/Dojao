@@ -222,7 +222,7 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
     @Override
     protected void outputMemory(PartitionState<RowAccumulator> pa, int pid) {
         beginOutput(pid);
-        for (int s = 0; s < SLOT_COUNT; s++) {
+        for (int s = 0; s < pa.slots.size(); s++) {
             checkCancelled();
             RowAccumulator acc = pa.slots.get(s);
             if (acc == null || acc.isEmpty()) continue;

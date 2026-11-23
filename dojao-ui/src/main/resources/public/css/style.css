@@ -863,6 +863,21 @@ body.resizing { cursor: row-resize; user-select: none; }
   border-right: 1px solid var(--line-soft);
 }
 
+/* 行号前的 show detail 列 / 按钮：窄列 + 对角箭头图标，hover 显「show detail」提示 */
+.result-table th.row-detail-th { width: 1%; padding: 0; }
+.result-table td.row-detail-cell {
+  width: 1%; padding: 0 5px; text-align: center;
+}
+.row-detail-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; padding: 0; border: none;
+  background: transparent; border-radius: var(--radius-xs);
+  color: var(--text-faint); cursor: pointer; vertical-align: middle;
+  transition: color .15s var(--ease), background .15s var(--ease), opacity .15s var(--ease);
+}
+.row-detail-btn svg { display: block; }
+.row-detail-btn:hover { color: var(--accent-text); background: var(--accent-soft); }
+
 /* 结果表头可点排序：图标恒在（未排 = 淡显，升/降 = 亮显 + 降序翻转 180°）。
    只改 color 与 transform —— 表头不是输入框的垫层，改字重不会影响落点，但保持统一克制。 */
 .result-table th.th-sort { cursor: pointer; user-select: none; white-space: nowrap; }
@@ -2280,6 +2295,26 @@ textarea.sql-editor::-moz-selection { background: rgba(37, 99, 235, 0.26); color
 .mg-body { padding: 16px 18px; overflow: auto; }
 .mg-loading, .mg-empty { padding: 18px; text-align: center; color: var(--text-faint); font-size: 13px; }
 .refresh-guard-tip { margin-bottom: 12px; color: var(--text-dim); font-size: 13px; line-height: 1.7; }
+/* show detail 弹窗：加宽 + 字段/值两列明细表（值完整展示、可换行） */
+.mg-modal.mg-modal-wide { width: min(860px, 94vw); }
+.row-detail-table-wrap { overflow: auto; }
+.row-detail-table {
+  width: 100%; border-collapse: collapse;
+  font-family: var(--font-mono); font-size: 12.5px;
+}
+.row-detail-table th, .row-detail-table td {
+  border: 1px solid var(--line-soft); padding: 8px 12px;
+  text-align: left; vertical-align: top;
+}
+.row-detail-table th {
+  width: 200px; color: var(--text-dim); font-weight: 600;
+  background: var(--bg2); white-space: nowrap;
+}
+.row-detail-table td {
+  color: var(--text); white-space: pre-wrap; word-break: break-all; min-width: 240px;
+}
+.row-detail-table tbody tr:hover td { background: var(--bg2); }
+.row-detail-null { color: var(--text-faint); font-style: italic; }
 .refresh-guard-tip b { color: var(--text); }
 .mg-error { padding: 18px; text-align: center; color: var(--err); font-size: 13px; }
 .mg-note {
