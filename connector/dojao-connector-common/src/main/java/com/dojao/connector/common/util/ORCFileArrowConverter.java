@@ -26,6 +26,7 @@ import org.apache.orc.TypeDescription;
 
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.LocalDate;
@@ -448,6 +449,12 @@ public class ORCFileArrowConverter implements AutoCloseable {
                 else {
                     HiveDecimalWritable w = dcv.vector[s];
                     BigDecimal bd = w.getHiveDecimal().bigDecimalValue();
+                    // ORC 文件里的 decimal scale 可能和 HMS 表定义不一致（外部表 / 异构写入），
+                    // Arrow DecimalVector 要求两者严格相等，否则 setSafe 抛 0 != 2。
+                    int scale = v.getScale();
+                    if (bd.scale() != scale) {
+                        bd = bd.setScale(scale, RoundingMode.HALF_UP);
+                    }
                     v.setSafe(dstFrom + i, bd);
                 }
             }

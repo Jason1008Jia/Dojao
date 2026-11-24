@@ -245,6 +245,7 @@ public class BroadcastHashJoinOperator extends AbstractMeasurableOperator {
             List<FieldVector> outVectors = null;
             int[] lWidths = null, rWidths = null;
             int filled = 0;
+            long bytes = 0;
 
             FieldVector keyVec = root.getVector(keyColIdx);
             for (int r = 0; r < root.getRowCount(); r++) {
@@ -254,7 +255,7 @@ public class BroadcastHashJoinOperator extends AbstractMeasurableOperator {
                 if (buildRows != null && !buildRows.isEmpty()) {
                     // 匹配 → cross join
                     for (int bRow : buildRows) {
-                        if (filled >= OUTPUT_BATCH_SIZE || outVectors == null) {
+                        if (filled >= OUTPUT_BATCH_SIZE || bytes >= BatchLimits.batchBytes() || outVectors == null) {
                             if (outVectors != null && filled > 0) {
                                 flushOutput(outVectors, filled);
                             }
@@ -262,6 +263,7 @@ public class BroadcastHashJoinOperator extends AbstractMeasurableOperator {
                             lWidths = new int[lCols];
                             rWidths = new int[rCols];
                             filled = 0;
+                            bytes = 0;
                             // 创建左列
                             for (int c = 0; c < lCols; c++) {
                                 FieldVector src = root.getVector(c);
@@ -290,6 +292,8 @@ public class BroadcastHashJoinOperator extends AbstractMeasurableOperator {
                         for (int c = 0; c < rCols; c++) {
                             copyCell(buildVectors.get(c), outVectors.get(lCols + c), rWidths[c], bRow, filled);
                         }
+                        bytes += RowAccumulator.rowBytes(root.getFieldVectors(), r)
+                                + RowAccumulator.rowBytes(buildVectors, bRow);
                         filled++;
 
                         // RIGHT/FULL: 标记 build 行已匹配
@@ -300,7 +304,7 @@ public class BroadcastHashJoinOperator extends AbstractMeasurableOperator {
                 } else {
                     // 不匹配 → LEFT/FULL 输出左孤儿
                     if (joinType == JoinType.LEFT || joinType == JoinType.FULL) {
-                        if (filled >= OUTPUT_BATCH_SIZE || outVectors == null) {
+                        if (filled >= OUTPUT_BATCH_SIZE || bytes >= BatchLimits.batchBytes() || outVectors == null) {
                             if (outVectors != null && filled > 0) {
                                 flushOutput(outVectors, filled);
                             }
@@ -308,6 +312,7 @@ public class BroadcastHashJoinOperator extends AbstractMeasurableOperator {
                             lWidths = new int[lCols];
                             rWidths = new int[rCols];
                             filled = 0;
+                            bytes = 0;
                             for (int c = 0; c < lCols; c++) {
                                 FieldVector src = root.getVector(c);
                                 FieldVector v = src.getField().createVector(allocator);
@@ -330,6 +335,7 @@ public class BroadcastHashJoinOperator extends AbstractMeasurableOperator {
                         }
                         // 右侧列显式设为 NULL（LEFT 孤儿）
                         for (int c = 0; c < rCols; c++) outVectors.get(lCols + c).setNull(filled);
+                        bytes += RowAccumulator.rowBytes(root.getFieldVectors(), r);
                         filled++;
                     }
                 }
@@ -351,11 +357,12 @@ public class BroadcastHashJoinOperator extends AbstractMeasurableOperator {
         List<FieldVector> outVectors = null;
         int[] lWidths = null, rWidths = null;
         int filled = 0;
+        long bytes = 0;
 
         for (int bRow = 0; bRow < buildRowCount; bRow++) {
             if (buildMatched.get(bRow)) continue;  // 已匹配, 跳过
 
-            if (filled >= OUTPUT_BATCH_SIZE || outVectors == null) {
+            if (filled >= OUTPUT_BATCH_SIZE || bytes >= BatchLimits.batchBytes() || outVectors == null) {
                 if (outVectors != null && filled > 0) {
                     flushOutput(outVectors, filled);
                 }
@@ -363,6 +370,7 @@ public class BroadcastHashJoinOperator extends AbstractMeasurableOperator {
                 lWidths = new int[lCols];
                 rWidths = new int[rCols];
                 filled = 0;
+                bytes = 0;
                 for (int c = 0; c < lCols; c++) {
                     Field f = probeSchema.getFields().get(c);
                     FieldVector v = f.createVector(allocator);
@@ -386,6 +394,7 @@ public class BroadcastHashJoinOperator extends AbstractMeasurableOperator {
             }
             // 左侧列显式设为 NULL（RIGHT 孤儿）
             for (int c = 0; c < lCols; c++) outVectors.get(c).setNull(filled);
+            bytes += RowAccumulator.rowBytes(buildVectors, bRow);
             filled++;
         }
 

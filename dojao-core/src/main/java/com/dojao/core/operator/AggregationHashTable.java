@@ -1386,13 +1386,11 @@ public class AggregationHashTable extends RowHashTable implements Slot {
         for (int si = 0; si < specs.length; si++)
             stateColCount[si] = aggregates[si].functionName().equals("avg") ? 2 : 1;
 
+        int[] spillKeyIdx = new int[keyColumns.size()];
+        for (int i = 0; i < spillKeyIdx.length; i++) spillKeyIdx[i] = i;
         for (int r = 0; r < spillSize; r++) {
-            int hash = 0;
-            for (int i = 0; i < keyColumns.size(); i++) {
-                FieldVector vec = spillRoot.getVector(i);
-                int h = vec.isNull(r) ? 0 : vec.getObject(r).hashCode();
-                hash = 31 * hash + h;
-            }
+            // 与主表插入同一个内容 hash 口径（变长按字节）：否则 spill 合并时同键会落不同桶 → 重复分组。
+            int hash = hashRow(spillRoot, spillKeyIdx, r);
             int bucket = bucketOf(hash, capacity);
 
             int groupIdx;

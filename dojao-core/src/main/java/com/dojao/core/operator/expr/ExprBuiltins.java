@@ -44,6 +44,7 @@ public final class ExprBuiltins {
             "split",                                 // 分隔符切分 → 数组
             "from_str_to_array",                     // JSON 数组文本 → 数组
             "json_array_explode",                    // JSON 数组文本 + 字段名 → 字段值数组
+            "json_array_explode_with_separator",     // JSON 数组 + 分隔符 + 多 key → 拼接字符串数组
             "size");                                 // 数组长度（字符串长度用 length）
 
     /**
@@ -174,6 +175,27 @@ public final class ExprBuiltins {
                 if (args[0] == null || args[1] == null) return null;
                 return jsonFieldArray(ExprEvaluator.string(args[0]), ExprEvaluator.string(args[1]));
             }
+            case "json_array_explode_with_separator": {
+                // json_array_explode_with_separator(arr, sep, ...keyvalue) —— 每个数组元素按给定
+                // key/path 取值，再用分隔符拼成一个字符串，逐个元素成数组：
+                // '[{"jobName":"储备干部","province":44},...]' + ',' + '$.jobName' + '$.province'
+                //   → ['储备干部,44', ...]。
+                // 非法 JSON / 非数组 → NULL；非对象元素、或任一 key 缺失/NULL → NULL 元素（保留下标对齐）。
+                if (args.length < 3) {
+                    throw new IllegalArgumentException(
+                            "函数 " + name + " 至少需要 3 个参数（数组, 分隔符, 至少一个 key），实得 "
+                                    + args.length);
+                }
+                for (Object a : args) {
+                    if (a == null) return null;
+                }
+                String[] paths = new String[args.length - 2];
+                for (int i = 2; i < args.length; i++) {
+                    paths[i - 2] = ExprEvaluator.string(args[i]);
+                }
+                return jsonFieldJoinArray(ExprEvaluator.string(args[0]),
+                        ExprEvaluator.string(args[1]), paths);
+            }
             default:
                 throw new IllegalArgumentException("未内置函数: " + name);
         }
@@ -214,6 +236,57 @@ public final class ExprBuiltins {
                     : el.isValueNode() ? el.asText() : el.toString());
         }
         return out;
+    }
+
+    /**
+     * JSON 数组文本 + 分隔符 + 多个 key/path → 每元素拼接成一个字符串（列表结果）；非法 JSON 或
+     * 非数组 → null。key 写法支持 {@code jobName}、{@code $.jobName} 与逐层 {@code $.a.b}。
+     * 元素不是对象、或任一 key 缺失/为 JSON null → null 元素（保留下标对齐）；值口径与
+     * {@link #jsonFieldArray} 一致（标量取 {@code asText()}，对象/数组保留 JSON 文本）。
+     */
+    private static List<String> jsonFieldJoinArray(String text, String separator, String[] paths) {
+        JsonNode node;
+        try {
+            node = JSON_MAPPER.readTree(text);
+        } catch (Exception e) {
+            return null;
+        }
+        if (node == null || !node.isArray()) return null;
+        List<String> out = new ArrayList<>(node.size());
+        for (JsonNode el : node) {
+            if (el == null || !el.isObject()) {
+                out.add(null);
+                continue;
+            }
+            StringBuilder sb = new StringBuilder();
+            boolean complete = true;
+            for (int i = 0; i < paths.length; i++) {
+                JsonNode v = pathValue(el, paths[i]);
+                if (v == null || v.isNull()) {
+                    complete = false;
+                    break;
+                }
+                if (i > 0) sb.append(separator);
+                sb.append(v.isValueNode() ? v.asText() : v.toString());
+            }
+            out.add(complete ? sb.toString() : null);
+        }
+        return out;
+    }
+
+    /** 取 JSON path：{@code jobName} / {@code $.jobName} / {@code $.a.b}；任一层缺失 → null。 */
+    private static JsonNode pathValue(JsonNode obj, String path) {
+        String p = path == null ? "" : path.trim();
+        if (p.startsWith("$")) p = p.substring(1);
+        while (p.startsWith(".")) p = p.substring(1);
+        if (p.isEmpty()) return obj;
+        JsonNode cur = obj;
+        for (String seg : p.split("\\.")) {
+            if (cur == null || !cur.isObject()) return null;
+            cur = cur.get(seg);
+            if (cur == null) return null;
+        }
+        return cur;
     }
 
     /**

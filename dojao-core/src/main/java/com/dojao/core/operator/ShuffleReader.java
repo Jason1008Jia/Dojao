@@ -33,7 +33,11 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class ShuffleReader implements PartitionedSource {
 
-    /** 每桶入队缓冲容量（与 HashPartitionOperator 的 PARALLEL_QUEUE_CAPACITY 同量级，有界 put 提供背压）。 */
+    /**
+     * 每桶入队缓冲容量（与 HashPartitionOperator 的 PARALLEL_QUEUE_CAPACITY 同量级，有界 put 提供背压）。
+     * <p>★页数之外还有<b>字节</b>预算（{@link BatchLimits}，默认 32MB）—— 宽行页单页几十 MB，
+     * 只按 8 页限制会让拉取端常驻数 GB（下游 join/聚合还没开始就 OOM）。</p>
+     */
     private static final int QUEUE_CAPACITY = 8;
 
     private final String exchangeId;
@@ -106,7 +110,7 @@ public final class ShuffleReader implements PartitionedSource {
         this.bucketPages = new AtomicLong[this.numPartitions];
         this.bucketEnded = new boolean[this.numPartitions];
         for (int i = 0; i < this.numPartitions; i++) {
-            bucketQueues[i] = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
+            bucketQueues[i] = new PageBoundedQueue(QUEUE_CAPACITY, BatchLimits.batchBytes());
             completedSenders[i] = new AtomicInteger();
             bucketPages[i] = new AtomicLong();
             if (owned != null && !owned[i]) {

@@ -8573,9 +8573,10 @@ public final class Planner {
                 djo.leftCatalog(), djo.leftSchema(), djo.leftTable(), djo.leftKeys(),
                 djo.rightCatalog(), djo.rightSchema(), djo.rightTable(), djo.rightKeys(),
                 djo.joinType(), djo.memoryLimit(), partitions,
-                djo.gateway(), djo.leftProbe(), djo.rightProbe(), djo.workers(), step,
+                djo.gateway(), djo.leftProbe(), djo.rightProbe(), djo.workers(), step, null,
                 djo.leftFilter(), djo.rightFilter(),
-                djo.firstColumns(), djo.links().get(0).rightColumns());
+                djo.firstColumns(), djo.links().get(0).rightColumns(), null,
+                djo.links().get(0).algorithm());
 
         List<String> outCols = new ArrayList<>(keys);
         outCols.addAll(aggs.stream().map(AggregationSpec::outputColumn).toList());
@@ -9751,7 +9752,8 @@ public final class Planner {
                     djo.joinType(), djo.memoryLimit(), partitions,
                     djo.gateway(), djo.leftProbe(), djo.rightProbe(), djo.workers(), null, steps,
                     djo.leftFilter(), djo.rightFilter(),
-                    djo.firstColumns(), djo.links().get(0).rightColumns(), aliases);
+                    djo.firstColumns(), djo.links().get(0).rightColumns(), aliases,
+                    djo.links().get(0).algorithm());
         }
 
         String name = "DistributedJoinWindowChain[groups=" + steps.size()
@@ -10631,20 +10633,22 @@ public final class Planner {
             if (isStarExpansion(text)) {
                 // 能否在计划期把 * 直接展开为真实列名（语义等价于运行期 Page.select 的展开）：
                 //   ① 上游列名已知（不含哨兵 "*" 自身 —— 嵌套 star 时上游也是哨兵，展不了）；
-                //   ② 裸 * 总是可以；alias.* 仅在 FROM 只有唯一关系时才可 —— 多表 join 时上游
-                //      列是各表之和，展开会连带别的表列，故 alias.* 多表时保留哨兵。
+                //   ② 裸 * 总是可以；限定 q.* 只在 q 能定位到 FROM 关系时可以 —— 展开范围收窄到
+                //      该关系自己的列。多表 join 下上游列是各表之和，靠关系声明列过滤，
+                //      否则 `a1.*, b.x` 会把 b 的其余列也带进结果（线上 2026-11-23）。
                 boolean pureStar = "*".equals(text);
+                List<String> starScope = pureStar ? null : starRelationColumns(select, text);
                 boolean canExpand = !upstream.outputColumns().contains("*")
-                        && (pureStar || (select.joins().isEmpty()
-                                         && select.fromRelations().size() == 1));
+                        && (pureStar || starScope != null);
                 if (explicitCols.isEmpty() && !canExpand) {
-                    // 无法静态展开（alias.* 多表 / 上游本身是哨兵）→ 保留 *，由 Page.select 运行期展开
+                    // 无法静态展开（关系定位不到 / 上游本身是哨兵）→ 保留 *，由 Page.select 运行期展开
                     outCols.add("*");
                     displayCols.add("*");
                 } else {
                     // 展开为上游真实列，并去掉显式列（避免 *, x 时 x 重复输出）。
                     // 内部列（__jk_* / __win_key_*）不对用户暴露，跳过。
                     for (String c : upstream.outputColumns()) {
+                        if (starScope != null && !starScope.contains(c)) continue;
                         if (isJoinKeyAlias(c)) continue;
                         // HAVING 为「非标识符列名」的聚合输出列复制出的内部副本，不对用户暴露
                         if (c.startsWith(HAVING_REF_PREFIX)) continue;
@@ -10719,6 +10723,25 @@ public final class Planner {
         }
         ProjectOperator proj = new ProjectOperator(upstream.operator(), outCols);
         return withDisplayNames(new PhysicalNode("Project", proj, outCols, upstream), outCols, displayCols);
+    }
+
+    /**
+     * 限定星号 {@code q.*} 的 q → 该 FROM 关系的声明列；匹配不到任何关系时返回 {@code null}
+     * （调用方回退「上游全部列」的旧口径）。按 alias 或表名匹配（大小写不敏感）。
+     */
+    private static List<String> starRelationColumns(LogicalPlan.Select select, String starText) {
+        int dot = starText.lastIndexOf('.');
+        if (dot <= 0) return null;
+        String qual = starText.substring(0, dot).trim();
+        String last = qual.substring(qual.lastIndexOf('.') + 1);
+        for (LogicalPlan.ResolvedRelation rel : select.fromRelations()) {
+            String alias = rel.alias().orElse(rel.table());
+            if (alias.equalsIgnoreCase(qual) || rel.table().equalsIgnoreCase(qual)
+                    || alias.equalsIgnoreCase(last) || rel.table().equalsIgnoreCase(last)) {
+                return rel.columns();
+            }
+        }
+        return null;
     }
 
     /**

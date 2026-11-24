@@ -1264,6 +1264,7 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
                         // 与内联派生表（deriveDerivedTableColumns）同一推导：有别名→别名；select *→按
                         // FROM 展开；裸列→剥表限定符（r.user_id → user_id）。原来直接用表达式文本会
                         // 把 "r.user_id" 整段当列标签 → CTE 内 join 后外层永远解析不到 user_id（bug）。
+                        validateDerivedColumnNames(innerPlan, cte);
                         columns = deriveDerivedTableColumns(innerPlan);
                     }
                     cteDefinitions.put(cteName, columns);
@@ -1810,6 +1811,7 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
             ? ctx.identifier().getText() : "subquery";
         // 修复：原来硬编码 List.of()，派生表的任何列都无法被外层解析（如 where rr<=10）。
         // 现在从子查询的输出列推导真实列名，与 CTE 的列推导保持一致。
+        validateDerivedColumnNames(innerPlan, ctx);
         List<String> columns = deriveDerivedTableColumns(innerPlan);
         Scope.RelationInfo info = new Scope.RelationInfo(
             "", "", alias, alias, columns, Optional.of(innerPlan));
@@ -1818,6 +1820,43 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
             "", "", alias, Optional.of(alias), columns,
             Optional.empty(), Optional.of(innerPlan)));
         return alias;
+    }
+
+    /**
+     * 校验派生表 / CTE 的<b>显式输出列名</b>不得重复。
+     *
+     * <p>SQL 语法允许 {@code select id, es_update_time, es_update_time}，但派生表列名重复后，
+     * 外层按列名引用就产生歧义：Hive 稳定取第一个，而 Dojao 内部多个算子（列裁剪 / 投影 /
+     * 窗口排序 / join 输出 schema）各自按名字解析，可能取到不同出现位置 ⇒ 静默 0 行
+     * （线上 2026-11-23：重复 {@code es_update_time} 导致 {@code rr=1} 过滤后结果为空）。</p>
+     *
+     * <p>这里只在<b>显式</b>列（别名 / 列引用 / 表达式）上查重；{@code *} 展开不在本校验内
+     * （{@code select *} 包 join 同名列是常见写法，外层通常加限定引用）。</p>
+     */
+    private void validateDerivedColumnNames(LogicalPlan innerPlan, ParserRuleContext ctx) {
+        if (innerPlan instanceof LogicalPlan.Select select) {
+            Map<String, String> seen = new LinkedHashMap<>();
+            for (LogicalPlan.SelectItem item : select.selectItems()) {
+                String expr = item.expression() == null ? null : item.expression().text();
+                if (expr != null && expr.trim().endsWith("*")) continue;   // 星号展开不在此查重
+                String name = item.alias().orElseGet(() -> {
+                    if (expr == null) return "";
+                    String t = expr.trim();
+                    int dot = t.lastIndexOf('.');
+                    return dot >= 0 ? t.substring(dot + 1) : t;
+                });
+                if (name.isEmpty()) continue;
+                String prev = seen.putIfAbsent(name.toLowerCase(Locale.ROOT), name);
+                if (prev != null) {
+                    error(ctx, "派生表/CTE 的输出列名重复: \"" + name
+                            + "\" —— 外层按列名绑定会命中不同出现位置（Hive 取第一个，Dojao 可能错位，"
+                            + "曾导致窗口 rr=1 过滤后 0 行）。请给重复列加不同别名，如 "
+                            + name + "_2");
+                }
+            }
+        } else if (innerPlan instanceof LogicalPlan.SetOperation so) {
+            validateDerivedColumnNames(so.left(), ctx);
+        }
     }
 
     /**
@@ -1897,6 +1936,7 @@ public class SemanticAnalyzer extends SqlBaseBaseVisitor<LogicalPlan> {
                 LogicalPlan innerPlan;
                 scopeStack.push(new Scope());
                 try { innerPlan = visit(subquery.query()); } finally { scopeStack.pop(); }
+                validateDerivedColumnNames(innerPlan, subquery);
                 return new Scope.RelationInfo("", "", "subquery", "subquery",
                     deriveDerivedTableColumns(innerPlan), Optional.of(innerPlan));
             }

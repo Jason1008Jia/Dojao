@@ -489,6 +489,11 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
         int[] batchLRow = new int[1024];   // 左行号（-1 = 该侧 NULL）
         int[] batchRRow = new int[1024];   // build 行号（-1 = 该侧 NULL）
         int batchSize;
+        /** 当前输出批的<b>逻辑字节</b>累计（行数之外的第二重切批上界，默认 32MB）。 */
+        long batchBytes;
+        /** build 侧累计逻辑字节 / 行数（折算单行右表宽度，用于给匹配对估字节）。 */
+        long buildBytes;
+        long buildRows;
         final List<Page> heldPages = new ArrayList<>();
         long matches;
         long nulls;
@@ -570,6 +575,8 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
                     j.table = new JoinHashTable(allocator, rightKeyColumns, keyFields, j.rightSchema);
                 }
                 int rows = page.getRowCount();
+                j.buildBytes += RowAccumulator.averageRowBytes(page.getRoot().getFieldVectors(), rows) * rows;
+                j.buildRows += rows;
                 // 右残差谓词：每页求值一次得到布尔掩码；为假的行同样入表（RIGHT/FULL 收尾要作为孤儿输出），
                 // 只是不参与匹配。
                 boolean[] pageOk = evaluateMask(rightFilterEvaluator, page.getRoot(), rows, "__on_right");
@@ -635,6 +642,9 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
             // Worker（REPLICATE），本机与左表就地做交叉连接。此时没有 probe 键向量可解析。
             boolean crossJoin = leftKeyColumns.isEmpty();
             boolean emptyBuild = (j.table == null || j.table.isEmpty());
+            // 输出批的字节估算：左页平均行宽 + build 侧平均行宽（只用于切批，不参与正确性）
+            long leftAvgBytes = RowAccumulator.averageRowBytes(root.getFieldVectors(), rowCount);
+            long rightAvgBytes = j.buildRows == 0 ? 0 : j.buildBytes / j.buildRows;
 
             // 左残差谓词：每页求值一次（逐候选只查布尔位）。
             boolean[] leftPageOk = evaluateMask(leftFilterEvaluator, root, rowCount, "__on_left");
@@ -650,8 +660,10 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
                         addPair(j, pageIdx, r, rr);
                         j.matches++;
                         matchedPairs++;
+                        j.batchBytes += leftAvgBytes + rightAvgBytes;
                         if (j.rightRowMatched != null) j.rightRowMatched[rr] = true;
-                        if (j.batchSize >= JOIN_SEND_BATCH_SIZE) {
+                        if (j.batchSize >= JOIN_SEND_BATCH_SIZE
+                                || j.batchBytes >= BatchLimits.batchBytes()) {
                             flush(j, true);
                             // flush(true) 后当前页被移到 heldPages[0]，后续配对的下标随之复位
                             pageIdx = 0;
@@ -663,14 +675,17 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
                 if (matchedPairs == 0 && needNullRight) {
                     addPair(j, pageIdx, r, -1);
                     j.nulls++;
-                    if (j.batchSize >= JOIN_SEND_BATCH_SIZE) {
+                    j.batchBytes += leftAvgBytes;
+                    if (j.batchSize >= JOIN_SEND_BATCH_SIZE
+                            || j.batchBytes >= BatchLimits.batchBytes()) {
                         flush(j, true);
                         pageIdx = 0;
                     }
                 }
             }
-            // 当前页耗尽：攒满 5W 或持有页过多（稀疏匹配）触发内存安全阀
-            if (j.batchSize >= JOIN_SEND_BATCH_SIZE || j.heldPages.size() > MAX_HELD_PAGES) {
+            // 当前页耗尽：攒满 5W 行 / 32MB 字节或持有页过多（稀疏匹配）触发内存安全阀
+            if (j.batchSize >= JOIN_SEND_BATCH_SIZE || j.batchBytes >= BatchLimits.batchBytes()
+                    || j.heldPages.size() > MAX_HELD_PAGES) {
                 flush(j, false);
             }
         }
@@ -693,6 +708,7 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
         }
         assembleAndEnqueue(j, () -> assemble(j));
         j.batchSize = 0;
+        j.batchBytes = 0;
 
         List<Page> held = j.heldPages;
         int closeEnd = keepCurrent ? held.size() - 1 : held.size();
@@ -770,14 +786,18 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
 
         boolean[] matched = j.rightRowMatched;
         int buildRows = j.table.buildRowCount();
+        long rightAvgBytes = j.buildRows == 0 ? 0 : j.buildBytes / j.buildRows;
+        long batchBytes = 0;
         List<int[]> batch = new ArrayList<>();
         for (int rr = 0; rr < buildRows; rr++) {
             if (matched != null && matched[rr]) continue;
             batch.add(new int[]{-1, rr});
-            if (batch.size() >= JOIN_SEND_BATCH_SIZE) {
+            batchBytes += rightAvgBytes;
+            if (batch.size() >= JOIN_SEND_BATCH_SIZE || batchBytes >= BatchLimits.batchBytes()) {
                 List<int[]> page = new ArrayList<>(batch);
                 assembleAndEnqueue(j, () -> assembleUnmatched(j, page));
                 batch.clear();
+                batchBytes = 0;
             }
         }
         if (!batch.isEmpty()) {
@@ -1202,8 +1222,6 @@ public class HashJoinOperator extends AbstractMeasurableOperator implements Expl
     }
 
     private static String formatBytes(long bytes) {
-        if (bytes < 1024) return bytes + " B";
-        if (bytes < 1024 * 1024) return String.format("%.1f KB", bytes / 1024.0);
-        return String.format("%.2f MB", bytes / (1024.0 * 1024.0));
+        return com.dojao.common.memory.SizeFormat.bytes(bytes);
     }
 }

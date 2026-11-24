@@ -15,6 +15,7 @@ import org.apache.hadoop.io.compress.CompressionCodecFactory;
 import java.io.IOException;
 import java.io.InputStream;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.util.ArrayList;
@@ -364,7 +365,15 @@ public class TextFileArrowConverter implements AutoCloseable {
         } else if (vec instanceof Float8Vector v) {
             v.setSafe(row, Double.parseDouble(s));
         } else if (vec instanceof DecimalVector v) {
-            v.setSafe(row, new BigDecimal(s));
+            // Arrow 要求 BigDecimal 的 scale 与列定义完全一致：文本里的 "123"（scale 0）
+            // 或小数位少于列定义的值直接 setSafe 会抛 UnsupportedOperationException: 0 != 2。
+            // 按列 scale 补齐（与 Hive 一致，超出位数按 HALF_UP 收敛）。
+            BigDecimal bd = new BigDecimal(s);
+            int scale = v.getScale();
+            if (bd.scale() != scale) {
+                bd = bd.setScale(scale, RoundingMode.HALF_UP);
+            }
+            v.setSafe(row, bd);
         } else if (vec instanceof DateDayVector v) {
             v.setSafe(row, (int) LocalDate.parse(s).toEpochDay());
         } else if (vec instanceof TimeStampMilliVector v) {

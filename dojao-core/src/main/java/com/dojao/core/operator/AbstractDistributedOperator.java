@@ -87,7 +87,12 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
      * 字节预算与扫描回传同口径（{@link ByteBoundedQueue#defaultBudgetBytes()}）。</p>
      */
     protected final BlockingQueue<FragmentEvent> resultQueue =
-            new FragmentEventQueue(RESULT_QUEUE_CAPACITY, ByteBoundedQueue.defaultBudgetBytes());
+            new FragmentEventQueue(RESULT_QUEUE_CAPACITY,
+                    // 回传数据页预算：默认 = 节点 Arrow 预算/4（Master 上可达 ~275MB）。
+                    // 宽行写回（143 列 JSON 提取 + 多 worker 并发 copyPage）时仍嫌大 —— 再封顶 128MB，
+                    // 把「排队页 + Flight 流根 + copyPage 瞬时拷贝」压在 Master 预算内（线上 2026-11-24
+                    // 当前分配 1.11GB 时申请 2MB 失败）。
+                    Math.min(128L << 20, ByteBoundedQueue.defaultBudgetBytes()));
     /**
      * Worker 回传的<b>控制事件</b>队列（FINISHED / FAILED / PROGRESS，无界）。
      *

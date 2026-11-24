@@ -448,6 +448,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
 
             outVectors = allocOutputVectors(outFields);
             int outRow = 0;
+            long outBytes = 0;
             List<Integer> same = new ArrayList<>();
 
             while (!pq.isEmpty()) {
@@ -493,15 +494,17 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                     outCol++;
                 }
                 outRow++;
+                outBytes += RowAccumulator.rowBytes(outVectors, outRow - 1);
                 bumpMergeProgress();
 
-                if (outRow >= AGG_PER_BATCH_KEYS) {
+                if (outRow >= AGG_PER_BATCH_KEYS || outBytes >= BatchLimits.batchBytes()) {
                     List<FieldVector> batch = outVectors;
                     outVectors = null;                  // 所有权移交给输出页
                     for (FieldVector v : batch) v.setValueCount(outRow);
                     emitPage(Page.partitioned(new VectorSchemaRoot(outFields, batch, outRow), pid));
                     outVectors = allocOutputVectors(outFields);
                     outRow = 0;
+                    outBytes = 0;
                 }
             }
 
@@ -914,6 +917,7 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
 
             outVectors = allocOutputVectors(outFields);
             int outRow = 0;
+            long outBytes = 0;
             List<Integer> same = new ArrayList<>();
 
             while (!pq.isEmpty()) {
@@ -970,15 +974,17 @@ public class HashAggregationOperator extends AbstractSpillableOperator<Slot> imp
                     outCol++;
                 }
                 outRow++;
+                outBytes += RowAccumulator.rowBytes(outVectors, outRow - 1);
                 bumpMergeProgress();
 
-                if (outRow >= AGG_PER_BATCH_KEYS) {
+                if (outRow >= AGG_PER_BATCH_KEYS || outBytes >= BatchLimits.batchBytes()) {
                     List<FieldVector> batch = outVectors;
                     outVectors = null;                  // 所有权移交给输出页
                     for (FieldVector v : batch) v.setValueCount(outRow);
                     emitPage(Page.partitioned(new VectorSchemaRoot(outFields, batch, outRow), pid));
                     outVectors = allocOutputVectors(outFields);
                     outRow = 0;
+                    outBytes = 0;
                 }
             }
 

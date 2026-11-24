@@ -85,7 +85,8 @@ function acOnKeydown(e, input) {
     if (e.key === 'ArrowDown') { e.preventDefault(); acMove(1); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); acMove(-1); }
     else if ((e.key === 'Enter' || e.key === 'Tab') && !e.ctrlKey && !e.metaKey && !e.altKey) {
-        // 注意排除 Ctrl/⌘+Enter —— 那是「运行」，不能让补全把它吃掉
+        // 注意排除 Ctrl/⌘+Enter —— 那是「运行」，不能让补全把它吃掉。
+        // 弹窗未打开时上面已 return，Tab 归编辑器缩进（见 dashboard.js bindSqlEditor）。
         e.preventDefault();
         acAccept();
     } else if (e.key === 'Escape') {

@@ -60,6 +60,14 @@ public class DistributedChainedOperator extends AbstractDistributedOperator
     private final List<String> rightColumns;
     /** 外连接同名列消歧别名（空 = 无）：join 输出先补 __jk_* 副本再进入窗口链。 */
     private final List<FragmentSpec.JoinAlias> outputAliases;
+    /**
+     * join 算法（Master 规划期 {@code Planner.chooseJoinAlgorithm} 的结论）。
+     *
+     * <p>链式舞台原先在 {@code StageScheduler} 里硬编码 HASH —— 即使规划期判定
+     * SORT_MERGE（build 侧超预算），Worker 仍会建 HashJoin 并在 probe 时
+     * {@code build side too large} fail-fast。算法必须随链式片段一起下发。</p>
+     */
+    private final FragmentSpec.JoinAlgorithm joinAlgorithm;
 
     public DistributedChainedOperator(String queryId,
                                       String leftCatalog, String leftSchema, String leftTable, List<String> leftKeys,
@@ -133,6 +141,28 @@ public class DistributedChainedOperator extends AbstractDistributedOperator
                                       String leftFilter, String rightFilter,
                                       List<String> leftColumns, List<String> rightColumns,
                                       List<FragmentSpec.JoinAlias> outputAliases) {
+        this(queryId, leftCatalog, leftSchema, leftTable, leftKeys,
+                rightCatalog, rightSchema, rightTable, rightKeys, joinType, memoryLimit, numPartitions,
+                gateway, leftProbe, rightProbe, workers, followUp, windowChain,
+                leftFilter, rightFilter, leftColumns, rightColumns, outputAliases,
+                FragmentSpec.JoinAlgorithm.HASH);
+    }
+
+    /**
+     * 全参构造：额外携带 <b>Master 规划期的 join 算法结论</b>（HASH / SORT_MERGE）。
+     * 链式路径必须透传，否则 SORT_MERGE 规划会被 StageScheduler 的默认 HASH 覆盖。
+     */
+    public DistributedChainedOperator(String queryId,
+                                      String leftCatalog, String leftSchema, String leftTable, List<String> leftKeys,
+                                      String rightCatalog, String rightSchema, String rightTable, List<String> rightKeys,
+                                      JoinType joinType, long memoryLimit, int numPartitions,
+                                      WorkerGateway gateway, DojaoConnector leftProbe, DojaoConnector rightProbe,
+                                      List<WorkerRegistration> workers, FragmentSpec.FollowUp followUp,
+                                      List<FragmentSpec.WindowStep> windowChain,
+                                      String leftFilter, String rightFilter,
+                                      List<String> leftColumns, List<String> rightColumns,
+                                      List<FragmentSpec.JoinAlias> outputAliases,
+                                      FragmentSpec.JoinAlgorithm joinAlgorithm) {
         super("DistributedChained", queryId, numPartitions, gateway, workers);
         this.leftCatalog = leftCatalog;
         this.leftSchema = leftSchema;
@@ -153,7 +183,11 @@ public class DistributedChainedOperator extends AbstractDistributedOperator
         this.leftColumns = leftColumns;
         this.rightColumns = rightColumns;
         this.outputAliases = outputAliases == null ? List.of() : List.copyOf(outputAliases);
+        this.joinAlgorithm = joinAlgorithm == null ? FragmentSpec.JoinAlgorithm.HASH : joinAlgorithm;
     }
+
+    /** 当前链式舞台下发的 join 算法（诊断 / 探针）。 */
+    public FragmentSpec.JoinAlgorithm joinAlgorithm() { return joinAlgorithm; }
 
     /** EXPLAIN 明细：两侧扫描 + join 算法 / 连接键 + 同 key 后续计算（聚合 / 窗口）。 */
     @Override
@@ -189,8 +223,8 @@ public class DistributedChainedOperator extends AbstractDistributedOperator
                     + " functions=" + win.functions().stream()
                             .map(f -> f.type() + " AS " + f.outputColumn()).toList());
         }
-        out.add("algorithm: " + JoinExplain.distributed(FragmentSpec.JoinAlgorithm.HASH, memoryLimit, numPartitions)
-                + "（本地每分区哈希 join，join 与后续计算之间零二次交换）");
+        out.add("algorithm: " + JoinExplain.distributed(joinAlgorithm, memoryLimit, numPartitions)
+                + "（本地每分区 join，join 与后续计算之间零二次交换）");
         return out;
     }
 
@@ -206,7 +240,7 @@ public class DistributedChainedOperator extends AbstractDistributedOperator
                     rightCatalog, rightSchema, rightTable, rightKeys,
                     joinType, memoryLimit, leftProbe, rightProbe, windowChain,
                     leftFilter, rightFilter, leftColumns, rightColumns, outputAliases,
-                    terminalReshuffleAggregate);
+                    terminalReshuffleAggregate, joinAlgorithm);
 
             List<FragmentSpec> fragments = withTerminal(stage.fragments());   // 仅终端组挂 sink / top-N
             for (FragmentSpec fragment : fragments) {
@@ -220,7 +254,7 @@ public class DistributedChainedOperator extends AbstractDistributedOperator
                 leftCatalog, leftSchema, leftTable, leftKeys,
                 rightCatalog, rightSchema, rightTable, rightKeys,
                 joinType, memoryLimit, leftProbe, rightProbe, followUp, leftFilter, rightFilter,
-                leftColumns, rightColumns, partialFollowUp);
+                leftColumns, rightColumns, partialFollowUp, joinAlgorithm);
 
         // 先 Consumer（同步注册接收端）后 Producer（发送端）—— 发送方 push 前所有接收端就绪
         List<FragmentSpec> consumers = withTerminal(stage.consumers());   // 分布式写 SinkStep + top-N 截断尾

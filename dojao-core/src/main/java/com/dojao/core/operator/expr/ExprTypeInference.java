@@ -108,7 +108,8 @@ public final class ExprTypeInference {
                  "md5", "sha1", "sha2", "uuid", "date_format", "from_unixtime", "now", "current_date_time" ->
                     ArrowType.Utf8.INSTANCE;
             // 数组返回函数：子列恒为 Utf8（元素 Field 由 toField 补齐）
-            case "split", "from_str_to_array", "json_array_explode" -> ArrowType.List.INSTANCE;
+            case "split", "from_str_to_array", "json_array_explode",
+                 "json_array_explode_with_separator" -> ArrowType.List.INSTANCE;
             // 数组长度 → BIGINT（字符串长度 length 同口径，见 ExprBuiltins.length）
             case "size" -> INT64;
             default -> null;
@@ -118,7 +119,7 @@ public final class ExprTypeInference {
     /**
      * 静态类型 → 完整 {@link Field}（LIST 必须带上子列 —— 光有 ArrowType.List 的 Field
      * {@code createVector} 建不出可写的 ListVector）。目前推出 LIST 的内置函数是
-     * split / from_str_to_array / json_array_explode。
+     * split / from_str_to_array / json_array_explode / json_array_explode_with_separator。
      */
     public static Field toField(String name, ArrowType type, boolean nullable) {
         if (type instanceof ArrowType.List) {

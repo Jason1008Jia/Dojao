@@ -159,11 +159,8 @@ public class LocalAggregationOperator extends AbstractMeasurableOperator {
         for (String col : keyColumns) {
             FieldVector vec = root.getVector(col);
             if (vec == null) continue;
-            if (vec.isNull(row)) {
-                hash = 31 * hash;
-            } else {
-                hash = 31 * hash + vec.getObject(row).hashCode();
-            }
+            // 内容 hash（变长按字节）：Arrow Text 的 hashCode 是对象身份，会把同值行分到不同分区。
+            hash = 31 * hash + RowAccumulator.keyHash(vec, row);
         }
         return (hash & Integer.MAX_VALUE) % numPartitions;
     }

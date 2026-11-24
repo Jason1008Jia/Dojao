@@ -266,7 +266,7 @@ public final class MasterControlFlightProducer implements FlightProducer {
                     VectorSchemaRoot root = flightStream.getRoot();
                     if (root.getRowCount() > 0 && sink != null) {
                         // 接收端「即将占用更多堆外」——先过背压闸门，把多页滞留压回读取端
-                        NodeMemory.shared().throttle();
+                        awaitAllocatorHeadroom(allocator);
                         sink.data(copyPage(root, allocator));
                     }
                     continue;
@@ -280,7 +280,7 @@ public final class MasterControlFlightProducer implements FlightProducer {
                             // 拷贝进 Master 分配器 → 路由入队；队列满阻塞 = 背压（Worker 生产随之阻塞）。
                             // throttle 在拷贝前施加：堆外高水位时先等溢写/消费把用量压下来，
                             // 避免结果回传洪峰把 Arrow 预算（尤其单机回退的多窗口分组）瞬间吃穿。
-                            NodeMemory.shared().throttle();
+                            awaitAllocatorHeadroom(allocator);
                             sink.data(copyPage(root, allocator));
                         }
                     }
@@ -368,6 +368,24 @@ public final class MasterControlFlightProducer implements FlightProducer {
     }
 
     /** 原生 batch → 独立 allocator 的页（逐列拷贝，var 列安全；与交换接收端同构）。 */
+    /**
+     * 拷贝前等待 Master Arrow 分配器腾出安全余量（默认至少 1/8 且不低于 64MB）。
+     *
+     * <p>本方法在 gRPC 收流线程上执行：等待期间 Worker 的 Flight 流控自然阻塞，上游扫描/计算随之
+     * 降速 —— 这正是我们要的端到端背压。结果页由 Master 侧 sink（写 Hive / 回传 UI）消费释放，
+     * 正常会持续推进；查询取消时线程被中断，检查点立即退出。</p>
+     */
+    private static void awaitAllocatorHeadroom(BufferAllocator alloc) throws InterruptedException {
+        long limit = alloc.getLimit();
+        if (limit <= 0 || limit == Long.MAX_VALUE) return;
+        long headroom = Math.max(64L << 20, limit / 8);
+        long keepBelow = Math.max(1L, limit - headroom);
+        while (alloc.getAllocatedMemory() > keepBelow) {
+            NodeMemory.shared().throttle();
+            Thread.sleep(10);
+        }
+    }
+
     private static Page copyPage(VectorSchemaRoot src, BufferAllocator allocator) {
         int rc = src.getRowCount();
         List<FieldVector> copied = new ArrayList<>(src.getFieldVectors().size());

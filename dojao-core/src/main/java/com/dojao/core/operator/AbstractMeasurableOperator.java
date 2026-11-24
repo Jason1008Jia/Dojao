@@ -117,7 +117,7 @@ public abstract class AbstractMeasurableOperator implements MeasurableOperator {
         if (first.length() > 300) {
             first = first.substring(0, 300) + "…";
         }
-        return cls + ": " + first;
+        return cls + ": " + com.dojao.common.memory.SizeFormat.humanize(first);
     }
 
     /**

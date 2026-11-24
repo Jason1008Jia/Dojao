@@ -61,7 +61,8 @@ public final class TableSinkOperator extends AbstractMeasurableOperator {
     private boolean overwriteCommitted;
 
     // ===== 并行写通道 =====
-    private final BlockingQueue<Page> writeQueue = new LinkedBlockingQueue<>(WRITE_QUEUE_CAPACITY);
+    private final BlockingQueue<Page> writeQueue =
+            new PageBoundedQueue(WRITE_QUEUE_CAPACITY, 64L * 1024 * 1024);
     private final BlockingQueue<Page> doneQueue  = new LinkedBlockingQueue<>();
     private final AtomicInteger writersFinished = new AtomicInteger();
     private final List<Page> drainBuffer = new ArrayList<>();  // EOF 收尾缓冲：先返回所有已写页再给 EOF

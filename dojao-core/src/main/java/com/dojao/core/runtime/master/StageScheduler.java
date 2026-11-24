@@ -716,7 +716,7 @@ public final class StageScheduler {
                 leftCatalog, leftSchema, leftTable, leftKeys,
                 rightCatalog, rightSchema, rightTable, rightKeys,
                 joinType, memoryLimit, leftProbe, rightProbe, null, leftFilter, rightFilter,
-                null, null, null);
+                null, null, null, FragmentSpec.JoinAlgorithm.HASH);
     }
 
     /** {@link #plan} 的列裁剪重载（{@code leftColumns} / {@code rightColumns} 空 = 读全列）。 */
@@ -731,7 +731,7 @@ public final class StageScheduler {
                 leftCatalog, leftSchema, leftTable, leftKeys,
                 rightCatalog, rightSchema, rightTable, rightKeys,
                 joinType, memoryLimit, leftProbe, rightProbe, null, leftFilter, rightFilter,
-                leftColumns, rightColumns, null);
+                leftColumns, rightColumns, null, FragmentSpec.JoinAlgorithm.HASH);
     }
 
     /**
@@ -753,7 +753,7 @@ public final class StageScheduler {
                 leftCatalog, leftSchema, leftTable, leftKeys,
                 rightCatalog, rightSchema, rightTable, rightKeys,
                 joinType, memoryLimit, leftProbe, rightProbe, followUp, leftFilter, rightFilter,
-                null, null, null);
+                null, null, null, FragmentSpec.JoinAlgorithm.HASH);
     }
 
     /** {@link #planChainedJoin} 的列裁剪重载（{@code leftColumns} / {@code rightColumns} 空 = 读全列）。 */
@@ -769,7 +769,7 @@ public final class StageScheduler {
                 leftCatalog, leftSchema, leftTable, leftKeys,
                 rightCatalog, rightSchema, rightTable, rightKeys,
                 joinType, memoryLimit, leftProbe, rightProbe, followUp, leftFilter, rightFilter,
-                leftColumns, rightColumns, null);
+                leftColumns, rightColumns, null, FragmentSpec.JoinAlgorithm.HASH);
     }
 
     /**
@@ -789,7 +789,29 @@ public final class StageScheduler {
                 leftCatalog, leftSchema, leftTable, leftKeys,
                 rightCatalog, rightSchema, rightTable, rightKeys,
                 joinType, memoryLimit, leftProbe, rightProbe, followUp, leftFilter, rightFilter,
-                leftColumns, rightColumns, partialFollowUp);
+                leftColumns, rightColumns, partialFollowUp, FragmentSpec.JoinAlgorithm.HASH);
+    }
+
+    /**
+     * {@link #planChainedJoin} 全参重载：携带 Master 规划期的 <b>join 算法结论</b>
+     * （HASH / SORT_MERGE）。链式路径必须在 JoinStep 里透传，否则 SORT_MERGE 会被默认 HASH 覆盖，
+     * Worker 侧 HashJoin 在 build 侧超预算时直接失败（线上 2026-11-23「57.25MB > 55.47MB」）。
+     */
+    public static DistributedStage planChainedJoin(String queryId, List<WorkerRegistration> workers, int numPartitions,
+                                                   String leftCatalog, String leftSchema, String leftTable, List<String> leftKeys,
+                                                   String rightCatalog, String rightSchema, String rightTable, List<String> rightKeys,
+                                                   JoinType joinType, long memoryLimit,
+                                                   DojaoConnector leftProbe, DojaoConnector rightProbe,
+                                                   FragmentSpec.FollowUp followUp,
+                                                   String leftFilter, String rightFilter,
+                                                   List<String> leftColumns, List<String> rightColumns,
+                                                   FragmentSpec.AggregateStep partialFollowUp,
+                                                   FragmentSpec.JoinAlgorithm joinAlgorithm) {
+        return planJoin(queryId, workers, numPartitions,
+                leftCatalog, leftSchema, leftTable, leftKeys,
+                rightCatalog, rightSchema, rightTable, rightKeys,
+                joinType, memoryLimit, leftProbe, rightProbe, followUp, leftFilter, rightFilter,
+                leftColumns, rightColumns, partialFollowUp, joinAlgorithm);
     }
 
     /**
@@ -888,6 +910,32 @@ public final class StageScheduler {
                                                      List<String> leftColumns, List<String> rightColumns,
                                                      List<FragmentSpec.JoinAlias> outputAliases,
                                                      FragmentSpec.AggregateStep tailAggregate) {
+        return planJoinWindowChain(queryId, workers, numPartitions,
+                leftCatalog, leftSchema, leftTable, leftKeys,
+                rightCatalog, rightSchema, rightTable, rightKeys,
+                joinType, memoryLimit, leftProbe, rightProbe, windowSteps,
+                leftFilter, rightFilter, leftColumns, rightColumns, outputAliases, tailAggregate,
+                FragmentSpec.JoinAlgorithm.HASH);
+    }
+
+    /**
+     * 全参版本：额外携带 Master 规划期的 <b>join 算法结论</b>（HASH / SORT_MERGE）。
+     * 与 {@code planChainedJoin} 同口径：链式窗口舞台也必须透传，否则 SORT_MERGE 被默认 HASH 覆盖。
+     */
+    public static JoinChainStage planJoinWindowChain(String queryId, List<WorkerRegistration> workers,
+                                                     int numPartitions,
+                                                     String leftCatalog, String leftSchema, String leftTable,
+                                                     List<String> leftKeys,
+                                                     String rightCatalog, String rightSchema, String rightTable,
+                                                     List<String> rightKeys,
+                                                     JoinType joinType, long memoryLimit,
+                                                     DojaoConnector leftProbe, DojaoConnector rightProbe,
+                                                     List<FragmentSpec.WindowStep> windowSteps,
+                                                     String leftFilter, String rightFilter,
+                                                     List<String> leftColumns, List<String> rightColumns,
+                                                     List<FragmentSpec.JoinAlias> outputAliases,
+                                                     FragmentSpec.AggregateStep tailAggregate,
+                                                     FragmentSpec.JoinAlgorithm joinAlgorithm) {
         if (windowSteps == null || windowSteps.isEmpty()) {
             throw new IllegalArgumentException("planJoinWindowChain: windowSteps 不能为空");
         }
@@ -964,7 +1012,7 @@ public final class StageScheduler {
 
         // 3. join 层：每 Worker 一个
         FragmentSpec.JoinStep joinStep = new FragmentSpec.JoinStep(leftKeys, rightKeys, joinType,
-                memoryLimit, n, FragmentSpec.JoinAlgorithm.HASH,
+                memoryLimit, n, joinAlgorithm,
                 rightFieldsOf(rightProbe, rightCatalog, rightSchema, rightTable, rightColumns),
                 rightFieldsOf(leftProbe, leftCatalog, leftSchema, leftTable, leftColumns))
                 .withOutputAliases(outputAliases);
@@ -1022,7 +1070,8 @@ public final class StageScheduler {
                                              FragmentSpec.FollowUp followUp,
                                              String leftFilter, String rightFilter,
                                              List<String> leftColumns, List<String> rightColumns,
-                                             FragmentSpec.AggregateStep partialFollowUp) {
+                                             FragmentSpec.AggregateStep partialFollowUp,
+                                             FragmentSpec.JoinAlgorithm joinAlgorithm) {
         // 1. round-robin owner 映射 —— co-partitioning 不变量：两侧必须完全一致
         PartitionLayout layout = PartitionLayout.roundRobin(workers, numPartitions);
         int n = layout.numPartitions();
@@ -1072,7 +1121,7 @@ public final class StageScheduler {
             FragmentSpec.ExchangeInStep rightIn = new FragmentSpec.ExchangeInStep(
                     rightExchange, n, numRightSenders, layout.ownedMask(workerId));
             FragmentSpec.JoinStep joinStep = new FragmentSpec.JoinStep(leftKeys, rightKeys, joinType,
-                    memoryLimit, n, FragmentSpec.JoinAlgorithm.HASH,
+                    memoryLimit, n, joinAlgorithm,
                     rightFieldsOf(rightProbe, rightCatalog, rightSchema, rightTable, rightColumns),
                     rightFieldsOf(leftProbe, leftCatalog, leftSchema, leftTable, leftColumns));
             if (followUp == null) {

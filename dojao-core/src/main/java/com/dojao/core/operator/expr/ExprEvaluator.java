@@ -182,7 +182,7 @@ public final class ExprEvaluator {
 
         out.setInitialCapacity(rowCount);
         out.allocateNew();
-        // LIST 结果（split / from_str_to_array / json_array_explode）：startNewValue 记录本行 list 起点 →
+        // LIST 结果（split / from_str_to_array / json_array_explode[_with_separator]）：startNewValue 记录本行 list 起点 →
         // 子列按累积下标连续写 → endValue
         ListVector listOut = out instanceof ListVector lv ? lv : null;
         VarCharVector listChild = null;
@@ -264,7 +264,8 @@ public final class ExprEvaluator {
 
     /** 静态返回数组的内置标量函数（整批全 NULL 时据此落 LIST 向量，而不是 Int64 兜底）。 */
     private static final Set<String> LIST_RETURNING_FUNCTIONS =
-            Set.of("split", "from_str_to_array", "json_array_explode");
+            Set.of("split", "from_str_to_array", "json_array_explode",
+                    "json_array_explode_with_separator");
 
     /** 全 NULL 结果的静态类型类别（决定输出向量类型）。 */
     private enum NullKind { NONE, STRING, DOUBLE, DECIMAL, BIGINT, BIT, LIST }

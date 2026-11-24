@@ -60,6 +60,17 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
     /** join 排序内部缓冲 / 输出批行数（独立于 agg/window 旋钮，固定 50000）。 */
     private static final int OUTPUT_BATCH_SIZE = 50000;
 
+    /**
+     * 归并（compaction）输出单批<b>字节</b>上界（默认 32MB，与 TEXT / JDBC 转换器同口径）。
+     *
+     * <p>只按 {@link #OUTPUT_BATCH_SIZE}（5 万行）切批时，宽行（如 {@code raw_json_data} 几十 KB）
+     * 会在同一批里把 VarCharVector 反复翻倍扩容 —— 实测「128MB → 申请 256MB」直接打穿算子分配器：
+     * {@code SortMergeJoin ... Left sort failed ... Unable to allocate buffer of size 268435456}。
+     * 行数与字节双上界、先到先切；单批逻辑字节数见 {@link #rowBytes}。</p>
+     */
+    private static final long COMPACTION_BATCH_BYTES =
+            Long.getLong("dojao.sortMerge.compactionBatchBytes", BatchLimits.batchBytes());
+
     // ==================== 构造函数 ====================
 
     public JoinSortOperator(Operator upstream,
@@ -651,6 +662,7 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
             Schema schema = inputSchema;
             List<FieldVector> outVectors = null;
             int outRowCount = 0, outCapacity = 0;
+            long outBytes = 0;
             while (!heap.isEmpty()) {
                 checkCancelled();
                 int si = heap.poll();
@@ -674,18 +686,23 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
                 // 旧实现只在 key 换组时切批，因此「单个 join key 组 > 一批」时输出向量会在
                 // 同一组内无限 reAlloc（实测：热键组把 Sort 算子分配器撑到 438MB 后申请 32MB
                 // 失败 → OOM）。切批后 key 组可以跨 batch，下游 SortMergeJoin 按「组跨批」消费。
-                if (outRowCount >= OUTPUT_BATCH_SIZE) {
+                // ★双上界：行数（5 万）或逻辑字节（默认 32MB）先到先切 —— 宽行表只按行数切批时
+                //   一批就是几百 MB，VarCharVector 翻倍扩容直接打穿分配器（2026-11-23 线上）。
+                if (outRowCount >= OUTPUT_BATCH_SIZE
+                        || (outRowCount > 0 && outBytes >= COMPACTION_BATCH_BYTES)) {
                     outRoot.setRowCount(outRowCount);
                     outWriter.writeBatch();
                     wroteAny = true;
                     for (FieldVector v : outVectors) v.setValueCount(0);
                     outRowCount = 0;
+                    outBytes = 0;
                 }
                 if (outRowCount >= outCapacity) {
                     for (FieldVector v : outVectors) v.reAlloc();
                     outCapacity = minValueCapacity(outVectors);
                 }
 
+                outBytes += RowAccumulator.rowBytes(src.getFieldVectors(), row);
                 copyRow(src, row, outVectors, outRowCount);
                 outRowCount++;
 

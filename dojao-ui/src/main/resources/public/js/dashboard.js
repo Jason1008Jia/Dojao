@@ -3743,6 +3743,7 @@ function bindSqlResultContextMenu() {
     }, true);
     document.addEventListener('keydown', function (e) {
         if (e.key !== 'Tab' || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+        if (e.defaultPrevented) return;         // 编辑器 Tab 缩进 / 补全接受已消费，不再切列转行
         if (!pointerInside) return;
         e.preventDefault();            // 不把焦点移走
         toggleSqlTranspose();
@@ -4035,6 +4036,15 @@ function bindSqlEditor() {
 
     input.addEventListener('input', onChanged);
     input.addEventListener('keydown', function (e) {
+        // Tab / Shift+Tab 缩进：textarea 没有插入制表符的默认行为（浏览器默认把焦点移走），
+        // 必须自己接管。补全弹窗打开时 Tab 归补全接受候选（acOnKeydown），这里让行。
+        if (e.key === 'Tab' && !e.ctrlKey && !e.metaKey && !e.altKey
+                && !(typeof acVisible === 'function' && acVisible())) {
+            e.preventDefault();
+            if (e.shiftKey) outdentSqlLines(input);
+            else indentSqlLines(input);
+            return;
+        }
         if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
         var k = (e.key || '').toLowerCase();
         if (k === 'z' && !e.shiftKey) {
@@ -4182,6 +4192,55 @@ function duplicateSqlLine(input) {
     input.value = text.slice(0, insertAt) + '\n' + line + text.slice(insertAt);
     var pos = insertAt + 1 + (s - lineStart);
     input.setSelectionRange(pos, pos);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+/**
+ * Tab：缩进。无选区 / 选区不跨行 → 插入（或替换成）一个制表符；跨行选区 → 逐行行首加 \t，
+ * 选区随内容一起后移。制表符靠 CSS {@code tab-size: 4} 与高亮垫层同宽，不会错位。
+ */
+function indentSqlLines(input) {
+    var text = input.value || '';
+    var s = input.selectionStart, e = input.selectionEnd;
+    if (s === e || text.slice(s, e).indexOf('\n') === -1) {
+        replaceSqlSelection(input, '\t');
+        return;
+    }
+    var lineStart = text.lastIndexOf('\n', s - 1) + 1;
+    var head = text.slice(lineStart, e);
+    // 选区恰好停在行首（以 \n 结尾）时，那一行不在缩进范围内
+    var tailNl = head.charAt(head.length - 1) === '\n';
+    var body = tailNl ? head.slice(0, -1) : head;
+    var added = body.split('\n').length;
+    var next = '\t' + body.replace(/\n/g, '\n\t') + (tailNl ? '\n' : '');
+    input.value = text.slice(0, lineStart) + next + text.slice(e);
+    input.setSelectionRange(s + 1, e + added);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+/**
+ * Shift+Tab：反缩进。选区触及的每一行去掉一个行首 \t（没有则最多 4 个空格，与 tab-size 一致）；
+ * 无选区时处理光标所在行；行首无可去内容时不动。
+ */
+function outdentSqlLines(input) {
+    var text = input.value || '';
+    var s = input.selectionStart, e = input.selectionEnd;
+    var lineStart = text.lastIndexOf('\n', s - 1) + 1;
+    var head = text.slice(lineStart, e);
+    var tailNl = head.charAt(head.length - 1) === '\n';
+    var body = tailNl ? head.slice(0, -1) : head;
+    var removedFirst = 0;
+    var removedTotal = 0;
+    var first = true;
+    var next = body.replace(/^(\t| {1,4})/gm, function (m) {
+        if (first) { removedFirst = m.length; first = false; }
+        removedTotal += m.length;
+        return '';
+    });
+    if (!removedTotal) return;
+    input.value = text.slice(0, lineStart) + next + (tailNl ? '\n' : '') + text.slice(e);
+    var ns = Math.max(lineStart, s - removedFirst);
+    input.setSelectionRange(ns, Math.max(ns, e - removedTotal));
     input.dispatchEvent(new Event('input', { bubbles: true }));
 }
 

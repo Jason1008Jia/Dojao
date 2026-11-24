@@ -575,16 +575,14 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
         /** 发送侧失败（putNext 抛错 / 流级错误）→ push 立即抛。 */
         private volatile Throwable failure;
         /**
-         * 流启动前暂存的 COMPLETE/FAIL 控制消息。共享流被第一条真实 DATA 定 schema；
-         * 空 slice 的 producer 只发 COMPLETE，若在流未启动时直接发会以空 schema 建流，
-         * 后续并发 DATA 拷入 0 列根崩溃（IllegalArgumentException）。故暂存，等首个 DATA
-         * 定 schema 后补发；确无 DATA 时 2s 宽限兜底。仅 flusher 线程访问，无需同步。
+         * 流启动前暂存的 COMPLETE 控制消息（FAIL 例外：失败必须尽快送达，允许空 schema 起流）。
+         * 共享流被第一条真实 DATA 定 schema；空 slice 的 producer 只发 COMPLETE，若在流未启动时
+         * 直接发会以空 schema 建流，后续并发 DATA 拷入 0 列根崩溃（IllegalArgumentException）。
+         * 故暂存，等首个 DATA 定 schema 后补发；确无 DATA 时由 flusher 收尾（finally）以空 schema
+         * 补发 —— <b>绝不因 COMPLETE 在流生命周期中途（仍可能有 DATA）用空 schema 启动</b>：
+         * Flight 流 schema 固定不可改，迟到 DATA 只能整条流报废。仅 flusher 线程访问，无需同步。
          */
         private final List<Msg> heldControls = new ArrayList<>();
-        /** 流未启动且持有暂存控制消息的计时起点（-1 = 未计时）。 */
-        private long emptySince = -1;
-        /** 兜底已用空 schema 启动流（此时迟到 DATA 无法复用流，须 fail-fast）。 */
-        private boolean emptySchemaStarted;
 
         SenderStream(String toWorkerId, String exchangeId, FlightClient client, BufferAllocator allocator,
                      java.util.function.Consumer<SenderStream> onClosed) {
@@ -608,6 +606,10 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
          * （或已判定丢弃）才返回。旧实现入队即返回 —— flusher 后续 {@code putNext} 失败时消息被
          * 静默丢弃，生产端却已按「全部桶已通知」收尾，接收端 {@code completedSenders} 永远差一个，
          * 终端 Aggregate 挂起 10 分钟才被看门狗发现（线上「已收 4/6 个完成」）。</p>
+         *
+         * <p>例外：流尚未启动（schema 未定）时控制消息被暂存并<b>立即 ack</b> —— 所有权移交
+         * {@code heldControls}，由流启动或 flusher 收尾时补发，失败路径由 {@code abortPending}
+         * 兜底 ack，不会静默丢失（详见 {@link #sendControl}）。</p>
          */
         void push(Msg msg) throws InterruptedException {
             // 快路径拒绝：状态机已离开 OPEN。
@@ -680,19 +682,11 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
                                 && (st != State.OPEN || closed.get())) {
                             break;
                         }
-                        // 2s 宽限兜底：流一直未启动（只有 COMPLETE 的空 slice 流）且队列已空持续超时
-                        // → 用空 schema 启动流并补发暂存 COMPLETE，防接收端 ShuffleReader 收不到
-                        // 结束标记而挂起。正常路径首个 DATA 会在毫秒级定 schema，宽限不触发。
-                        if (streamRoot == null && !heldControls.isEmpty()) {
-                            if (emptySince == -1) {
-                                emptySince = System.currentTimeMillis();
-                            } else if (System.currentTimeMillis() - emptySince > 2_000) {
-                                emptySchemaStarted = true;
-                                streamRoot = VectorSchemaRoot.create(new Schema(List.of()), allocator);
-                                listener.start(streamRoot);
-                                flushHeldControls();
-                            }
-                        }
+                        // 流未启动时绝不「等一会儿就用空 schema 起流」：state 仍为 OPEN 就代表
+                        // 同 exchange 的其它 producer 还可能发 DATA，空 schema 一启动，迟到 DATA
+                        // 只能整条流报废（线上 2026-11-23：AGG#4 空 schema 兜底后 PA0 迟到 DATA →
+                        // 6 个聚合 Consumer 全部级联失败）。暂存的控制消息由首个 DATA 的
+                        // flushHeldControls 或 flusher 退出时的 finally 兜底补发，必然送达。
                         continue;
                     }
                     if (failure != null) {
@@ -724,7 +718,6 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
                 try {
                     // 流关闭兜底：仍有未启动流的暂存 COMPLETE（本 exchange 全程无 DATA）→ 空 schema 补发
                     if (streamRoot == null && !heldControls.isEmpty()) {
-                        emptySchemaStarted = true;
                         streamRoot = VectorSchemaRoot.create(new Schema(List.of()), allocator);
                         listener.start(streamRoot);
                         flushHeldControls();
@@ -874,13 +867,15 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
                 streamRoot.allocateNew();
                 listener.start(streamRoot);
                 flushHeldControls();   // 真实 schema 已定：补发暂存的 COMPLETE/FAIL（顺序在首条 DATA 前）
-            } else if (emptySchemaStarted && !src.getFieldVectors().isEmpty()) {
-                // 兜底已用空 schema 建流（补偿型 COMPLETE 已发出），此时到流的 DATA 无法复用流：
-                // Flight 流 schema 固定不可改，只能 fail-fast（罕见：2s 宽限后才来数据的慢 slice）
-                throw new RuntimeException("exchange 流 " + toWorkerId + "#" + exchangeId
-                        + " 已用空 schema 兜底启动（COMPLETE 已补发），迟到 DATA 无法复用流，须重跑查询");
             }
             int rc = page.getRowCount();
+            if (streamRoot.getFieldVectors().isEmpty() && !src.getFieldVectors().isEmpty()) {
+                // 流已被 FAIL 用空 schema 提前启动（失败必须尽快送达）：交换已判定失败、接收端会立即
+                // 收尾全部桶，迟到的 DATA 已无意义 —— 直接丢弃，不能拷入 0 列根（会抛
+                // IllegalArgumentException 把「已通知失败」变成误导性崩溃）。
+                page.close();
+                return;
+            }
             for (int col = 0; col < src.getFieldVectors().size(); col++) {
                 FieldVector s = src.getVector(col);
                 FieldVector d = streamRoot.getVector(col);
@@ -897,10 +892,27 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
         /** 控制消息（COMPLETE/FAIL）：0 行 body，仅 metadata 携带 kind/桶号。 */
         private void sendControl(Msg msg) {
             if (streamRoot == null) {
+                // FAIL 必须尽快送达：一旦发出，接收端会立刻收尾全部桶（查询注定失败），迟到的 DATA
+                // 已无意义，所以允许用空 schema 起流（sendData 会对后续 DATA 直接丢弃）。
+                // COMPLETE 则必须暂存 —— 空 slice 的 COMPLETE 用空 schema 起流，会让同一 exchange
+                // 仍在读宽表的其他 producer 的迟到 DATA 无法复用流（线上 2026-11-23 全链路失败）。
+                if (msg.control().getKind() == ExchangeControl.Kind.FAIL) {
+                    streamRoot = VectorSchemaRoot.create(new Schema(List.of()), allocator);
+                    listener.start(streamRoot);
+                    flushHeldControls();   // 先补发更早暂存的 COMPLETE（保持入队顺序）
+                    putNext(msg.control());
+                    ack(msg);
+                    return;
+                }
                 // 流未启动：暂存而非以空 schema 建流 —— 空 schema 流会令并发 DATA 拷入 0 列根崩溃。
                 // 等首个 DATA 定真实 schema 后由 flushHeldControls 补发；全 exchange 无 DATA 时
-                // 由 2s 宽限 / 关闭兜底以空 schema 补发，保证接收端一定收到结束标记。
+                // 由 flusher 收尾兜底以空 schema 补发，保证接收端一定收到结束标记。
+                // 暂存即 ack：所有权已移交 heldControls，此后「补发成功」或「abortPending 置失败后
+                // ack」二者必居其一，不会静默丢弃。**不能**让生产端阻塞等送达后才收尾 —— 最后
+                // 一个 producer 的 COMPLETE 若被暂存，它的 push 阻塞 → 分发线程不退出 → 租约不归还
+                // → 流永远等不到 CLOSING，flusher 也就永远走不到补发，只能 600s 超时报错。
                 heldControls.add(msg);
+                ack(msg);
                 return;
             }
             streamRoot.setRowCount(0);
@@ -911,14 +923,14 @@ public final class NetworkExchangeChannel implements ExchangeChannel {
         /**
          * 流已启动（真实或兜底空 schema）后，按暂存顺序补发全部控制消息。
          *
-         * <p>每条发送后立即 ack；中途失败时把剩余未发消息一并 ack（它们确定未送达），
-         * 由等待方在 {@code push} 里读到 {@code failure} 后上抛 —— 绝不静默丢弃。</p>
+         * <p>暂存时已 ack（见 {@link #sendControl}），这里每条发送后再次 ack 是幂等兜底
+         * （CountDownLatch 重复 countDown 无副作用）；中途失败时把剩余未发消息一并 ack，
+         * 流失败由 {@code failure} 传播给后续 push / 接收端 —— 绝不静默丢弃。</p>
          */
         private void flushHeldControls() {
             if (heldControls.isEmpty()) return;
             List<Msg> batch = new ArrayList<>(heldControls);
             heldControls.clear();
-            emptySince = -1;
             for (int i = 0; i < batch.size(); i++) {
                 Msg c = batch.get(i);
                 try {

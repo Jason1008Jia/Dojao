@@ -78,6 +78,13 @@ public abstract class AbstractSpillableOperator<S extends Slot>
      * 保证 {@code 槽数 × 单槽预算} 与 3 槽设计峰值一致。</p>
      */
     protected static final int MIN_SLOT_COUNT = 2;
+
+    /**
+     * 分配器水位兜底阈值（占 {@code query.direct.limit} 的比例）：超过即先把各分区在收槽位
+     * 同步溢写完再收新页。80% 与 {@code computeSlotBytesThreshold} 的峰值封顶同源 ——
+     * 单槽阈值的设计峰值本就不该越过它，越过说明「异步溢写来不及」（见 spillAllPartitionsOnPressure）。
+     */
+    private static final double SPILL_ALLOC_HIGH_WATERMARK = 0.80;
     /** 溢写/拉取批次不在此处定义：聚合用 query.agg.spill.perBatchKeys，窗口用 query.window.spill.perBatchRows（写）与 query.window.spill.fetchPerKeys（读），各子类独立。 */
     protected static final int DEFAULT_PARTITIONS = 4;
     /**
@@ -854,6 +861,47 @@ public abstract class AbstractSpillableOperator<S extends Slot>
 
     // ==================== Phase 1: 累积 & 溢写 ====================
 
+    /**
+     * 分配器水位兜底：占用达到上限 {@value #SPILL_ALLOC_HIGH_WATERMARK} 时，先把各分区
+     * <b>在收</b>的槽位全部提交溢写并<b>同步等它们收尾</b>，再继续接收新页。
+     *
+     * <p>为什么单槽阈值不够：多分区 × 每分区 2~3 槽叠加，各槽都没到阈值，分配器总占用却可能
+     * 已经贴住硬上限 —— 此时宽行页的一次拷贝（变长缓冲翻倍扩容）就会直接 Arrow OOM。
+     * 线上 {@code row_number() over(partition by …)} 正是这样撑挂的：2 个桶 × 3 槽，
+     * 落盘占用 601MB / 上限 681MB，下一张宽行页申请 128MB 失败。</p>
+     *
+     * <p>策略为 ERROR 的算子（顶层无 LIMIT 全量排序拒绝溢写）不走此路：其语义就是「超预算
+     * 必须明确报错而不是静默溢写」，交由 {@link #accumulatePage} 的阈值判定处理。</p>
+     */
+    private void spillAllPartitionsOnPressure() {
+        if (spillPolicy == SpillPolicy.ERROR) return;
+        long limit = allocator.getLimit();
+        long used = allocator.getAllocatedMemory();
+        long watermark = (long) (limit * SPILL_ALLOC_HIGH_WATERMARK);
+        if (used < watermark) return;
+
+        int submitted = 0;
+        for (int i = 0; i < partitions.length; i++) {
+            PartitionState<S> p = partitions[i];
+            if (p == null) continue;
+            S s = p.activeSlot();
+            if (s != null && !s.isEmpty()) {
+                noteSpillTrigger();
+                p.submitSpill(spillExecutor, this, i);
+                submitted++;
+            }
+            // ★逐个分区「提交 → 等完」而不是一次提交全部：一次性提交会让 N 个溢写线程的写出批
+            //   与仍在驻留的槽位叠加，在已经吃紧的分配器上再叠 N 份临时缓冲，反而先把内存打爆。
+            //   同时这里也等掉了本分区已在跑的溢写 —— 它们的临时缓冲（排序拷贝 / 写出批）才是
+            //   此刻占用的主体。
+            p.awaitPendingSpills(i);
+            p.checkSpillFailure();
+        }
+        log.info("[溢写] {} 分配器水位 {} ≥ {}（上限 {}）：同步溢写 {} 个分区的在收槽位后再接收新页",
+                getStats().getOperatorId(), formatBytes(used), formatBytes(watermark),
+                formatBytes(limit), submitted);
+    }
+
     protected void accumulatePage(Page input) {
         // Worker 级背压：本节点堆外用量吃紧时，先短暂等待（让别的算子溢写把内存还回来）再累积本页。
         // 放在「累积」这个「即将占用更多内存」的入口，绝不放溢写/释放路径（否则无法解除背压）。
@@ -873,12 +921,21 @@ public abstract class AbstractSpillableOperator<S extends Slot>
         // 上一轮的异步溢写可能已失败（如磁盘写满）→ 立刻上抛，不再继续吞数据
         pa.checkSpillFailure();
 
+        // 分配器整体吃紧时先把各分区在收 / 在写的数据落盘（详见方法注释），再接收本页
+        spillAllPartitionsOnPressure();
+
         S active = pa.activeSlot();
         if (active == null) {
             active = createSlot(allocator);
             pa.slots.set(pa.activeIdx, active);
         }
-        if (!active.isEmpty() && active.estimateMemoryBytes() >= slotBytesThreshold) {
+        // ★页感知触发：不能只看「当前槽位已超阈值」—— 宽行（单行几 KB 的 JSON 列，10k 行/页
+        //   即 60MB+）一张页就能把空槽位推过阈值；等加完再看，槽位 + 拷贝时的变长缓冲翻倍扩容
+        //   会先撞分配器硬上限（线上：copyColumnBatch 里申请 128MB → Arrow OOM）。
+        //   把「本页预计占用」并入判定：加上本页会推过阈值 → 先把旧槽位交出去溢写，本页进新槽。
+        long incomingBytes = input.getSizeInBytes();
+        if (!active.isEmpty()
+                && active.estimateMemoryBytes() + incomingBytes >= slotBytesThreshold) {
             // 策略门：ERROR → 拒绝溢写直接抛错；WARN → 告警一次后照常溢写；SPILL（默认）→ 静默溢写
             SpillPolicy policy = spillPolicy;
             if (policy == SpillPolicy.ERROR) {
@@ -894,9 +951,9 @@ public abstract class AbstractSpillableOperator<S extends Slot>
             // 每次溢写都打印「本槽实际内存 / 本次阈值」：阈值 = memoryLimit × ratio ÷ owned 桶数，
             // 再受 query.spill.minPartitionBytes 下限与 direct.limit 封顶（见 computeSlotBytesThreshold）。
             long slotBytes = active.estimateMemoryBytes();
-            log.info("[溢写] {} 分区 {} 第 {} 次：槽位 {} ≥ 阈值 {}（owned={}，slots={}，memoryLimit={} × ratio {}）",
+            log.info("[溢写] {} 分区 {} 第 {} 次：槽位 {} + 本页 {} ≥ 阈值 {}（owned={}，slots={}，memoryLimit={} × ratio {}）",
                     getStats().getOperatorId(), pid, getStats().getSpillTriggers(),
-                    formatBytes(slotBytes), formatBytes(slotBytesThreshold),
+                    formatBytes(slotBytes), formatBytes(incomingBytes), formatBytes(slotBytesThreshold),
                     budgetPartitions, slotCount, formatBytes(memoryLimit),
                     String.format("%.2f", ResourceConfig.spillRatio()));
             pa.submitSpill(spillExecutor, this, pid);
@@ -1441,11 +1498,7 @@ public abstract class AbstractSpillableOperator<S extends Slot>
     }
 
     protected static String formatBytes(long bytes) {
-        if (bytes < 1024) return bytes + " B";
-        if (bytes < 1024 * 1024) return String.format("%.1f KB", bytes / 1024.0);
-        // 溢写量动辄上 GB：只到 MB 会打出「12345.67 MB」，多一层换算更直观
-        if (bytes < 1024L * 1024 * 1024) return String.format("%.2f MB", bytes / (1024.0 * 1024.0));
-        return String.format("%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0));
+        return com.dojao.common.memory.SizeFormat.bytes(bytes);
     }
 
     // ==================== OperatorMemoryHandle ====================

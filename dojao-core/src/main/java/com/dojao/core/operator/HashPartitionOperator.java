@@ -68,6 +68,15 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
 
     /** 每个分区缓冲区的行数上限，达到后立即发射。 */
     static final int BATCH_SIZE = 10000;
+
+    /**
+     * 每个分区缓冲区的<b>字节</b>上限（{@code query.shuffle.batch.maxBytes}，默认 16MB）。
+     *
+     * <p>行数上限对宽行无效：单行几 KB 的 JSON 列按 10000 行组页就是 60MB+，下游溢写算子
+     * 收一页要整份拷贝，变长缓冲一翻倍就撞分配器硬上限（线上 {@code row_number() over(...)}
+     * 在 {@code copyColumnBatch} 里 128MB 申请 OOM）。行数 + 字节双上限，与扫描转换器同口径。</p>
+     */
+    private final long batchMaxBytes = ResourceConfig.shuffleBatchMaxBytes();
     /** 每分区输出队列容量（有界 put 提供背压，防止任意一侧缓冲过大）。 */
     private static final int PARALLEL_QUEUE_CAPACITY = 8;
 
@@ -237,7 +246,8 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
         BlockingQueue<Page>[] qs = (BlockingQueue<Page>[]) new BlockingQueue[this.numPartitions];
         this.partitionQueues = qs;
         for (int i = 0; i < this.numPartitions; i++) {
-            partitionQueues[i] = new LinkedBlockingQueue<>(PARALLEL_QUEUE_CAPACITY);
+            // 页数 + 字节双上界（默认 32MB）：宽行页只按 8 页限制会让下游拉取端常驻数 GB
+            partitionQueues[i] = new PageBoundedQueue(PARALLEL_QUEUE_CAPACITY, BatchLimits.batchBytes());
         }
     }
 
@@ -620,6 +630,7 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
     /** 解析 key 列在 schema 中的索引（一次解析，后续按索引取列，避免 name lookup）。 */
     private void resolveKeyIndices(Schema schema, int[] keyIndices) {
         for (int i = 0; i < keyColumns.size(); i++) {
+            keyIndices[i] = -1;
             for (int j = 0; j < schema.getFields().size(); j++) {
                 if (schema.getFields().get(j).getName().equals(keyColumns.get(i))) {
                     NestedTypeSupport.requireSupported(schema.getFields().get(j), "哈希分布键");
@@ -627,7 +638,40 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
                     break;
                 }
             }
+            if (keyIndices[i] < 0) {
+                // ★缺列绝不能静默退回下标 0：那会把「另一列」当 join / 分组键 → 左右两侧分区不同
+                //   → 分布式 join 空结果（线上 2026-11-23 TEXT ⋈ ORC 的排查点之一）。
+                List<String> have = new ArrayList<>(schema.getFields().size());
+                for (Field f : schema.getFields()) have.add(f.getName());
+                throw new IllegalStateException("哈希分布键列 \"" + keyColumns.get(i)
+                        + "\" 不在输入页中（实到列：" + have + "）—— 列裁剪 / 投影下发漏了 join 键，"
+                        + "继续按第 0 列哈希会让左右两侧静默分到不同桶、join 返回空。");
+            }
         }
+    }
+
+    /**
+     * 源页平均行宽（字节，逻辑口径）：分区缓冲的行数 + 字节双上限需要按行累计占用。
+     *
+     * <p>固定宽列按类型宽度；变长列按 offset 末端取真实数据量；嵌套列退回 buffer 总容量（偏保守）。
+     * 页内各行的宽度差异被平均掉 —— 只用于「什么时候该切页」，不参与正确性。</p>
+     */
+    private static long estimateRowBytes(VectorSchemaRoot root, int rows) {
+        if (rows <= 0) return 0;
+        long total = 0;
+        for (FieldVector v : root.getFieldVectors()) {
+            int tw = RowAccumulator.typeWidthOf(v.getField().getType());
+            if (tw > 0) {
+                total += (long) rows * tw;
+            } else if (v instanceof BaseVariableWidthVector bv) {
+                ArrowBuf off = bv.getOffsetBuffer();
+                total += (long) rows * 4 + (off != null ? off.getInt((long) rows * 4) : 0);
+            } else {
+                total += v.getBufferSize();
+            }
+            total += (rows + 7) / 8;
+        }
+        return Math.max(1, total / rows);
     }
 
     /** 批量分区：先算所有行的分区号，再按分区 gather 拷贝（消除逐行 copyValueSafe 虚调用）。 */
@@ -665,15 +709,17 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
         acc[1] += System.nanoTime() - tHash;
 
         // 4. 按分区分组逐行拷贝（copyValueSafe 已验证正确，分组后顺序写缓存友好）
+        long avgRowBytes = estimateRowBytes(root, rowCount);
         long mark = System.nanoTime();
         for (int pid = 0; pid < numPartitions; pid++) {
             int[] srcRows = groups[pid];
             if (srcRows.length == 0) continue;
             PartitionBuffer buf = bufs[pid];
+            buf.rowBytes = avgRowBytes;
 
             for (int r = 0; r < srcRows.length; r++) {
                 buf.appendRow(root, srcRows[r]);
-                if (buf.rowCount >= BATCH_SIZE) {
+                if (buf.rowCount >= BATCH_SIZE || buf.dataBytes >= batchMaxBytes) {
                     acc[2] += System.nanoTime() - mark;          // 拷贝段
                     long tB = System.nanoTime();
                     Page out = Page.partitioned(buf.detach(schema), pid);
@@ -707,12 +753,14 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
      */
     private void replicatePageBulk(VectorSchemaRoot root, int rowCount, PartitionBuffer[] bufs, Schema schema,
                                     long[] acc) throws InterruptedException {
+        long avgRowBytes = estimateRowBytes(root, rowCount);
         long mark = System.nanoTime();
         for (int pid = 0; pid < numPartitions; pid++) {
             PartitionBuffer buf = bufs[pid];
+            buf.rowBytes = avgRowBytes;
             for (int r = 0; r < rowCount; r++) {
                 buf.appendRow(root, r);
-                if (buf.rowCount >= BATCH_SIZE) {
+                if (buf.rowCount >= BATCH_SIZE || buf.dataBytes >= batchMaxBytes) {
                     acc[2] += System.nanoTime() - mark;
                     long tB = System.nanoTime();
                     Page out = Page.partitioned(buf.detach(schema), pid);
@@ -763,31 +811,15 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
     private int[] computePartitionsBulk(VectorSchemaRoot root, int rowCount, int[] keyIndices) {
         int[] pids = new int[rowCount];
         FieldVector[] keyVecs = new FieldVector[keyIndices.length];
-        int[] keyTws = new int[keyIndices.length];
         for (int i = 0; i < keyIndices.length; i++) {
             keyVecs[i] = root.getVector(keyIndices[i]);
-            keyTws[i] = keyVecs[i] != null ? RowAccumulator.typeWidthOf(keyVecs[i].getField().getType()) : -1;
         }
         for (int r = 0; r < rowCount; r++) {
             int hash = 0;
-            for (int i = 0; i < keyIndices.length; i++) {
-                FieldVector vec = keyVecs[i];
-                if (vec == null || vec.isNull(r)) {
-                    hash = 31 * hash;
-                    continue;
-                }
-                int tw = keyTws[i];
-                if (tw == 8) {
-                    hash = 31 * hash + Long.hashCode(vec.getDataBuffer().getLong((long) r * 8));
-                } else if (tw == 4) {
-                    hash = 31 * hash + vec.getDataBuffer().getInt(r * 4);
-                } else if (tw == 2) {
-                    hash = 31 * hash + (int) vec.getDataBuffer().getShort((long) r * 2);
-                } else if (tw == 1) {
-                    hash = 31 * hash + (int) vec.getDataBuffer().getByte(r);
-                } else {
-                    hash = 31 * hash + vec.getObject(r).hashCode();
-                }
+            for (FieldVector vec : keyVecs) {
+                // ★内容 hash（变长按字节、整型符号扩展）：绝不能用 getObject().hashCode() ——
+                //   Arrow Text 是对象身份 hash，左右两侧同值不同桶 ⇒ join 静默空结果。
+                hash = 31 * hash + RowAccumulator.keyHash(vec, r);
             }
             pids[r] = (hash & Integer.MAX_VALUE) % numPartitions;
         }
@@ -818,6 +850,10 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
         List<FieldVector> vectors;
         List<TransferPair> transfers;
         int rowCount;
+        /** 当前缓冲的预估数据字节数（行数上限之外的第二道闸门，见 {@link #batchMaxBytes}）。 */
+        long dataBytes;
+        /** 当前源页的平均行宽（字节）；由分发循环在换页时设定，appendRow 按它累计 dataBytes。 */
+        long rowBytes;
         private VectorSchemaRoot lastSrcRoot;
 
         PartitionBuffer(int partitionId, BufferAllocator allocator) {
@@ -834,6 +870,10 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
             vectors.clear();
             transfers.clear();
             rowCount = 0;
+            dataBytes = 0;
+            // ★rowBytes 不清：同一源页内「写满切页 → 重建缓冲 → 继续收本页剩余行」时，
+            //   若清零，剩余行会按 0 字节累计 ⇒ 字节闸门失效，本页剩余部分又被攒成大页
+            //   （实测：645 行页之后紧跟 5000 行 / 32MB 的页）。新源页到来时会重新赋值。
             lastSrcRoot = null;
             for (Field field : schema.getFields()) {
                 FieldVector vec = field.createVector(allocator);
@@ -859,6 +899,7 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
                 transfers.get(col).copyValueSafe(srcRow, rowCount);
             }
             rowCount++;
+            dataBytes += rowBytes;
         }
 
         /**
@@ -959,6 +1000,7 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
             vectors = new ArrayList<>();
             transfers.clear();
             rowCount = 0;
+            dataBytes = 0;
             lastSrcRoot = null;
             return root;
         }
@@ -971,6 +1013,7 @@ public class HashPartitionOperator extends AbstractMeasurableOperator implements
             vectors.clear();
             transfers.clear();
             rowCount = 0;
+            dataBytes = 0;
         }
     }
 }

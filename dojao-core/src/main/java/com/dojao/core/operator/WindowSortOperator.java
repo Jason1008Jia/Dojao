@@ -66,6 +66,15 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
     private static final int SPILL_BATCH_ROWS = ResourceConfig.windowSpillPerBatchRows();
 
     /**
+     * 溢写文件 / 归并输出批次的<b>字节</b>上限（{@code query.window.spill.perBatchBytes} 可配，默认 32MB）。
+     *
+     * <p>行数上限对宽行失效：10000 行 × 单行几 KB = 60MB+ 的写出批，变长缓冲翻倍扩容时
+     * 一次申请 128MB，直接撞算子分配器硬上限（线上 {@code row_number() over(...)} 的 OOM）。
+     * 这里按累加器平均行宽把每批行数再压到字节预算内 —— 文件仍是一个、record batch 变多而已。</p>
+     */
+    private static final long SPILL_BATCH_BYTES = ResourceConfig.windowSpillPerBatchBytes();
+
+    /**
      * Phase 2 <b>拉取</b>侧每页容纳的 key 组数（query.window.spill.fetchPerKeys 可配，默认 10000）。
      *
      * <p>与 {@link #SPILL_BATCH_ROWS}（写侧）刻意拆开：写侧决定<b>文件切多细</b>，本值决定<b>一次回传
@@ -322,10 +331,17 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
         pa.batchFiles.add(file);
         if (pa.dataFilePath == null) pa.dataFilePath = file;
 
+        // 行数上限之外再按字节收紧批大小：宽行（单行几 KB）按 10000 行组批就是 60MB+，
+        // 变长缓冲翻倍扩容会一次申请 128MB，先撞分配器上限（线上 window OOM 的正因）。
+        int batchRows = Math.min(SPILL_BATCH_ROWS, total);
+        long avgRowBytes = averageRowBytes(acc);
+        if (avgRowBytes > 0) {
+            batchRows = (int) Math.max(1, Math.min(batchRows, SPILL_BATCH_BYTES / avgRowBytes));
+        }
         List<FieldVector> outVectors = new ArrayList<>(fields.size());
         for (Field field : fields) {
             FieldVector dst = field.createVector(allocator);
-            dst.setInitialCapacity(Math.min(SPILL_BATCH_ROWS, total));
+            dst.setInitialCapacity(batchRows);
             dst.allocateNew();
             outVectors.add(dst);
         }
@@ -335,7 +351,7 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
              ArrowFileWriter writer = SpillCompression.writer(root, ch)) {
             int off = 0;
             while (off < total) {
-                int rows = Math.min(SPILL_BATCH_ROWS, total - off);
+                int rows = Math.min(batchRows, total - off);
                 // 缓冲容量按实际 valueCapacity 判（Arrow 按字节取整，不同类型换算行数不同）
                 while (rows > minValueCapacity(outVectors)) {
                     for (FieldVector v : outVectors) v.reAlloc();
@@ -353,6 +369,34 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
         // 并发溢写线程共享该字段：同步累加（与 writeBatchToArrow 同口径）
         synchronized (pa) { pa.dataFileSize += writtenBytes; }
         return writtenBytes;
+    }
+
+    /**
+     * 累加器当前数据的平均行宽（字节，逻辑口径）：固定宽列按类型宽度、变长列按 offset 末端、
+     * 嵌套列退回 buffer 总容量（偏保守）。只用于把溢写输出批压进字节预算，不参与正确性。
+     */
+    private static long averageRowBytes(RowAccumulator acc) {
+        return averageRowBytes(acc.rowCount(), acc.vectors);
+    }
+
+    /** 同 {@link #averageRowBytes(RowAccumulator)}，用于溢出读回 / 归并输入等现成 {@code VectorSchemaRoot}。 */
+    private static long averageRowBytes(int rowCount, List<FieldVector> vectors) {
+        int rc = rowCount;
+        if (rc <= 0) return 0;
+        long total = 0;
+        for (FieldVector v : vectors) {
+            int tw = RowAccumulator.typeWidthOf(v.getField().getType());
+            if (tw > 0) {
+                total += (long) rc * tw;
+            } else if (v instanceof BaseVariableWidthVector bv) {
+                ArrowBuf off = bv.getOffsetBuffer();
+                total += (long) rc * 4 + (off != null ? off.getInt((long) rc * 4) : 0);
+            } else {
+                total += v.getBufferSize();
+            }
+            total += (rc + 7) / 8;
+        }
+        return Math.max(1, total / rc);
     }
 
     // ==================== 索引：覆盖以使用 CompositeKey ====================
@@ -592,13 +636,18 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
         //   无条件 resetPartitionState（单键 / 全局分区路径），页首若不是组首就会把分组切断、结果错。
         int offset = 0;
         int gi = 0;
+        // 行数（OUTPUT_PAGE_ROWS）之外再按字节收口：宽行一页 50000 行可到 325MB，
+        // 而 Phase 2 输出队列可缓存 8 页 —— 一页就可能占掉分配器的一大块。
+        long pageRowBytes = averageRowBytes(acc);
         while (offset < total) {
             checkCancelled();
-            // 至少并入一个完整分组；随后继续并入，直到凑够一页（或没有更多分组）
+            // 至少并入一个完整分组；随后继续并入，直到凑够一页（或没有更多分组 / 已到字节上限）
             int end;
             do {
                 end = groupEnds[gi++];
-            } while (end < total && end - offset < OUTPUT_PAGE_ROWS && gi < groupEnds.length);
+            } while (end < total && end - offset < OUTPUT_PAGE_ROWS
+                    && groupEnds.length > gi
+                    && (long) (end - offset) * pageRowBytes < SPILL_BATCH_BYTES);
 
             int rows = end - offset;
             List<FieldVector> outVectors = new ArrayList<>();
@@ -1167,6 +1216,9 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
             List<FieldVector> outVectors = null;
             int outRowCount = 0;
             int outCapacity = 0;
+            // 归并输出批的行数上限：在 SPILL_BATCH_ROWS 之外再按字节收紧（与 writeSortedBatches 同口径）。
+            // 宽行 10000 行 = 65MB，变长缓冲按 2 的幂翻倍会申请 64MB+，归并并发时直接撞分配器上限。
+            int outBatchRows = SPILL_BATCH_ROWS;
             Object lastKey = null;
             int groupOut = 0;   // 当前分组已写出的行数（用于每组只留前 keep 行）
 
@@ -1177,7 +1229,12 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
                 int row = positions[si];
 
                 if (outVectors == null) {
-                    outVectors = createOutputVectors(schema, SPILL_BATCH_ROWS);
+                    long avgRowBytes = averageRowBytes(src.getRowCount(), src.getFieldVectors());
+                    if (avgRowBytes > 0) {
+                        outBatchRows = (int) Math.max(1,
+                                Math.min(SPILL_BATCH_ROWS, SPILL_BATCH_BYTES / avgRowBytes));
+                    }
+                    outVectors = createOutputVectors(schema, outBatchRows);
                     // ★ 闸门取所有列的最小容量：Arrow 按字节取整后不同类型换算回的行数不同
                     //   （TINYINT 一次 reAlloc 只有 116504 行，INT 有 127100 行），用首列会在窄列上越界。
                     outCapacity = minValueCapacity(outVectors);
@@ -1193,7 +1250,7 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
                 // newGroup：curKey 与上一个 key 不同（含首行）。
                 boolean newGroup = lastKey == null || !keysEqual(lastKey, curKey);
                 // 缓冲满即切批：无过滤时允许组内切（组可跨批，Phase 2 流式处理）；有过滤时只在组边界切。
-                if (outRowCount >= SPILL_BATCH_ROWS && (newGroup || canSplitMidGroup)) {
+                if (outRowCount >= outBatchRows && (newGroup || canSplitMidGroup)) {
                     outRoot.setRowCount(outRowCount);
                     outWriter.writeBatch();
                     wroteAny = true;
@@ -1461,11 +1518,16 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
         private List<TransferPair> transfers;
         private VectorSchemaRoot srcRoot;    // transfers 当前绑定的源 root
         private int rows;
+        /** 累积页的预估逻辑字节：行数之外的第二道闸门（宽行 50000 行一页可到 325MB）。 */
+        private long bytes;
 
         FlatOut(int pid) { this.pid = pid; }
 
         /** 追加源 root 的 [0,n) 行（顺序，不排序）。够一页即吐。 */
         void appendAll(VectorSchemaRoot root, int n) {
+            long incoming = averageRowBytes(n, root.getFieldVectors()) * n;
+            // 先判后加：页字节将超上限时先吐当前页，保证单页 ≤ 上限 + 一个源批（源批本身已被字节口径压过）
+            if (rows > 0 && bytes + incoming > SPILL_BATCH_BYTES) flush();
             ensureVectors(root);
             int need = rows + n;
             boolean grown = false;
@@ -1485,7 +1547,8 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
                 for (TransferPair tp : transfers) tp.copyValueSafe(i, rows + i);
             }
             rows = need;
-            if (rows >= OUTPUT_PAGE_ROWS) flush();
+            bytes += incoming;
+            if (rows >= OUTPUT_PAGE_ROWS || bytes >= SPILL_BATCH_BYTES) flush();
         }
 
         /** 把累积的行成页 emit（不足一批也发）；空则 no-op。向量所有权随之移交，本对象可继续累积。 */
@@ -1498,6 +1561,7 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
             transfers = null;
             srcRoot = null;
             rows = 0;
+            bytes = 0;
         }
 
         /** 异常路径释放尚未成页的累积向量（已移交的已置 null，不受影响）。 */
@@ -1510,6 +1574,7 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
             transfers = null;
             srcRoot = null;
             rows = 0;
+            bytes = 0;
         }
 
         private void ensureVectors(VectorSchemaRoot root) {
@@ -1580,6 +1645,8 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
         private VectorSchemaRoot srcRoot;    // transfers 当前绑定的源 root
         private int rows;
         private int keys;
+        /** 累积页的预估逻辑字节：行数/组数之外的第二道闸门（宽行页过大同样会撞分配器上限）。 */
+        private long bytes;
 
         Phase2Out(int pid) { this.pid = pid; }
 
@@ -1587,6 +1654,10 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
         void appendGroup(VectorSchemaRoot root, int from, int to) {
             List<Integer> ordered = orderAndFilterGroup(root, from, to);
             if (ordered.isEmpty()) return;
+            long incoming = averageRowBytes(root.getRowCount(), root.getFieldVectors())
+                    * ordered.size();
+            // 先判后加：页将超上限时先吐当前页（组不拆页 —— 有过滤下推时下游按组整组消费）
+            if (rows > 0 && bytes + incoming > SPILL_BATCH_BYTES) flush();
             ensureVectors(root);
             int need = rows + ordered.size();
             boolean grown = false;
@@ -1607,8 +1678,11 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
                 for (TransferPair tp : transfers) tp.copyValueSafe(src, rows + i);
             }
             rows = need;
+            bytes += incoming;
             keys++;
-            if (keys >= FETCH_PER_KEYS || rows >= OUTPUT_PAGE_ROWS) flush();
+            if (keys >= FETCH_PER_KEYS || rows >= OUTPUT_PAGE_ROWS || bytes >= SPILL_BATCH_BYTES) {
+                flush();
+            }
         }
 
         /** 把累积的行成页 emit（不足一批也发）；空则 no-op。向量所有权随之移交，本对象可继续累积。 */
@@ -1622,6 +1696,7 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
             srcRoot = null;
             rows = 0;
             keys = 0;
+            bytes = 0;
         }
 
         /** 异常路径释放尚未成页的累积向量（已移交的已置 null，不受影响）。 */
@@ -1635,6 +1710,7 @@ public class WindowSortOperator extends AbstractSpillableOperator<RowAccumulator
             srcRoot = null;
             rows = 0;
             keys = 0;
+            bytes = 0;
         }
 
         private void ensureVectors(VectorSchemaRoot root) {

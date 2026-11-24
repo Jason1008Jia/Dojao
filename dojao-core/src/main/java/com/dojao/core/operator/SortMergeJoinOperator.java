@@ -66,6 +66,8 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
     }
 
     private static final int OUTPUT_BATCH_SIZE = 50000;
+    /** 输出页/批的<b>字节</b>上界（默认 32MB）：宽行 join 只按 5 万行切批会一批几百 MB。 */
+    private static final long OUTPUT_BATCH_BYTES = BatchLimits.batchBytes();
     private static final int KEYS_PER_BATCH = 5000;
 
     /**
@@ -1124,14 +1126,23 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
                 // 选定 [firstBlock, end)：至少一个 block，之后累计到 maxRows 为止
                 Schema schema = null;
                 int dstRow = 0;
+                long dstBytes = 0;
+                long maxBytes = BatchLimits.batchBytes();
                 int bi = firstBlock;
                 // one pass: read each block once, copy into the target root as we go
                 while (bi < blocks.size() && (bi == firstBlock || dstRow < maxRows)) {
                     reader.loadRecordBatch(blocks.get(bi));
                     VectorSchemaRoot loaded = reader.getVectorSchemaRoot();
                     int rc = loaded.getRowCount();
+                    if (rc == 0) { bi++; continue; }
+                    long blockBytes = RowAccumulator.averageRowBytes(loaded.getFieldVectors(), rc) * rc;
+                    // ★字节闸门：只按行数切片的宽行（raw_json_data 几十 KB）会把几十个 32MB block
+                    //   拼成 >1GB 的切片（线上 2026-11-23：copyColumnBatch 里 VarChar 申请 256MB OOM）。
+                    //   超预算就把本 block 留给下一次切片（bi 回退，下次从同一 block 继续）。
+                    if (dstRow > 0 && dstBytes + blockBytes > maxBytes) {
+                        break;
+                    }
                     bi++;
-                    if (rc == 0) continue;
                     if (schema == null) {
                         schema = loaded.getSchema();
                         for (int c = 0; c < loaded.getFieldVectors().size(); c++) {
@@ -1145,6 +1156,7 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
                         RowAccumulator.copyColumnBatch(loaded.getVector(c), copied.get(c), 0, dstRow, rc);
                     }
                     dstRow += rc;
+                    dstBytes += blockBytes;
                 }
                 boolean done = bi >= blocks.size();
                 if (dstRow == 0) return new FileSlice(null, bi, done);
@@ -1353,8 +1365,11 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
         if (outputFields == null) outputFields = outFields;
 
         long offset = 0;
+        long pairBytes = Math.max(1L, RowAccumulator.averageRowBytes(left.getFieldVectors(), lRows)
+                + RowAccumulator.averageRowBytes(right.getFieldVectors(), rRows));
+        long maxRowsPerBatch = Math.max(1L, OUTPUT_BATCH_BYTES / pairBytes);
         while (offset < total) {
-            int batch = (int) Math.min(OUTPUT_BATCH_SIZE, total - offset);
+            int batch = (int) Math.min(Math.min(OUTPUT_BATCH_SIZE, maxRowsPerBatch), total - offset);
 
             // 左列：用源向量创建 TransferPair 得到完全兼容的目标向量
             List<TransferPair> ltps = new ArrayList<>();
@@ -1413,8 +1428,12 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
         }
 
         int offset = 0;
+        long rowBytes = left != null
+                ? RowAccumulator.averageRowBytes(left.getFieldVectors(), rows)
+                : RowAccumulator.averageRowBytes(right.getFieldVectors(), rows);
+        long maxRowsPerBatch = Math.max(1L, OUTPUT_BATCH_BYTES / Math.max(1L, rowBytes));
         while (offset < rows) {
-            int batch = Math.min(OUTPUT_BATCH_SIZE, rows - offset);
+            int batch = (int) Math.min(Math.min(OUTPUT_BATCH_SIZE, maxRowsPerBatch), rows - offset);
             List<FieldVector> out = new ArrayList<>();
 
             if (left != null) {
@@ -1620,13 +1639,15 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
     }
 
     // ===================================================================
-    // 跨 key 输出缓冲：攒满 OUTPUT_BATCH_SIZE 行再 flush
+    // 跨 key 输出缓冲：攒满 OUTPUT_BATCH_SIZE 行 / OUTPUT_BATCH_BYTES 字节再 flush
     // ===================================================================
 
     private class JoinOutputBuffer {
         private final int pid;
         private final List<FieldVector> outVectors;
         private int filled;
+        /** 当前输出批的逻辑字节累计（宽行 join 的第二重切批上界）。 */
+        private long bytes;
 
         JoinOutputBuffer(int pid) {
             this.pid = pid;
@@ -1650,9 +1671,11 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
                         VectorSchemaRoot rRoot = rightLoaded.get(rs.batchIndex());
                         if (rRoot == null) continue;
                         for (int ri = rs.startRow(); ri < rs.endRow(); ri++) {
-                            if (filled >= OUTPUT_BATCH_SIZE) flush();
+                            if (filled >= OUTPUT_BATCH_SIZE || bytes >= OUTPUT_BATCH_BYTES) flush();
                             if (outVectors.isEmpty()) initOutputVectors(lRoot, rRoot);
                             copyRow(lRoot, li, rRoot, ri);
+                            bytes += RowAccumulator.rowBytes(lRoot.getFieldVectors(), li)
+                                    + RowAccumulator.rowBytes(rRoot.getFieldVectors(), ri);
                             filled++;
                         }
                     }
@@ -1785,28 +1808,41 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
         }
 
         void appendMatchedRow(FileIterator left, int li, FileIterator right, int ri) {
-            if (filled >= OUTPUT_BATCH_SIZE) flush();
+            if (filled >= OUTPUT_BATCH_SIZE || bytes >= OUTPUT_BATCH_BYTES) flush();
             if (outVectors.isEmpty()) initOutputVectors(left, right);
             copyRow(left, li, right, ri);
+            bytes += srcRowBytes(left, li) + srcRowBytes(right, ri);
             filled++;
         }
 
         void appendLeftOrphanRow(FileIterator left, int li) {
-            if (filled >= OUTPUT_BATCH_SIZE) flush();
+            if (filled >= OUTPUT_BATCH_SIZE || bytes >= OUTPUT_BATCH_BYTES) flush();
             if (outVectors.isEmpty()) initFromLeft(left);
             for (int c = 0; c < lCols; c++)
                 copyCell(left.getVector(c), outVectors.get(c), lWidths[c], li, lTPs, lTpSrc, c);
             for (int c = 0; c < rCols; c++) outVectors.get(lCols + c).setNull(filled);
+            bytes += srcRowBytes(left, li);
             filled++;
         }
 
         void appendRightOrphanRow(FileIterator right, int ri) {
-            if (filled >= OUTPUT_BATCH_SIZE) flush();
+            if (filled >= OUTPUT_BATCH_SIZE || bytes >= OUTPUT_BATCH_BYTES) flush();
             if (outVectors.isEmpty()) initFromRight(right);
             for (int c = 0; c < lCols; c++) outVectors.get(c).setNull(filled);
             for (int c = 0; c < rCols; c++)
                 copyCell(right.getVector(c), outVectors.get(lCols + c), rWidths[c], ri, rTPs, rTpSrc, c);
+            bytes += srcRowBytes(right, ri);
             filled++;
+        }
+
+        /** 单行逻辑字节（FileIterator 来源；按列累计，口径同 {@link RowAccumulator#rowBytes}). */
+        private long srcRowBytes(FileIterator it, int row) {
+            long total = 0;
+            int n = it.cols();
+            for (int c = 0; c < n; c++) {
+                total += RowAccumulator.rowBytes(it.getVector(c), row);
+            }
+            return total;
         }
 
         private void copyCell(FieldVector src, FieldVector dst, int tw, int srcIdx,
@@ -1851,29 +1887,33 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
 
         void appendMatchedRow(VectorSchemaRoot lRoot, int li,
                               VectorSchemaRoot rRoot, int ri) {
-            if (filled >= OUTPUT_BATCH_SIZE) flush();
+            if (filled >= OUTPUT_BATCH_SIZE || bytes >= OUTPUT_BATCH_BYTES) flush();
             if (outVectors.isEmpty()) initOutputVectors(lRoot, rRoot);
             copyRow(lRoot, li, rRoot, ri);
+            bytes += RowAccumulator.rowBytes(lRoot.getFieldVectors(), li)
+                    + RowAccumulator.rowBytes(rRoot.getFieldVectors(), ri);
             filled++;
         }
 
         void appendLeftOrphanRow(VectorSchemaRoot lRoot, int li) {
-            if (filled >= OUTPUT_BATCH_SIZE) flush();
+            if (filled >= OUTPUT_BATCH_SIZE || bytes >= OUTPUT_BATCH_BYTES) flush();
             if (outVectors.isEmpty()) initFromLeft(lRoot);
             for (int c = 0; c < lCols; c++)
                 copyCell(lRoot.getVector(c), outVectors.get(c), lWidths[c], li, lTPs, lTpSrc, c);
             // 右侧列显式设为 NULL (Arrow allocateNew 默认 validity=全1, 不是全0!)
             for (int c = 0; c < rCols; c++) outVectors.get(lCols + c).setNull(filled);
+            bytes += RowAccumulator.rowBytes(lRoot.getFieldVectors(), li);
             filled++;
         }
 
         void appendRightOrphanRow(VectorSchemaRoot rRoot, int ri) {
-            if (filled >= OUTPUT_BATCH_SIZE) flush();
+            if (filled >= OUTPUT_BATCH_SIZE || bytes >= OUTPUT_BATCH_BYTES) flush();
             if (outVectors.isEmpty()) initFromRight(rRoot);
             // 左侧列设为 NULL
             for (int c = 0; c < lCols; c++) outVectors.get(c).setNull(filled);
             for (int c = 0; c < rCols; c++)
                 copyCell(rRoot.getVector(c), outVectors.get(lCols + c), rWidths[c], ri, rTPs, rTpSrc, c);
+            bytes += RowAccumulator.rowBytes(rRoot.getFieldVectors(), ri);
             filled++;
         }
 
@@ -1930,7 +1970,7 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
         }
 
         void flushIfNeeded() {
-            if (filled >= OUTPUT_BATCH_SIZE) flush();
+            if (filled >= OUTPUT_BATCH_SIZE || bytes >= OUTPUT_BATCH_BYTES) flush();
         }
 
         void flush() {
@@ -1942,6 +1982,7 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
                     new VectorSchemaRoot(fields, new ArrayList<>(outVectors), filled), pid));
             outVectors.clear();
             filled = 0;
+            bytes = 0;
         }
 
         /**
@@ -1954,6 +1995,7 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
             }
             outVectors.clear();
             filled = 0;
+            bytes = 0;
         }
     }
 }

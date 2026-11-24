@@ -483,6 +483,122 @@ public class RowAccumulator implements Slot {
         return 0; // 变长或未知
     }
 
+    /**
+     * 单列单行的<b>内容 hash</b>（join / 聚合 / shuffle 分区共用）。
+     *
+     * <p>★不能对 {@code vec.getObject(row)} 直接取 {@code hashCode()}：Arrow 的 {@code Text}
+     * （{@code VarCharVector.getObject} 的返回类型）<b>没有覆写 hashCode</b>，用的是对象身份 hash ——
+     * 同一个字符串在左右两侧是两个对象 ⇒ 分区不同 ⇒ 分布式 join 静默空结果、GROUP BY 被拆成多组。
+     * 变长列必须按<b>字节内容</b>求 hash；定长整型统一符号扩展到 long（跨类型同值同 hash）。</p>
+     */
+    static int keyHash(FieldVector vec, int row) {
+        if (vec == null || row < 0 || vec.isNull(row)) return 0;
+        ArrowType type = vec.getField().getType();
+        int tw = typeWidthOf(type);
+        if (tw > 0 && tw <= 8 && !(type instanceof ArrowType.FloatingPoint)) {
+            ArrowBuf buf = vec.getDataBuffer();
+            long v = switch (tw) {
+                case 8 -> buf.getLong((long) row * 8);
+                case 4 -> buf.getInt((long) row * 4);
+                case 2 -> buf.getShort((long) row * 2);
+                default -> buf.getByte(row);
+            };
+            return (int) (v ^ (v >>> 32));
+        }
+        if (vec instanceof BaseVariableWidthVector bv) {
+            return bytesHash(bv.getDataBuffer(), bv.getOffsetBuffer(), row, 4);
+        }
+        if (vec instanceof BaseLargeVariableWidthVector lbv) {
+            return bytesHash(lbv.getDataBuffer(), lbv.getOffsetBuffer(), row, 8);
+        }
+        if (vec instanceof FixedSizeBinaryVector fb) {
+            int width = ((ArrowType.FixedSizeBinary) type).getByteWidth();
+            ArrowBuf data = fb.getDataBuffer();
+            int h = 1;
+            for (int i = row * width; i < (row + 1) * width; i++) {
+                h = 31 * h + data.getByte(i);
+            }
+            return h;
+        }
+        Object val = readKeyValue(vec, row);
+        if (val instanceof Long l) {
+            long v = l;
+            return (int) (v ^ (v >>> 32));
+        }
+        if (val instanceof Double d) return Double.hashCode(d);
+        return val == null ? 0 : val.hashCode();
+    }
+
+    /** 变长列的单行字节内容 hash（offsetWidth = 4 / 8）。 */
+    private static int bytesHash(ArrowBuf data, ArrowBuf offsets, int row, int offsetWidth) {
+        long start, end;
+        if (offsetWidth == 8) {
+            start = offsets.getLong((long) row * 8);
+            end = offsets.getLong((long) (row + 1) * 8);
+        } else {
+            start = offsets.getInt((long) row * 4) & 0xFFFFFFFFL;
+            end = offsets.getInt((long) (row + 1) * 4) & 0xFFFFFFFFL;
+        }
+        int h = 1;
+        for (long i = start; i < end; i++) {
+            h = 31 * h + data.getByte(i);
+        }
+        return h;
+    }
+
+    /**
+     * 单行<b>逻辑字节数</b>（输出批按字节切批用）：定长列按 {@link #typeWidthOf}；变长列按
+     * offset 差 + 4B 偏移；嵌套 / 少见类型按「向量缓冲容量 ÷ 值数」兜底（保守）。
+     *
+     * <p>只决定「什么时候切批」，不参与正确性 —— 不追求与 Arrow 实际分配逐字节一致。</p>
+     */
+    static long rowBytes(List<FieldVector> vectors, int row) {
+        long total = 0;
+        for (FieldVector v : vectors) {
+            total += rowBytes(v, row);
+        }
+        return total;
+    }
+
+    /** 单列单行逻辑字节数（口径见 {@link #rowBytes(List, int)}）。 */
+    static long rowBytes(FieldVector v, int row) {
+        int tw = typeWidthOf(v.getField().getType());
+        if (tw > 0) {
+            return tw + 1L;   // 数据 + validity 位
+        }
+        if (v instanceof BaseVariableWidthVector bv) {
+            if (bv.isNull(row)) return 1L;
+            ArrowBuf off = bv.getOffsetBuffer();
+            long start = off.getInt((long) row * 4);
+            long end = off.getInt((long) (row + 1) * 4);
+            return 1L + 4L + Math.max(0L, end - start);
+        }
+        int rows = Math.max(row + 1, v.getValueCount());
+        return 1L + Math.max(8L, v.getBufferSize() / rows);
+    }
+
+    /**
+     * 源批<b>平均行宽</b>（字节）：固定宽列按类型宽度；变长列按 offset 末端取真实数据量；
+     * 嵌套列退化为 buffer 总容量（偏保守）。用于「按目标字节数折算一批多少行」。
+     */
+    static long averageRowBytes(List<FieldVector> vectors, int rows) {
+        if (rows <= 0) return 0;
+        long total = 0;
+        for (FieldVector v : vectors) {
+            int tw = typeWidthOf(v.getField().getType());
+            if (tw > 0) {
+                total += (long) rows * tw;
+            } else if (v instanceof BaseVariableWidthVector bv) {
+                ArrowBuf off = bv.getOffsetBuffer();
+                total += (long) rows * 4 + (off != null ? off.getInt((long) rows * 4) : 0);
+            } else {
+                total += v.getBufferSize();
+            }
+            total += (rows + 7) / 8;
+        }
+        return Math.max(1, total / rows);
+    }
+
     // ==================== INT 键 Primitive Map（避免 Integer 装箱） ====================
 
     static final class IntObjectMap {

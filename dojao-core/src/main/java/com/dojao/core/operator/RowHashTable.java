@@ -172,37 +172,10 @@ public abstract class RowHashTable implements AutoCloseable {
      * <p>供 join 的 probe 侧使用：probe 侧的键列名（左表）与 build 侧（右表）可以不同名，
      * 但复合键必须按<b>全部</b>键列求 hash，否则两侧桶位不一致，探测会静默漏配/错配。</p>
      */
-    protected int hashRow(VectorSchemaRoot root, int[] keyIdx, int rowIndex) {
+    static int hashRow(VectorSchemaRoot root, int[] keyIdx, int rowIndex) {
         int hash = 0;
         for (int i = 0; i < keyIdx.length; i++) {
-            FieldVector vec = root.getVector(keyIdx[i]);
-            if (vec.isNull(rowIndex)) { hash = 31 * hash; continue; }
-            ArrowType type = vec.getField().getType();
-            int tw = RowAccumulator.typeWidthOf(type);
-            if (tw > 0 && tw <= 8 && !(type instanceof ArrowType.FloatingPoint)) {
-                // ★整型（含 Date/Time/Timestamp/Bool）无论宽度一律符号扩展到 long 再混洗：
-                //   BIGINT 与 INT 上的同一个数值得到同一个 hash ⇒ 跨类型 join 落同一桶。
-                //   旧实现 4 字节列直接取 raw int，负数与 8 字节列口径不一致。
-                ArrowBuf buf = vec.getDataBuffer();
-                long v = switch (tw) {
-                    case 8 -> buf.getLong((long) rowIndex * 8);
-                    case 4 -> buf.getInt((long) rowIndex * 4);
-                    case 2 -> buf.getShort((long) rowIndex * 2);
-                    default -> buf.getByte(rowIndex);
-                };
-                hash = 31 * hash + (int) (v ^ (v >>> 32));
-            } else {
-                // 浮点 / Decimal / 变长：与 RowAccumulator.readKeyValue 的规范口径一致
-                Object val = RowAccumulator.readKeyValue(vec, rowIndex);
-                if (val instanceof Long l) {
-                    long v = l;
-                    hash = 31 * hash + (int) (v ^ (v >>> 32));
-                } else if (val instanceof Double d) {
-                    hash = 31 * hash + Double.hashCode(d);
-                } else {
-                    hash = 31 * hash + val.hashCode();
-                }
-            }
+            hash = 31 * hash + RowAccumulator.keyHash(root.getVector(keyIdx[i]), rowIndex);
         }
         return hash;
     }

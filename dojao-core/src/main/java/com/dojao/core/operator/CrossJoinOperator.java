@@ -163,9 +163,18 @@ public class CrossJoinOperator extends AbstractMeasurableOperator {
             }
         }
 
-        // 分批组装
-        for (int i = 0; i < allPairs.size(); i += OUTPUT_BATCH_SIZE) {
-            int end = Math.min(i + OUTPUT_BATCH_SIZE, allPairs.size());
+        // 分批组装：行数 + 字节双上界（宽行笛卡尔积一批可能几百 MB）
+        long rightBytes = 0;
+        for (Page rp : crossJoinRightPages) {
+            int rr = rp.getRowCount();
+            rightBytes += RowAccumulator.averageRowBytes(rp.getRoot().getFieldVectors(), rr) * rr;
+        }
+        long rightAvg = totalRightRows == 0 ? 0 : rightBytes / totalRightRows;
+        long leftAvg = RowAccumulator.averageRowBytes(leftRoot.getFieldVectors(), leftRowCount);
+        long pairBytes = Math.max(1L, leftAvg + rightAvg);
+        int step = (int) Math.max(1L, Math.min(OUTPUT_BATCH_SIZE, BatchLimits.batchBytes() / pairBytes));
+        for (int i = 0; i < allPairs.size(); i += step) {
+            int end = Math.min(i + step, allPairs.size());
             List<int[]> batch = allPairs.subList(i, end);
             batches.add(assembleCrossJoinBatch(batch, leftRoot));
         }

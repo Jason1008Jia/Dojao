@@ -211,6 +211,22 @@ public final class ResourceConfig {
     public static final String QUERY_WINDOW_PER_BATCH_KEYS = "query.window.perBatchKeys";
     /** 窗口算子<b>溢写</b>每批行数 —— Phase 1 落盘文件切分粒度（{@code query.window.spill.perBatchRows}）。 */
     public static final String QUERY_WINDOW_SPILL_PER_BATCH_ROWS = "query.window.spill.perBatchRows";
+    /**
+     * 窗口算子<b>溢写</b>每批字节上限（{@code query.window.spill.perBatchBytes}）。
+     *
+     * <p>行数上限对宽行（单行几 KB 的 JSON 列）失效：10000 行 = 60MB+，写出批的变长缓冲
+     * 一翻倍就申请 128MB → 先撞算子分配器上限（Arrow OOM）。按累加器平均行宽把批压到该
+     * 字节预算内，见 {@code WindowSortOperator#writeSortedBatches}。</p>
+     */
+    public static final String QUERY_WINDOW_SPILL_PER_BATCH_BYTES = "query.window.spill.perBatchBytes";
+    /**
+     * 哈希分发（shuffle 发送端）每个分区缓冲的字节上限（{@code query.shuffle.batch.maxBytes}）。
+     *
+     * <p>只有行数上限（10000 行/页）时，宽行会把一张 shuffle 页做成 60MB+：
+     * 下游溢写算子收一页就要整份拷贝，变长缓冲翻倍直接 OOM。行数 + 字节双上限与扫描转换器
+     * （{@code TextFileArrowConverter} / {@code JdbcArrowConverter} 的 32MB）同口径。</p>
+     */
+    public static final String QUERY_SHUFFLE_BATCH_MAX_BYTES = "query.shuffle.batch.maxBytes";
     /** 窗口算子<b>拉取</b>每批 key 数 —— Phase 2 成页回传下游的 key 组数（{@code query.window.spill.fetchPerKeys}）。 */
     public static final String QUERY_WINDOW_SPILL_FETCH_PER_KEYS = "query.window.spill.fetchPerKeys";
     /** 无 ORDER BY 聚合窗口的整分区缓冲上限（字节，{@code query.window.partitionAggBufferBytes}），超限转磁盘溢写。 */
@@ -339,6 +355,16 @@ public final class ResourceConfig {
     public static final int DEFAULT_WINDOW_PER_BATCH_KEYS = 50000;
     /** 窗口<b>溢写</b>每批行数默认 10000（query.window.spill.perBatchRows）。 */
     public static final int DEFAULT_WINDOW_SPILL_PER_BATCH_ROWS = 10000;
+    /**
+     * 窗口<b>溢写</b>每批字节上限默认 16MB（query.window.spill.perBatchBytes）。
+     *
+     * <p>不只管溢写文件切批：Phase 1.5 归并输出批、Phase 2 输出页累积也都按它收口。宽行（单行
+     * 6~7KB）按 10000 / 50000 行组批就是 65MB / 325MB，变长缓冲按 2 的幂翻倍会一次申请
+     * 64MB+，且 Phase 2 输出队列可缓存 8 页 ⇒ 直接撑爆算子分配器（线上 window 溢写 OOM 的正因）。</p>
+     */
+    public static final long DEFAULT_WINDOW_SPILL_PER_BATCH_BYTES = 16L * 1024 * 1024;
+    /** 哈希分发每分区缓冲字节上限默认 16MB（query.shuffle.batch.maxBytes）。 */
+    public static final long DEFAULT_SHUFFLE_BATCH_MAX_BYTES = 16L * 1024 * 1024;
     /** 窗口<b>拉取</b>每批 key 数默认 10000（query.window.spill.fetchPerKeys）。 */
     public static final int DEFAULT_WINDOW_SPILL_FETCH_PER_KEYS = 10000;
     /** 无 ORDER BY 聚合窗口的整分区内存缓冲上限默认 64MB，超过转磁盘溢写。 */
@@ -1093,6 +1119,18 @@ public final class ResourceConfig {
     /** 窗口算子<b>溢写</b>每批行数（{@code query.window.spill.perBatchRows}，≥ 1，默认 10000）。 */
     public static int windowSpillPerBatchRows() {
         return Math.max(1, intValue(QUERY_WINDOW_SPILL_PER_BATCH_ROWS, DEFAULT_WINDOW_SPILL_PER_BATCH_ROWS));
+    }
+
+    /** 窗口算子<b>溢写</b>每批字节上限（{@code query.window.spill.perBatchBytes}，字节，默认 32MB）。 */
+    public static long windowSpillPerBatchBytes() {
+        long v = sizeValue(QUERY_WINDOW_SPILL_PER_BATCH_BYTES, DEFAULT_WINDOW_SPILL_PER_BATCH_BYTES);
+        return v > 0 ? v : DEFAULT_WINDOW_SPILL_PER_BATCH_BYTES;
+    }
+
+    /** 哈希分发每分区缓冲字节上限（{@code query.shuffle.batch.maxBytes}，字节，默认 16MB）。 */
+    public static long shuffleBatchMaxBytes() {
+        long v = sizeValue(QUERY_SHUFFLE_BATCH_MAX_BYTES, DEFAULT_SHUFFLE_BATCH_MAX_BYTES);
+        return v > 0 ? v : DEFAULT_SHUFFLE_BATCH_MAX_BYTES;
     }
 
     /** 窗口算子<b>拉取</b>每批 key 数（{@code query.window.spill.fetchPerKeys}，≥ 1，默认 10000）。 */

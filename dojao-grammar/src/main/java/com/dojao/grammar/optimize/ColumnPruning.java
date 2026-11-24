@@ -74,14 +74,25 @@ public final class ColumnPruning implements OptimizerRule {
             }
         }
 
-        // 2) 检查 SELECT *
-        boolean hasStar = select.selectItems().stream()
-            .anyMatch(item -> {
-                if (item.expression() instanceof Expression.OpaqueExpr oe) {
-                    return "*".equals(oe.originalText().trim());
-                }
-                return false;
-            });
+        // 2) 检查星号：裸 * 保留全部关系；限定星号 a.* / a.b.* 只保留该关系的列。
+        //    ★只认裸 "*" 时，`select a1.* from (...) a1 join t b ...` 会被按名裁剪成只剩 join 键，
+        //    派生表其余列全部丢失（线上 2026-11-23：a1.* 的 raw_json_data/dt/rr 全没了）。
+        boolean starAll = false;
+        Set<String> starRelations = new LinkedHashSet<>();   // 小写 alias / 表名
+        for (LogicalPlan.SelectItem item : select.selectItems()) {
+            if (!(item.expression() instanceof Expression.OpaqueExpr oe)) continue;
+            String t = oe.originalText().trim();
+            if ("*".equals(t)) {
+                starAll = true;
+                continue;
+            }
+            int dot = t.lastIndexOf('.');
+            if (dot <= 0 || !"*".equals(t.substring(dot + 1).trim())) continue;
+            String qual = t.substring(0, dot).trim().toLowerCase(Locale.ROOT);
+            starRelations.add(qual);
+            int lastDot = qual.lastIndexOf('.');   // catalog.schema.tbl.* 兼容
+            if (lastDot >= 0) starRelations.add(qual.substring(lastDot + 1));
+        }
 
         // 3) 按 relation alias 分组
         Map<String, Set<String>> neededByAlias = new LinkedHashMap<>();
@@ -99,8 +110,12 @@ public final class ColumnPruning implements OptimizerRule {
         for (LogicalPlan.ResolvedRelation rel : relations) {
             String alias = rel.alias().orElse(rel.table()).toLowerCase();
             List<String> declared = rel.columns(); // 派生表对外声明列（与内层 selectItems 对齐）
+            // 裸 * 或 `本关系.*` → 该关系保留全部列
+            boolean keepAll = starAll
+                || starRelations.contains(alias)
+                || starRelations.contains(rel.table().toLowerCase(Locale.ROOT));
             List<String> prunedColumns;
-            if (hasStar) {
+            if (keepAll) {
                 prunedColumns = rel.columns(); // 保留全部
             } else {
                 Set<String> needed = neededByAlias.getOrDefault(alias, Set.of());
@@ -122,9 +137,9 @@ public final class ColumnPruning implements OptimizerRule {
                 }
             }
             // 需求穿透进 FROM 子查询：把外层真正引用的列集传下去，使内层扫描读更少列。
-            // 只在无 `*`（无从按名裁）且外层确有需求时进行；歧义一律原样保留。
+            // 保留全部列的关系（裸 * / 本关系.*）不穿透；歧义一律原样保留。
             Optional<LogicalPlan> prunedSub = rel.subquery();
-            if (!hasStar && rel.subquery().isPresent()) {
+            if (!keepAll && rel.subquery().isPresent()) {
                 Set<String> needed = neededByAlias.getOrDefault(alias, Set.of());
                 if (!needed.isEmpty()) {
                     prunedSub = Optional.of(
@@ -325,11 +340,14 @@ public final class ColumnPruning implements OptimizerRule {
     /** 收窄结果：{@code select} 与 {@code declared} 始终逐项对齐。 */
     private record Narrowed(LogicalPlan.Select select, List<String> declared) {}
 
+    /** 主查询是否含星号（裸 {@code *} 或限定 {@code q.*}）：含星号时无从按名裁 CTE，整体跳过。 */
     private boolean hasStarSelect(LogicalPlan plan) {
         if (plan instanceof LogicalPlan.Select s) {
-            return s.selectItems().stream().anyMatch(item ->
-                item.expression() instanceof Expression.OpaqueExpr oe
-                && "*".equals(oe.originalText().trim()));
+            return s.selectItems().stream().anyMatch(item -> {
+                if (!(item.expression() instanceof Expression.OpaqueExpr oe)) return false;
+                String t = oe.originalText().trim();
+                return "*".equals(t) || t.endsWith(".*");
+            });
         }
         return false;
     }
