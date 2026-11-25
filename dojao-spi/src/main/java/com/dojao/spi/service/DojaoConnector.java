@@ -640,6 +640,32 @@ public interface DojaoConnector extends DataSourceMetaService {
     default void closeWrite() {}
 
     /**
+     * <b>放弃</b>当前线程的写会话：不提交本次已写出的半成品数据，清理临时对象
+     * （Hive 的 {@code _dojao_tmp_*} 临时目录 / 未提交事务；JDBC 的暂存批）。
+     *
+     * <p>与 {@link #closeWrite()} 的分工：片段<b>正常写完</b> → {@code closeWrite()}（收尾 + 提交）；
+     * <b>失败 / 取消</b> → {@code abortWrite()}（整片丢弃）。若失败时误走 close，被取消的片段会把
+     * 半截数据静默追加进目标表 —— 比丢数据更坏的错。</p>
+     *
+     * <p>默认退回 {@link #closeWrite()}：逐页提交的连接器（JDBC 系）没有「收尾」语义，关掉写句柄
+     * 不会改变已写入的数据；有 staging / 临时目录的连接器（Hive）必须重写本方法。</p>
+     */
+    default void abortWrite() {
+        closeWrite();
+    }
+
+    /**
+     * <b>放弃本连接器里所有线程</b>的写会话（Master 侧写语句中途失败时调，此时写线程已停）。
+     *
+     * <p>与 {@link #finishWrite()} 相对：正常完成 → {@code finishWrite()}；
+     * 有写线程失败 → {@code abortWriteAll()}，不留半成品。默认只放弃当前线程（对逐页提交的
+     * 连接器足够）；有 staging / 临时目录的连接器（Hive）应覆盖为「全部丢弃」。</p>
+     */
+    default void abortWriteAll() {
+        abortWrite();
+    }
+
+    /**
      * 写语句整体收尾：写线程都已停之后由 Master（{@code TableSinkOperator.doClose}）调用，
      * 把本连接器里<b>所有线程</b>的写会话一并收掉。
      *

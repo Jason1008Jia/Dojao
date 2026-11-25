@@ -377,16 +377,37 @@ public final class StringFunctions {
         return node == null ? null : node.toString();
     }
 
-    /** 解析 JSON 并按路径取值；非法 JSON、非法路径、缺失/JSON null → null。 */
-    private static JsonNode resolveJsonNode(String json, String path) {
-        String p = path.trim();
-        if (!p.startsWith("$")) return null;
-        JsonNode node;
+    /** 解析 JSON（非法 / null → null）。供表达式求值器做「同一行只解析一次」的缓存。 */
+    public static JsonNode parseJson(String json) {
+        if (json == null || json.isEmpty()) return null;
         try {
-            node = MAPPER.readTree(json);
+            return MAPPER.readTree(json);
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /**
+     * 已解析节点上按路径取值（{@code get_json_object} 口径：值节点转文本、对象/数组转 JSON 文本）。
+     *
+     * <p>与 {@link #getJsonObject(String, String)} 的区别只是跳过解析 —— 一行有 100+ 个
+     * {@code get_json_object(同一列, ...)} 时，解析一次、按路径取 N 次，避免 N 次 readTree。</p>
+     */
+    public static String jsonValue(JsonNode node, String path) {
+        JsonNode hit = resolveNode(node, path);
+        return hit == null ? null : hit.isValueNode() ? hit.asText() : hit.toString();
+    }
+
+    /** 解析 JSON 并按路径取值；非法 JSON、非法路径、缺失/JSON null → null。 */
+    private static JsonNode resolveJsonNode(String json, String path) {
+        return resolveNode(parseJson(json), path);
+    }
+
+    /** 已解析节点按路径取值（非法路径 / 缺失 / JSON null → null）。 */
+    private static JsonNode resolveNode(JsonNode node, String path) {
+        if (node == null || path == null) return null;
+        String p = path.trim();
+        if (!p.startsWith("$")) return null;
         int i = 1;
         while (i < p.length()) {
             char c = p.charAt(i);

@@ -151,6 +151,14 @@ public final class QueryManager {
      */
     private final ConcurrentHashMap<String, Long> liveFragmentSpillFiles = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Long> liveFragmentSpillTriggers = new ConcurrentHashMap<>();
+    /**
+     * 溢写总量里属于「归并重写」的部分（与 {@link #liveFragmentSpilled} 同源同键）：
+     * 首次溢写 = spilled − compaction。总量是写盘吞吐（同一份数据归并几轮就写几遍），
+     * 拆开后用户才能理解「WebUI 40GB vs du 6.4GB」不是计数错误而是重写放大。
+     */
+    private final ConcurrentHashMap<String, Long> liveFragmentCompaction = new ConcurrentHashMap<>();
+    /** 各片段溢写目录的峰值实际占用（Worker 遍历目录采样，与累计写入量口径不同）。 */
+    private final ConcurrentHashMap<String, Long> liveFragmentPeakDisk = new ConcurrentHashMap<>();
 
     /**
      * Worker 遥测已确认收尾的任务 id（含片段<b>内部分区子任务</b> {@code <fragmentId>#p<k>}）。
@@ -256,9 +264,11 @@ public final class QueryManager {
      */
     private void logSpillSummary() {
         try {
-            long bytes = 0L, files = 0L, triggers = 0L, input = 0L;
+            long bytes = 0L, compaction = 0L, peakDisk = 0L, files = 0L, triggers = 0L, input = 0L;
             for (OperatorSnapshot o : snapshot().operators()) {
                 bytes += o.spilledBytes();
+                compaction += o.compactionBytes();
+                peakDisk += o.peakSpillDiskBytes();
                 files += o.spillFiles();
                 triggers += o.spillTriggers();
                 input += o.inputBytes();
@@ -266,9 +276,15 @@ public final class QueryManager {
             if (bytes <= 0L && files <= 0L && triggers <= 0L) {
                 return;
             }
+            long logical = Math.max(0L, bytes - compaction);
             long avgFile = files > 0 ? bytes / files : 0L;
-            log.info("Query {} 溢写汇总: spill={}MB input={}MB 放大比={} files={} 平均文件={}KB triggers={}",
-                    queryId, bytes >> 20, input >> 20,
+            // 首次溢写 / 归并重写 / 峰值磁盘三个口径并列打出来：总量是写盘吞吐，不是数据量，
+            // 用户拿 du 对照时不会再以为计数错了（2026-11-24）。
+            log.info("Query {} 溢写汇总: spill={}MB（首次={}MB 重写={}MB 放大={}x）峰值磁盘={}MB "
+                            + "input={}MB 写读比={} files={} 平均文件={}KB triggers={}",
+                    queryId, bytes >> 20, logical >> 20, compaction >> 20,
+                    logical > 0L ? String.format("%.2f", (double) bytes / logical) : "-",
+                    peakDisk >> 20, input >> 20,
                     input > 0 ? String.format("%.2f", (double) bytes / input) : "-",
                     files, avgFile >> 10, triggers);
         } catch (Throwable t) {
@@ -359,12 +375,23 @@ public final class QueryManager {
      */
     public void acceptFragmentTelemetry(String taskId, long rows, long bytesIn, long bytesOut,
                                         long spilledBytes, boolean done) {
-        acceptFragmentTelemetry(taskId, rows, bytesIn, bytesOut, spilledBytes, -1L, -1L, done);
+        acceptFragmentTelemetry(taskId, rows, bytesIn, bytesOut, spilledBytes, -1L, -1L, -1L, -1L, done);
     }
 
     public void acceptFragmentTelemetry(String taskId, long rows, long bytesIn, long bytesOut,
                                         long spilledBytes, long spillFiles, long spillTriggers,
                                         boolean done) {
+        acceptFragmentTelemetry(taskId, rows, bytesIn, bytesOut, spilledBytes,
+                spillFiles, spillTriggers, -1L, -1L, done);
+    }
+
+    /**
+     * 完整遥测入口：溢写四通道（总量 / 文件数 / 触发次数 / 归并重写量）+ 溢写目录峰值占用。
+     * 各通道相互独立（{@code -1} = 本帧无读数，不覆盖），传输层逐字段透传。
+     */
+    public void acceptFragmentTelemetry(String taskId, long rows, long bytesIn, long bytesOut,
+                                        long spilledBytes, long spillFiles, long spillTriggers,
+                                        long compactionBytes, long peakDiskBytes, boolean done) {
         if (taskId == null) {
             return;
         }
@@ -381,6 +408,12 @@ public final class QueryManager {
         }
         if (spillTriggers >= 0L) {
             liveFragmentSpillTriggers.put(taskId, spillTriggers);
+        }
+        if (compactionBytes >= 0L) {
+            liveFragmentCompaction.put(taskId, compactionBytes);
+        }
+        if (peakDiskBytes >= 0L) {
+            liveFragmentPeakDisk.put(taskId, peakDiskBytes);
         }
         // 扫描存活心跳（P1）：独立 Scan 叶子没有「数据面回 Master」的页，其片段 tick 只表达
         // 「任务还活着」—— 命中即刷新看门狗的接触时刻后直接返回，<b>不写</b> 行数 / 字节表：
@@ -486,8 +519,11 @@ public final class QueryManager {
                     st.getPeakMemoryBytes(),
                     // 溢写 = 本算子（单机 / Master 本地）自报 + 分布式 Worker 侧遥测之和
                     st.getSpilledBytes() + workerSpilled(op),
+                    // 归并重写量同构累加；峰值占用跨 Worker 取各片段之和与本地峰值中的较大者
+                    st.getCompactionBytes() + workerSpillSum(op, liveFragmentCompaction),
                     st.getSpillFiles() + workerSpillSum(op, liveFragmentSpillFiles),
                     st.getSpillTriggers() + workerSpillSum(op, liveFragmentSpillTriggers),
+                    Math.max(st.getPeakSpillDiskBytes(), workerSpillSum(op, liveFragmentPeakDisk)),
                     elapsedMs,
                     instant,
                     avg,
@@ -541,8 +577,10 @@ public final class QueryManager {
                     liveFragmentBytesIn.getOrDefault(t.taskId(), 0L),
                     liveFragmentBytesOut.getOrDefault(t.taskId(), 0L),
                     liveFragmentSpilled.getOrDefault(t.taskId(), 0L),
+                    liveFragmentCompaction.getOrDefault(t.taskId(), 0L),
                     liveFragmentSpillFiles.getOrDefault(t.taskId(), 0L),
                     liveFragmentSpillTriggers.getOrDefault(t.taskId(), 0L),
+                    liveFragmentPeakDisk.getOrDefault(t.taskId(), 0L),
                     t.dispatchNanos(), t.finishNanos(), t.failure(),
                     src, expectedFor(src)));
         }
@@ -637,8 +675,10 @@ public final class QueryManager {
                     liveFragmentBytesOut.getOrDefault(id, 0L),
                     // 溢写是算子对象级（非分区级）：挂在 0 号分区上，阶段框按任务求和仍得真实值
                     k == 0 ? liveFragmentSpilled.getOrDefault(base, 0L) : 0L,
+                    k == 0 ? liveFragmentCompaction.getOrDefault(base, 0L) : 0L,
                     k == 0 ? liveFragmentSpillFiles.getOrDefault(base, 0L) : 0L,
                     k == 0 ? liveFragmentSpillTriggers.getOrDefault(base, 0L) : 0L,
+                    k == 0 ? liveFragmentPeakDisk.getOrDefault(base, 0L) : 0L,
                     t.dispatchNanos(), finishNanos, t.failure(), t.source(),
                     expectedFor(t.source())));
         }

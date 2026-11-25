@@ -24,6 +24,16 @@ public interface MeasurableOperator extends Operator {
     long getCurrentMemoryBytes();
     void addSpilledBytes(long bytes); // 由溢写管理器回调
 
+    /**
+     * 采样本算子溢写目录的实际磁盘占用，返回峰值字节数（无溢写的算子恒 0）。
+     *
+     * <p>默认取统计里已记录的峰值：可溢写算子覆盖为真实目录遍历（归并重写 / 删除旧文件后
+     * 读数会回落，峰值才与 {@code du} 对得上），无目录的算子无需实现。</p>
+     */
+    default long sampleSpillDiskBytes() {
+        return getStats().getPeakSpillDiskBytes();
+    }
+
     // 4. 性能和吞吐量更新
     void recordInput(Page page); // 在 next() 中调用
     void recordOutput(Page page); // 在输出页时调用

@@ -492,7 +492,12 @@ public sealed interface FragmentSpec
      *
      * <p>{@code targetColumns}：目标表列名（按位置对应输出页列），null → 用页 schema 列名。</p>
      */
-    record SinkStep(String catalog, String schema, String table, List<String> targetColumns) {
+    record SinkStep(String catalog, String schema, String table, List<String> targetColumns,
+                    ScanProjection projection) {
+        /** 无投影（纯写算子输出列）——兼容既有构造点。 */
+        public SinkStep(String catalog, String schema, String table, List<String> targetColumns) {
+            this(catalog, schema, table, targetColumns, null);
+        }
     }
 
     /**
@@ -511,19 +516,35 @@ public sealed interface FragmentSpec
      * sink 写入（SQL 语义 WHERE → ORDER BY/LIMIT → 写）。</p>
      */
     record ScanProjection(List<String> outputColumns, List<String> computedColumns,
-                          List<GroupKeyExpression> expressions, String filterAfterProjection) {
+                          List<GroupKeyExpression> expressions, String filterAfterProjection,
+                          List<ColumnRename> renames, List<CaseProjection> caseProjections) {
         public ScanProjection {
             outputColumns = outputColumns == null ? List.of() : List.copyOf(outputColumns);
             computedColumns = computedColumns == null ? List.of() : List.copyOf(computedColumns);
             expressions = expressions == null ? List.of() : List.copyOf(expressions);
             filterAfterProjection = filterAfterProjection == null || filterAfterProjection.isBlank()
                     ? null : filterAfterProjection;
+            renames = renames == null ? List.of() : List.copyOf(renames);
+            caseProjections = caseProjections == null ? List.of() : List.copyOf(caseProjections);
         }
 
-        /** 兼容构造：无投影后谓词（scan-sink 与纯投影下推的旧调用点）。 */
+        /** 兼容构造：带投影后谓词、改名列表。 */
+        public ScanProjection(List<String> outputColumns, List<String> computedColumns,
+                              List<GroupKeyExpression> expressions, String filterAfterProjection,
+                              List<ColumnRename> renames) {
+            this(outputColumns, computedColumns, expressions, filterAfterProjection, renames, null);
+        }
+
+        /** 兼容构造：带投影后谓词、无改名。 */
+        public ScanProjection(List<String> outputColumns, List<String> computedColumns,
+                              List<GroupKeyExpression> expressions, String filterAfterProjection) {
+            this(outputColumns, computedColumns, expressions, filterAfterProjection, null, null);
+        }
+
+        /** 兼容构造：无投影后谓词、无改名。 */
         public ScanProjection(List<String> outputColumns, List<String> computedColumns,
                               List<GroupKeyExpression> expressions) {
-            this(outputColumns, computedColumns, expressions, null);
+            this(outputColumns, computedColumns, expressions, null, null, null);
         }
 
         /** 投影后谓词是否生效（non-blank）。 */
@@ -532,11 +553,45 @@ public sealed interface FragmentSpec
         }
 
         /**
-         * 扫描后投影是否为空操作（输出列 == 扫描列，无计算列、无投影后谓词）—— 无需包算子；
+         * 是否有<b>改名投影</b>（{@code SELECT a AS b} / 派生表列改名）：Worker 最后一步必须按
+         * {@link ColumnRename} 逐列取源列并改名，而不能按 {@link #outputColumns} 直接 select
+         * （后者要求源列名与输出名一致，改名场景会报「源列不存在」）。
+         */
+        public boolean hasRenames() {
+            return !renames.isEmpty();
+        }
+
+        /** 是否有 CASE / IF 派生列（行内条件投影；Worker 在表达式投影之后求值）。 */
+        public boolean hasCaseProjections() {
+            return !caseProjections.isEmpty();
+        }
+
+        /**
+         * 扫描后投影是否为空操作（输出列 == 扫描列，无计算列、无投影后谓词、无改名、无 CASE）—— 无需包算子；
          * 带谓词时恒 false（即使输出列与扫描列相同，也必须保留投影阶段以承载过滤）。
          */
         public boolean isIdentity() {
-            return expressions.isEmpty() && computedColumns.isEmpty() && !hasFilterAfterProjection();
+            return expressions.isEmpty() && computedColumns.isEmpty() && !hasFilterAfterProjection()
+                    && !hasRenames() && !hasCaseProjections();
+        }
+    }
+
+    /**
+     * 投影改名项：Worker 从上游页取第 {@code occurrence} 个名为 {@code sourceName} 的列，
+     * 以 {@code outputName} 输出（语义同 {@code ProjectOperator.ColumnRef}，含「同名列按出现次序
+     * 取第 N 个」的重复列口径）。
+     */
+    record ColumnRename(String sourceName, int occurrence, String outputName) {
+        public ColumnRename {
+            if (sourceName == null || sourceName.isBlank()) {
+                throw new IllegalArgumentException("投影改名项缺源列名");
+            }
+            outputName = outputName == null || outputName.isBlank() ? sourceName : outputName;
+            occurrence = Math.max(1, occurrence);
+        }
+
+        public ColumnRename(String sourceName, String outputName) {
+            this(sourceName, 1, outputName);
         }
     }
 

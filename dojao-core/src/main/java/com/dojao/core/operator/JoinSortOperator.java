@@ -71,6 +71,16 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
     private static final long COMPACTION_BATCH_BYTES =
             Long.getLong("dojao.sortMerge.compactionBatchBytes", BatchLimits.batchBytes());
 
+    /**
+     * 单个溢写文件内的 record batch 上界（默认 4 MB，{@code -Ddojao.sort.spillBatchBytes} 可调）。
+     *
+     * <p>归并时每个源文件整批读入内存：槽位 35 MB 写成一个 batch 时，110 MB 预算只够开 2–3 个源，
+     * 73 个文件要归并 5 轮、每轮重写全量（线上 Join 节点 111 GB 溢写的主要来源）。切成 4 MB 后
+     * 扇入可到 8–10，轮数降到 2–3。</p>
+     */
+    private static final long SPILL_BATCH_BYTES =
+            Long.getLong("dojao.sort.spillBatchBytes", 4L * 1024 * 1024);
+
     // ==================== 构造函数 ====================
 
     public JoinSortOperator(Operator upstream,
@@ -95,6 +105,11 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
     }
 
     // ==================== 抽象方法实现 ====================
+
+    @Override
+    protected long spillBatchBytes() {
+        return SPILL_BATCH_BYTES;
+    }
 
     @Override
     protected RowAccumulator createSlot(BufferAllocator allocator) {
@@ -444,6 +459,8 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
         for (int pid = 0; pid < partitions.length; pid++) {
             if (partitions[pid] != null) partitions[pid].awaitPendingSpills(pid);
         }
+        // Phase 1 全部落盘、归并尚未删旧文件 = 可预见的占用高点（本类不走基类 startPhase2，需自行采样）
+        captureSpillDiskPeak();
 
         int activeCount = 0;
         for (PartitionState<RowAccumulator> pa : partitions) {
@@ -537,7 +554,7 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
 
     // ==================== Phase 3: K 路归并 ====================
 
-    private static final int MAX_MERGE_K = 16;
+    private static final int MAX_MERGE_K = Integer.getInteger("dojao.sort.maxMergeK", 32);
 
     /**
      * 对指定分区做 K 路归并，把 key 交错的 batch 文件归并为 key 连续文件。
@@ -593,7 +610,9 @@ class JoinSortOperator extends AbstractSpillableOperator<RowAccumulator> {
         int concurrent = 0;
         for (PartitionState<RowAccumulator> p : partitions) if (p != null) concurrent++;
         long perMerge = allocator.getLimit() / Math.max(1, concurrent);
-        return Math.max(1, perMerge / 2);
+        // 旧实现还 /2，扇入被无谓砍半 → 多出一整轮全量重写。留 -D 开关便于线上 A/B 回退。
+        int divisor = Integer.getInteger("dojao.sort.mergeInputDivisor", 1);
+        return Math.max(1, perMerge / Math.max(1, divisor));
     }
 
     /**

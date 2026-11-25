@@ -485,13 +485,17 @@ public final class ControlSerde {
         if (s.targetColumns() != null) {
             b.addAllTargetColumns(s.targetColumns());
         }
+        if (s.projection() != null) {
+            b.setProjection(toScanProjection(s.projection()));
+        }
         return b.build();
     }
 
     public static FragmentSpec.SinkStep fromSinkStep(SinkStepMsg m) {
         List<String> cols = m.getTargetColumnsList();
         return new FragmentSpec.SinkStep(m.getCatalog(), m.getSchema(), m.getTable(),
-                cols.isEmpty() ? null : cols);
+                cols.isEmpty() ? null : cols,
+                m.hasProjection() ? fromScanProjection(m.getProjection()) : null);
     }
 
     /** 扫描分片侧投影 ↔ proto（scan-sink：Worker 扫完先投影）。 */
@@ -502,6 +506,16 @@ public final class ControlSerde {
         for (GroupKeyExpression g : p.expressions()) {
             b.addExpressions(toGroupKeyExpression(g));
         }
+        for (FragmentSpec.ColumnRename r : p.renames()) {
+            b.addRenames(ProjectRenameMsg.newBuilder()
+                    .setSourceName(r.sourceName())
+                    .setOccurrence(r.occurrence())
+                    .setOutputName(r.outputName())
+                    .build());
+        }
+        for (CaseProjection c : p.caseProjections()) {
+            b.addCaseProjections(toCaseProjection(c));
+        }
         if (p.hasFilterAfterProjection()) {
             b.setFilterAfterProjection(p.filterAfterProjection());
         }
@@ -511,7 +525,14 @@ public final class ControlSerde {
     public static FragmentSpec.ScanProjection fromScanProjection(ScanProjectionMsg m) {
         return new FragmentSpec.ScanProjection(m.getOutputColumnsList(), m.getComputedColumnsList(),
                 m.getExpressionsList().stream().map(ControlSerde::fromGroupKeyExpression).toList(),
-                m.getFilterAfterProjection());
+                m.getFilterAfterProjection(),
+                m.getRenamesList().stream()
+                        .map(r -> new FragmentSpec.ColumnRename(r.getSourceName(),
+                                r.getOccurrence(), r.getOutputName()))
+                        .toList(),
+                m.getCaseProjectionsList().stream()
+                        .map(ControlSerde::fromCaseProjection)
+                        .toList());
     }
 
     /** 片内 top-N 截断尾 ↔ proto（可空；空 = 不下推）。 */

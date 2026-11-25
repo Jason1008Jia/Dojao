@@ -51,15 +51,21 @@ public final class CaseProjectOperator extends AbstractMeasurableOperator {
 
     private Operator upstream;
     private final List<CompiledCase> compiled;
+    /** 原始投影定义（Planner 下推到 Worker sink / 诊断用）。 */
+    private final List<CaseProjection> projections;
 
     public CaseProjectOperator(Operator upstream, List<CaseProjection> projections) {
         super("CaseProject", "CaseProject", 1);
         this.upstream = upstream;
+        this.projections = List.copyOf(projections == null ? List.of() : projections);
         this.compiled = new ArrayList<>();
-        for (CaseProjection p : projections) {
+        for (CaseProjection p : this.projections) {
             compiled.add(CompiledCase.compile(p));
         }
     }
+
+    /** 原始 CASE / IF 投影定义（Planner 提取下推 / 诊断用）。 */
+    public List<CaseProjection> projections() { return projections; }
 
     /** 更新上游算子引用（列裁剪优化使用，须在 {@link #doOpen()} 前调用）。 */
     public void setUpstream(Operator upstream) { this.upstream = upstream; }

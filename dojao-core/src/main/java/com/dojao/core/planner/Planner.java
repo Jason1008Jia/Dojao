@@ -1249,8 +1249,7 @@ public final class Planner {
         if (ins.overwrite()) {
             return buildOverwriteInsert(ins);
         }
-        LogicalPlan.Select inner = asSelect(ins.query());
-        PhysicalNode innerRoot = buildQuery(inner, null);
+        PhysicalNode innerRoot = buildInnerQuery(ins.query());
         DojaoConnector connector = context.connectorProvider().get(ins.catalog());
 
         // 目标列名：列别名子句（INSERT INTO t(a,b)）优先，否则目标表全列（按序）。
@@ -1275,6 +1274,18 @@ public final class Planner {
                     "DistributedWrite[" + ins.catalog() + "." + ins.schema() + "." + ins.table() + "]",
                     dist, innerRoot.outputColumns(), innerRoot);
         }
+        // 分布式写 + 顶层投影：`Project / ScalarProject / Filter` 包在分布式算子之上时，把投影
+        // （143 个 get_json_object 等）也下推到归属 Worker，在本地算完直接写走 —— 数据不回 Master。
+        DistributedSinkShape projectedWrite = detectDistributedSink(innerRoot);
+        if (projectedWrite != null) {
+            projectedWrite.target().setSink(new FragmentSpec.SinkStep(
+                    ins.catalog(), ins.schema(), ins.table(), targetColumns,
+                    toScanProjection(projectedWrite)));
+            return new PhysicalNode(
+                    "DistributedWrite[" + ins.catalog() + "." + ins.schema() + "." + ins.table()
+                            + ", worker-projection]",
+                    projectedWrite.target(), projectedWrite.outputColumns(), projectedWrite.source());
+        }
         // scan-sink 门控：内层 = 纯分布式扫描（可带一层列/表达式投影）。分片在各自 Worker 本地
         // 投影后直接写目标表（get_json_object 等重表达式随数据所在节点并行求值），数据页不回 Master。
         ScanSinkShape scanShape = detectScanSink(innerRoot);
@@ -1283,6 +1294,16 @@ public final class Planner {
             return new PhysicalNode(
                     "DistributedWrite[" + ins.catalog() + "." + ins.schema() + "." + ins.table() + "]",
                     scanShape.scan(), innerRoot.outputColumns(), innerRoot);
+        }
+        // UNION ALL 之上写：每条腿各自挂 sink（数据不回 Master）。UNION ALL 只是拼接，
+        // 各腿输出列数量/顺序一致即可按位置写入；任一条腿不能下推 → 回退 Master。
+        DistributedUnionAllOperator unionAll = buildUnionAllSink(innerRoot);
+        if (unionAll != null) {
+            unionAll.setSink(ins.catalog(), ins.schema(), ins.table(), targetColumns);
+            return new PhysicalNode(
+                    "DistributedUnionAll[" + ins.catalog() + "." + ins.schema() + "." + ins.table()
+                            + ", legs=" + unionAll.legNames().size() + "]",
+                    unionAll, innerRoot.outputColumns(), innerRoot);
         }
         // 否则回退：Master 侧 TableSinkOperator 逐页写出（含标量投影 / 列重排 / CASE 派生等非分布式包装，
         // v1 暂不下推投影描述）
@@ -1294,6 +1315,160 @@ public final class Planner {
         return new PhysicalNode(
                 "TableSink[INSERT " + ins.catalog() + "." + ins.schema() + "." + ins.table() + "]",
                 sink, innerRoot.outputColumns(), innerRoot);
+    }
+
+    /**
+     * 写入语句（INSERT / CTAS）的内层查询：{@code SELECT} 走 {@link #buildQuery}，
+     * {@code UNION / UNION ALL} 走 {@link #buildSetOperation}（否则顶层出现集合运算就无法再下推）。
+     */
+    private PhysicalNode buildInnerQuery(LogicalPlan query) {
+        if (query instanceof LogicalPlan.Select s) return buildQuery(s, null);
+        if (query instanceof LogicalPlan.SetOperation so) return buildSetOperation(so);
+        if (query instanceof LogicalPlan.Explain e) return buildInnerQuery(e.statement());
+        throw unsupported("写入语句的内层查询暂不支持: "
+                + (query == null ? "null" : query.getClass().getSimpleName()));
+    }
+
+    /** 分布式写 + 顶层投影的提取结果（{@code source} = 分布式算子节点，用于 PhysicalNode 来源追踪）。 */
+    private record DistributedSinkShape(AbstractDistributedOperator target, PhysicalNode source,
+                                        List<String> outputColumns, List<String> computedColumns,
+                                        List<GroupKeyExpression> expressions,
+                                        String filterAfterProjection,
+                                        List<FragmentSpec.ColumnRename> renames,
+                                        List<CaseProjection> caseProjections) {
+    }
+
+    /**
+     * 从 INSERT 的物理根向下剥离纯投影 / 过滤，找到可承载 sink 的 {@link AbstractDistributedOperator}。
+     *
+     * <p>只接受「最多一层 {@link ScalarProjectOperator}（表达式投影）+ 任意纯
+     * {@link ProjectOperator} + {@link FilterOperator}」这种常见形态；遇到 ColumnAlias、窗口算子
+     * 之外的未知包装就回退 Master，绝不猜。表达式引用的列必须都能在分布式算子输出里找到，
+     * 否则下推后 Worker 求值会缺列。</p>
+     */
+    private DistributedSinkShape detectDistributedSink(PhysicalNode root) {
+        if (root.operator() instanceof AbstractDistributedOperator) {
+            return null;   // 裸分布式算子：调用方的既有直连分支负责（无需投影描述）
+        }
+        ScalarProjectOperator scalar = null;
+        CaseProjectOperator caseOp = null;
+        List<String> filters = new ArrayList<>();
+        List<ProjectOperator.ColumnRef> topRefs = null;
+        boolean topProjectSeen = false;
+        PhysicalNode cur = root;
+        PhysicalNode distNode = null;
+        while (true) {
+            Operator op = cur.operator();
+            if (op instanceof AbstractDistributedOperator) {
+                distNode = cur;
+                break;
+            }
+            if (op instanceof ScalarProjectOperator sp) {
+                if (scalar != null) return null;   // 多层 ScalarProject 暂不支持
+                scalar = sp;
+            } else if (op instanceof CaseProjectOperator cp) {
+                if (caseOp != null) return null;   // 多层 CASE 投影暂不支持
+                caseOp = cp;
+            } else if (op instanceof ProjectOperator pj) {
+                // 纯列选择/重排，<b>改名投影</b>（SELECT a AS b / 派生表列改名）只允许出现在最外层
+                // 一层 —— Worker 最后按 ColumnRef 逐列改名，多层改名无法用一份描述表达。
+                if (!topProjectSeen) {
+                    topProjectSeen = true;
+                    topRefs = pj.refs();
+                } else if (pj.refs() != null) {
+                    return null;
+                }
+            } else if (op instanceof FilterOperator f) {
+                filters.add(SqlTextUtil.stripQualifiers(f.filterExpression()));
+            } else {
+                return null;   // 先别表/ CASE / 其它包装 → 不走 worker sink
+            }
+            if (cur.children().size() != 1) return null;
+            cur = cur.children().get(0);
+        }
+        if (distNode == null) return null;
+
+        List<String> out = root.outputColumns();
+        if (out == null || out.isEmpty() || out.contains("*")) return null;
+        Set<String> baseCols = new HashSet<>(distNode.outputColumns());
+
+        // 顶层改名投影：最终输出列取自 ScalarProject 输出列名（Worker 侧改名用）。
+        // 例：`customer_id_list AS customer_id` —— 143 列宽表里很常见，不建模就会误判「缺列」而回退 Master。
+        Map<String, ProjectOperator.ColumnRef> topRefByOutput = new LinkedHashMap<>();
+        if (topRefs != null) {
+            for (ProjectOperator.ColumnRef r : topRefs) topRefByOutput.putIfAbsent(r.outputName(), r);
+        }
+        Map<String, String> sourceOf = new LinkedHashMap<>();
+        Map<String, Integer> occurrenceOf = new HashMap<>();
+        List<FragmentSpec.ColumnRename> renames = new ArrayList<>();
+        for (String c : out) {
+            ProjectOperator.ColumnRef r = topRefs == null ? null : topRefByOutput.get(c);
+            if (topRefs != null && r == null) return null;   // 目标列不在改名清单里 → 描述不完整，回退
+            sourceOf.put(c, r == null ? c : r.sourceName());
+            occurrenceOf.put(c, r == null ? 1 : r.occurrence());
+            if (topRefs != null) {
+                renames.add(new FragmentSpec.ColumnRename(sourceOf.get(c), occurrenceOf.get(c), c));
+            }
+        }
+        // 全是「源列名 == 输出名且首次出现」→ 改名投影退化成纯列选择，走既有 outputColumns 路径
+        boolean renameNeeded = false;
+        for (FragmentSpec.ColumnRename r : renames) {
+            if (!r.sourceName().equals(r.outputName()) || r.occurrence() > 1) {
+                renameNeeded = true;
+                break;
+            }
+        }
+        if (!renameNeeded) renames = new ArrayList<>();
+        Set<String> wanted = new HashSet<>(sourceOf.values());
+
+        List<GroupKeyExpression> expressions = new ArrayList<>();
+        List<String> computed = new ArrayList<>();
+        if (scalar != null) {
+            for (ScalarProjectOperator.Projection p : scalar.projections()) {
+                if (!scalar.computedColumns().contains(p.outputName())) continue;
+                if (!wanted.contains(p.outputName())) continue;
+                String expr = SqlTextUtil.stripQualifiers(p.exprText());
+                Set<String> need = new LinkedHashSet<>();
+                collectExprColumns(expr, need);
+                if (!baseCols.containsAll(need)) return null;
+                expressions.add(new GroupKeyExpression(p.outputName(), expr));
+                computed.add(p.outputName());
+            }
+        }
+        // CASE / IF 派生列（行内条件投影）：Worker 在表达式投影之后求值，引用列必须都可得
+        List<CaseProjection> caseProjections = new ArrayList<>();
+        Set<String> caseCols = new HashSet<>();
+        if (caseOp != null) {
+            Set<String> available = new HashSet<>(baseCols);
+            available.addAll(computed);
+            for (CaseProjection c : caseOp.projections()) {
+                if (!wanted.contains(c.derivedColumn())) continue;
+                Set<String> need = new LinkedHashSet<>();
+                for (CaseProjection.CaseBranch br : c.branches()) {
+                    collectExprColumns(br.condition(), need);
+                    collectExprColumns(br.value(), need);
+                }
+                if (c.elseValue() != null) collectExprColumns(c.elseValue(), need);
+                if (!available.containsAll(need)) return null;
+                caseProjections.add(c);
+                caseCols.add(c.derivedColumn());
+            }
+        }
+        // 最终输出列：要么是表达式 / CASE 算出来的，要么直接来自分布式算子输出（按改名后的源列名判定）
+        for (String c : out) {
+            String s = sourceOf.get(c);
+            if (!computed.contains(s) && !caseCols.contains(s) && !baseCols.contains(s)) return null;
+        }
+        String filter = null;
+        if (!filters.isEmpty()) {
+            String cond = String.join(" AND ", filters);
+            for (String c : FilterOperator.referencedColumnsOf(cond)) {
+                if (!baseCols.contains(c) && !computed.contains(c) && !caseCols.contains(c)) return null;
+            }
+            filter = cond;
+        }
+        return new DistributedSinkShape((AbstractDistributedOperator) distNode.operator(), distNode,
+                out, computed, expressions, filter, renames, caseProjections);
     }
 
     /**
@@ -1319,8 +1494,7 @@ public final class Planner {
      * </ol>
      */
     private PhysicalNode buildOverwriteInsert(LogicalPlan.Insert ins) {
-        LogicalPlan.Select inner = asSelect(ins.query());
-        PhysicalNode innerRoot = buildQuery(inner, null);
+        PhysicalNode innerRoot = buildInnerQuery(ins.query());
         DojaoConnector connector = context.connectorProvider().get(ins.catalog());
         if (!(connector instanceof OverwriteEnable oe)) {
             throw unsupported("INSERT OVERWRITE 目标数据源不支持覆盖（连接器未实现 OverwriteEnable）: "
@@ -1372,7 +1546,50 @@ public final class Planner {
         // 非分布式内层（纯扫描 / 复杂投影 / VALUES）：Master 侧 TableSinkOperator 逐页写出，覆盖
         // 生命周期（begin → 每页写 staging → 全部写完 commit / 失败 abort）由算子编排 ——
         // 数据仍不回 Master 的分布式路径之外，这条是本轮放宽的兜底（原直接报「暂不支持」）。
-        if (!(innerRoot.operator() instanceof AbstractDistributedOperator dist)) {
+        // UNION ALL 之上写：各腿各自写 staging（数据不回 Master）。
+        DistributedUnionAllOperator unionAll = buildUnionAllSink(innerRoot);
+        if (unionAll != null) {
+            AtomicReference<String> staging = new AtomicReference<>();
+            final List<String> unionColumns = targetColumns;
+            Runnable prepare = () -> {
+                if (!connector.tableExists(ins.catalog(), ins.schema(), ins.table())) {
+                    throw new IllegalStateException("INSERT OVERWRITE 目标表不存在: "
+                            + ins.catalog() + "." + ins.schema() + "." + ins.table());
+                }
+                if (!oe.supportsOverwrite(ins.catalog(), ins.schema(), ins.table())) {
+                    throw new IllegalStateException("INSERT OVERWRITE 目标数据源权限不足，无法覆盖: "
+                            + ins.catalog() + "." + ins.schema() + "." + ins.table());
+                }
+                staging.set(oe.beginOverwrite(ins.catalog(), ins.schema(), ins.table()));
+                unionAll.setSink(ins.catalog(), ins.schema(), staging.get(), unionColumns);
+            };
+            Runnable success = () ->
+                    oe.commitOverwrite(ins.catalog(), ins.schema(), ins.table(), staging.get());
+            Runnable abort = () -> {
+                String s = staging.get();
+                if (s != null) oe.abortOverwrite(ins.catalog(), ins.schema(), ins.table(), s);
+            };
+            unionAll.setOverwriteLifecycle(prepare, success, abort);
+            return new PhysicalNode(
+                    "DistributedOverwrite[" + ins.catalog() + "." + ins.schema() + "." + ins.table()
+                            + ", union-all]",
+                    unionAll, innerRoot.outputColumns(), innerRoot);
+        }
+        DistributedSinkShape shape = detectDistributedSink(innerRoot);
+        AbstractDistributedOperator dist;
+        FragmentSpec.ScanProjection projection = null;
+        List<String> outCols;
+        PhysicalNode source;
+        if (shape != null) {
+            dist = shape.target();
+            projection = toScanProjection(shape);
+            outCols = shape.outputColumns();
+            source = shape.source();
+        } else if (innerRoot.operator() instanceof AbstractDistributedOperator d) {
+            dist = d;
+            outCols = innerRoot.outputColumns();
+            source = innerRoot;
+        } else {
             int writeParallelism = Math.max(1, context.parallelism());
             TableSinkOperator sink = new TableSinkOperator(
                     innerRoot.operator(), connector,
@@ -1388,6 +1605,8 @@ public final class Planner {
         AtomicReference<String> staging = new AtomicReference<>();
         // targetColumns 在 if/else 分支被重赋值 → 非 effectively-final，prepare 闭包须捕获 final 副本
         final List<String> sinkColumns = targetColumns;
+        final FragmentSpec.ScanProjection sinkProjection = projection;
+        final AbstractDistributedOperator sinkTarget = dist;
         Runnable prepare = () -> {
             if (!connector.tableExists(ins.catalog(), ins.schema(), ins.table())) {
                 throw new IllegalStateException("INSERT OVERWRITE 目标表不存在: "
@@ -1398,7 +1617,8 @@ public final class Planner {
                         + ins.catalog() + "." + ins.schema() + "." + ins.table());
             }
             staging.set(oe.beginOverwrite(ins.catalog(), ins.schema(), ins.table()));
-            dist.setSink(new FragmentSpec.SinkStep(ins.catalog(), ins.schema(), staging.get(), sinkColumns));
+            sinkTarget.setSink(new FragmentSpec.SinkStep(ins.catalog(), ins.schema(), staging.get(),
+                    sinkColumns, sinkProjection));
         };
         Runnable success = () ->
                 oe.commitOverwrite(ins.catalog(), ins.schema(), ins.table(), staging.get());
@@ -1408,8 +1628,9 @@ public final class Planner {
         };
         dist.setOverwriteLifecycle(prepare, success, abort);
         return new PhysicalNode(
-                "DistributedOverwrite[" + ins.catalog() + "." + ins.schema() + "." + ins.table() + "]",
-                dist, innerRoot.outputColumns(), innerRoot);
+                "DistributedOverwrite[" + ins.catalog() + "." + ins.schema() + "." + ins.table()
+                        + (shape != null ? ", worker-projection]" : "]"),
+                dist, outCols, source);
     }
 
     /**
@@ -1428,14 +1649,23 @@ public final class Planner {
             throw unsupported("CTAS 目标表须为全限定名 catalog.schema.table，实际: "
                     + String.join(".", qname));
         }
-        LogicalPlan.Select inner = asSelect(ctas.query());
-        PhysicalNode innerRoot = buildQuery(inner, null);
+        PhysicalNode innerRoot = buildInnerQuery(ctas.query());
         DojaoConnector connector = context.connectorProvider().get(catalog);
         // 分布式写门控（同 INSERT / INSERT OVERWRITE）：内层查询顶层就是分布式算子
         // （join / 聚合 / 窗口等 FragmentSpec 派发形态）→ 数据不回 Master，Master 只建表 + 收集行数
         if (innerRoot.operator() instanceof AbstractDistributedOperator dist) {
             return buildDistributedCreateTableAsSelect(ctas, innerRoot, connector,
                     catalog, schema, table, dist);
+        }
+        // 分布式算子 + 顶层 Project/ScalarProject/Filter：投影随 SinkStep 下推 Worker
+        DistributedSinkShape projected = detectDistributedSink(innerRoot);
+        if (projected != null) {
+            PhysicalNode node = buildDistributedProjectionCreateTableAsSelect(
+                    ctas, connector, catalog, schema, table, projected);
+            if (node != null) {
+                return node;
+            }
+            // 类型推导不出 → 继续走下面的 scan-sink / Master 回退（CTAS 不猜类型）。
         }
         // scan-sink 门控（纯扫描 + 投影）：类型推导成功才下沉，否则回退下面 Master 写路径
         ScanSinkShape scanShape = detectScanSink(innerRoot);
@@ -1444,6 +1674,16 @@ public final class Planner {
                     catalog, schema, table, scanShape);
             if (scanSink != null) {
                 return scanSink;
+            }
+        }
+        // UNION ALL 之上 CTAS：各腿各写各的。目标表列必须能从<b>每条腿</b>静态推导且逐列类型一致，
+        // 推不出 / 不一致 → 回退下面 Master 写路径（建表绝不猜类型）。
+        List<UnionAllLegPlan> unionLegs = collectUnionAllLegPlans(innerRoot);
+        if (unionLegs != null) {
+            PhysicalNode unionCtas = buildUnionAllCreateTableAsSelect(ctas, innerRoot, connector,
+                    catalog, schema, table, unionLegs);
+            if (unionCtas != null) {
+                return unionCtas;
             }
         }
         // 写并行度 = 上游扫描并行度（硬约束：上游多少 写入时就多少）
@@ -1526,6 +1766,110 @@ public final class Planner {
                 dist, innerRoot.outputColumns(), innerRoot);
     }
 
+    /**
+     * CTAS 分布式 + 顶层投影：目标表列由「基座分布式算子输出字段 + 投影表达式静态类型」推导；
+     * 推导不出任一列 → 返回 null，调用方回退 Master（绝不猜类型建表）。
+     */
+    private PhysicalNode buildDistributedProjectionCreateTableAsSelect(
+            LogicalPlan.CreateTableAsSelect ctas, DojaoConnector connector,
+            String catalog, String schema, String table, DistributedSinkShape shape) {
+        List<Field> fields = inferProjectionFields(shape.target().outputFields(),
+                shape.outputColumns(), shape.computedColumns(), shape.expressions(), shape.renames());
+        if (fields == null || fields.isEmpty()) return null;
+        List<String> targetColumns = null;
+        if (ctas.columnAliases().isPresent()) {
+            List<String> aliases = ctas.columnAliases().get();
+            if (aliases.size() != fields.size()) {
+                throw unsupported("CTAS 列别名数量与输出列不一致: 别名 " + aliases.size()
+                        + "，输出列 " + fields.size());
+            }
+            List<Field> renamed = new ArrayList<>(fields.size());
+            for (int i = 0; i < fields.size(); i++) {
+                Field f = fields.get(i);
+                renamed.add(new Field(aliases.get(i), f.getFieldType(), f.getChildren()));
+            }
+            fields = renamed;
+            targetColumns = new ArrayList<>(aliases);
+        }
+        final List<Field> ctasFields = fields;
+        final List<String> ctasTargetColumns = targetColumns;
+        final FragmentSpec.ScanProjection projection = toScanProjection(shape);
+        AtomicBoolean created = new AtomicBoolean();
+        Runnable prepare = () -> {
+            boolean c = connector.createTable(catalog, schema, table, ctasFields, ctas.ifNotExists());
+            created.set(c);
+            shape.target().setSink(new FragmentSpec.SinkStep(
+                    catalog, schema, table, ctasTargetColumns, projection));
+            if (!c) shape.target().skipDispatch();
+        };
+        Runnable success = () -> { };
+        Runnable abort = () -> {
+            if (created.get()) {
+                try { connector.dropTable(catalog, schema, table); } catch (Throwable ignored) { }
+            }
+        };
+        shape.target().setOverwriteLifecycle(prepare, success, abort);
+        return new PhysicalNode(
+                "DistributedCTAS[" + catalog + "." + schema + "." + table + ", worker-projection]",
+                shape.target(), shape.outputColumns(), shape.source());
+    }
+
+    /** 按「基座输出字段 + 投影表达式静态类型」推导 CTAS 目标列；任一列推不出返回 null。 */
+    private List<Field> inferProjectionFields(List<Field> baseFields, List<String> outputColumns,
+                                              List<String> computedColumns,
+                                              List<GroupKeyExpression> expressions,
+                                              List<FragmentSpec.ColumnRename> renames) {
+        if (baseFields == null || baseFields.isEmpty() || outputColumns == null) return null;
+        Map<String, Field> byName = new LinkedHashMap<>();
+        Map<String, Field> lower = new HashMap<>();
+        for (Field f : baseFields) {
+            byName.putIfAbsent(f.getName(), f);
+            lower.putIfAbsent(f.getName().toLowerCase(Locale.ROOT), f);
+        }
+        Map<String, String> exprByColumn = new LinkedHashMap<>();
+        Set<String> computed = new HashSet<>(computedColumns == null ? List.of() : computedColumns);
+        if (expressions != null) {
+            for (GroupKeyExpression g : expressions) exprByColumn.put(g.derivedColumn(), g.exprText());
+        }
+        // 改名投影（SELECT a AS b）：类型取源列，输出名取最终列名
+        Map<String, String> sourceOf = new LinkedHashMap<>();
+        if (renames != null) {
+            for (FragmentSpec.ColumnRename r : renames) sourceOf.put(r.outputName(), r.sourceName());
+        }
+        List<Field> out = new ArrayList<>(outputColumns.size());
+        for (String col : outputColumns) {
+            String source = sourceOf.getOrDefault(col, col);
+            Field src = byName.get(source) != null ? byName.get(source)
+                    : lower.get(source.toLowerCase(Locale.ROOT));
+            if (computed.contains(source)) {
+                String expr = exprByColumn.get(source);
+                if (expr == null) return null;
+                ExprNode node;
+                try {
+                    node = ExprParser.parse(expr);
+                } catch (RuntimeException e) {
+                    return null;
+                }
+                ArrowType t = ExprTypeInference.infer(node, byName);
+                if (t == null) return null;
+                boolean nullable = src == null || src.isNullable();
+                out.add(ExprTypeInference.toField(col, t, nullable));
+            } else {
+                if (src == null) return null;
+                out.add(col.equals(src.getName()) ? src
+                        : new Field(col, src.getFieldType(), src.getChildren()));
+            }
+        }
+        return out;
+    }
+
+    /** {@link DistributedSinkShape} → 控制端 / Worker 使用的投影描述。 */
+    private static FragmentSpec.ScanProjection toScanProjection(DistributedSinkShape shape) {
+        return new FragmentSpec.ScanProjection(shape.outputColumns(), shape.computedColumns(),
+                shape.expressions(), shape.filterAfterProjection(), shape.renames(),
+                shape.caseProjections());
+    }
+
     // ==================== 扫描分片就地写（scan-sink：纯扫描 + 投影） ====================
 
     /**
@@ -1548,25 +1892,57 @@ public final class Planner {
      * <p>返回 null = 非此形态 / 带截断下推（LIMIT 会让分区只产出候选集，与整表写入语义冲突）。</p>
      */
     private ScanSinkShape detectScanSink(PhysicalNode innerRoot) {
-        Operator op = innerRoot.operator();
+        PhysicalNode cur = innerRoot;
+        // 先摘投影**之后**的谓词（可引用计算列 / 改名列），worker 投影后过滤
+        List<String> afterProjection = new ArrayList<>();
+        while (cur.operator() instanceof FilterOperator f && cur.children().size() == 1) {
+            afterProjection.add(SqlTextUtil.stripQualifiers(f.filterExpression()));
+            cur = cur.children().get(0);
+        }
+        Operator op = cur.operator();
         DistributedScanOperator scan;
         FragmentSpec.ScanProjection projection = null;
-        List<String> outCols = innerRoot.outputColumns();
+        List<String> outCols = cur.outputColumns();
+        // 摘下投影 / 扫描本体；投影**之下**的谓词能直接下推到扫描侧引擎过滤（扫描页含全部源列）
+        List<String> preProjection = new ArrayList<>();
         if (op instanceof DistributedScanOperator ds) {
             scan = ds;
-        } else if (op instanceof ScalarProjectOperator sp
-                && sp.upstream() instanceof DistributedScanOperator ds) {
+        } else if (op instanceof ScalarProjectOperator || op instanceof ProjectOperator) {
+            PhysicalNode below = cur.children().isEmpty() ? null : cur.children().get(0);
+            while (below != null && below.operator() instanceof FilterOperator f
+                    && below.children().size() == 1) {
+                preProjection.add(SqlTextUtil.stripQualifiers(f.filterExpression()));
+                below = below.children().get(0);
+            }
+            if (below == null || !(below.operator() instanceof DistributedScanOperator ds)) {
+                return null;
+            }
             scan = ds;
-            List<GroupKeyExpression> exprs = sp.projections().stream()
-                    .map(p -> new GroupKeyExpression(p.outputName(), p.exprText())).toList();
-            projection = new FragmentSpec.ScanProjection(sp.outputColumns(),
-                    List.copyOf(sp.computedColumns()), exprs);
-            outCols = sp.outputColumns();
-        } else if (op instanceof ProjectOperator p && !p.isAliased()
-                && p.upstream() instanceof DistributedScanOperator ds) {
-            scan = ds;
-            projection = new FragmentSpec.ScanProjection(p.columns(), List.of(), List.of());
-            outCols = p.columns();
+            if (op instanceof ScalarProjectOperator sp2) {
+                List<GroupKeyExpression> exprs = sp2.projections().stream()
+                        .map(p -> new GroupKeyExpression(p.outputName(), p.exprText())).toList();
+                projection = new FragmentSpec.ScanProjection(sp2.outputColumns(),
+                        List.copyOf(sp2.computedColumns()), exprs);
+                outCols = sp2.outputColumns();
+            } else {
+                ProjectOperator p = (ProjectOperator) op;
+                if (p.refs() != null) {
+                    // 改名投影（SELECT a AS b / 派生表列改名）：按 ColumnRef 逐列改名
+                    List<FragmentSpec.ColumnRename> renames = new ArrayList<>(p.refs().size());
+                    List<String> outs = new ArrayList<>(p.refs().size());
+                    for (ProjectOperator.ColumnRef r : p.refs()) {
+                        renames.add(new FragmentSpec.ColumnRename(r.sourceName(), r.occurrence(),
+                                r.outputName()));
+                        outs.add(r.outputName());
+                    }
+                    projection = new FragmentSpec.ScanProjection(outs, List.of(), List.of(), null,
+                            renames);
+                    outCols = outs;
+                } else {
+                    projection = new FragmentSpec.ScanProjection(p.columns(), List.of(), List.of());
+                    outCols = p.columns();
+                }
+            }
         } else {
             return null;
         }
@@ -1574,12 +1950,30 @@ public final class Planner {
         if (scan.hasTruncation()) {
             return null;
         }
+        if (!preProjection.isEmpty()) {
+            // 扫描侧引擎过滤（与 WHERE 走同一个 openWithEngineFilter 通道）
+            scan.pushdown(preProjection);
+        }
+        if (!afterProjection.isEmpty()) {
+            String filter = String.join(" AND ", afterProjection);
+            FragmentSpec.ScanProjection base = projection == null
+                    ? new FragmentSpec.ScanProjection(List.of(), List.of(), List.of())
+                    : projection;
+            projection = new FragmentSpec.ScanProjection(base.outputColumns(),
+                    base.computedColumns(), base.expressions(), filter, base.renames(),
+                    base.caseProjections());
+        }
         // 列裁剪：只读投影引用的列 + 引擎谓词引用的列（空 = 连接器语义读全表）
         if (projection != null) {
             Set<String> need = new LinkedHashSet<>();
             Set<String> computed = new HashSet<>(projection.computedColumns());
-            for (String c : projection.outputColumns()) {
-                if (!computed.contains(c)) need.add(c);
+            if (projection.hasRenames()) {
+                // 改名投影：扫描侧要读的是**源列**（outputColumns 是改名后的名字）
+                for (FragmentSpec.ColumnRename r : projection.renames()) need.add(r.sourceName());
+            } else {
+                for (String c : projection.outputColumns()) {
+                    if (!computed.contains(c)) need.add(c);
+                }
             }
             for (GroupKeyExpression g : projection.expressions()) {
                 collectExprColumns(g.exprText(), need);
@@ -1592,6 +1986,181 @@ public final class Planner {
             }
         }
         return new ScanSinkShape(scan, projection, outCols);
+    }
+
+    /**
+     * 一条 UNION ALL 写腿的提取结果：{@code target} 是真正执行写的算子，{@code projection}
+     * 是它自己的 sink 投影（null = 裸算子按输出列写）；{@code distributedShape / scanShape}
+     * 保留投影形态，供 CTAS 静态推导目标表列（按腿形态恰有一个非空）。
+     */
+    private record UnionAllLegPlan(Operator target, FragmentSpec.ScanProjection projection,
+                                   DistributedSinkShape distributedShape, ScanSinkShape scanShape) {
+    }
+
+    /**
+     * {@code UNION ALL} 之上写：每条腿各自下推 sink（数据不回 Master）。腿可以是
+     * ① 裸分布式算子；② Project / ScalarProject / CASE / Filter 包在分布式算子上；③ 分布式扫描（scan-sink）。
+     *
+     * <p>只接受<b>纯拼接</b>形态（{@link UnionAllOperator#identityConcat()}）：CUBE / GROUPING SETS
+     * 改写的多腿 UNION 各腿只输出规范列的子序列、缺列由 UnionAll 运行期补 typed NULL，直接拆腿会
+     * 静默错列。嵌套的纯拼接 UNION ALL（{@code A UNION ALL B UNION ALL C} 的二叉计划）递归展平成
+     * N 条腿，省掉中间拼接层。</p>
+     *
+     * <p>任一条腿不满足 → 返回 {@code null}（整体回退 Master），绝不「半下推」—— 否则会写一半数据。</p>
+     */
+    private DistributedUnionAllOperator buildUnionAllSink(PhysicalNode innerRoot) {
+        List<UnionAllLegPlan> plans = collectUnionAllLegPlans(innerRoot);
+        if (plans == null) return null;
+        List<DistributedUnionAllOperator.Leg> legs = new ArrayList<>(plans.size());
+        for (UnionAllLegPlan p : plans) {
+            if (p.scanShape() != null && p.scanShape().projection() != null) {
+                p.scanShape().scan().setProjection(p.scanShape().projection());
+            }
+            legs.add(new DistributedUnionAllOperator.Leg(p.target(), p.projection()));
+        }
+        return new DistributedUnionAllOperator(legs);
+    }
+
+    /**
+     * 把 UNION ALL 写计划的腿收集成扁平列表（嵌套纯拼接递归展平）。任一腿不支持下推 /
+     * 遇非纯拼接 UNION（CUBE 多腿）→ 返回 null，调用方整体回退 Master。
+     */
+    private List<UnionAllLegPlan> collectUnionAllLegPlans(PhysicalNode innerRoot) {
+        if (!(innerRoot.operator() instanceof UnionAllOperator union) || !union.identityConcat()) {
+            return null;
+        }
+        List<UnionAllLegPlan> legs = new ArrayList<>();
+        if (!collectUnionAllLegPlans(innerRoot, innerRoot.outputColumns().size(), legs)) return null;
+        return legs.isEmpty() ? null : legs;
+    }
+
+    private boolean collectUnionAllLegPlans(PhysicalNode node, int columns, List<UnionAllLegPlan> out) {
+        for (PhysicalNode legNode : node.children()) {
+            if (legNode.outputColumns().size() != columns) return false;
+            if (legNode.operator() instanceof UnionAllOperator inner) {
+                // 嵌套 UNION ALL：仅纯拼接可展平；CUBE / GROUPING SETS 的补 NULL 腿必须留给
+                // UnionAllOperator 运行期对齐（拆腿会写错列），整体回退 Master。
+                if (!inner.identityConcat()) return false;
+                if (!collectUnionAllLegPlans(legNode, columns, out)) return false;
+                continue;
+            }
+            if (legNode.operator() instanceof AbstractDistributedOperator d) {
+                out.add(new UnionAllLegPlan(d, null, null, null));
+                continue;
+            }
+            DistributedSinkShape shape = detectDistributedSink(legNode);
+            if (shape != null) {
+                out.add(new UnionAllLegPlan(shape.target(), toScanProjection(shape), shape, null));
+                continue;
+            }
+            ScanSinkShape scanShape = detectScanSink(legNode);
+            if (scanShape == null) return false;
+            out.add(new UnionAllLegPlan(scanShape.scan(), null, null, scanShape));
+        }
+        return true;
+    }
+
+    /**
+     * CTAS + UNION ALL：目标表列由各腿静态推导、逐列要求类型<b>完全一致</b>（不做提升 ——
+     * 建表类型一旦猜错，Worker 写回会静默错值或直接失败）。任一腿推不出 / 类型不一致 → null，
+     * 调用方回退 Master 写路径。
+     *
+     * <p>腿的输出列名可能互不相同（UNION 结果列名取首个操作数），故建表后按<b>位置</b>绑定
+     * （{@code targetColumns} = 规范列名），不依赖各腿页列名。</p>
+     */
+    private PhysicalNode buildUnionAllCreateTableAsSelect(LogicalPlan.CreateTableAsSelect ctas,
+                                                          PhysicalNode innerRoot,
+                                                          DojaoConnector connector,
+                                                          String catalog, String schema, String table,
+                                                          List<UnionAllLegPlan> legPlans) {
+        List<String> outCols = innerRoot.outputColumns();
+        List<Field> fields = inferUnionAllFields(legPlans, outCols);
+        if (fields == null || fields.isEmpty()) {
+            System.err.println("[Planner] CTAS UNION ALL 目标表列类型无法静态推导，回退 Master 写路径: "
+                    + catalog + "." + schema + "." + table);
+            return null;
+        }
+        List<String> targetColumns = new ArrayList<>(outCols);
+        if (ctas.columnAliases().isPresent()) {
+            List<String> aliases = ctas.columnAliases().get();
+            if (aliases.size() != fields.size()) {
+                throw unsupported("CTAS 列别名数量与输出列不一致: 别名 " + aliases.size()
+                        + "，输出列 " + fields.size());
+            }
+            List<Field> renamed = new ArrayList<>(fields.size());
+            for (int i = 0; i < fields.size(); i++) {
+                Field f = fields.get(i);
+                renamed.add(new Field(aliases.get(i), f.getFieldType(), f.getChildren()));
+            }
+            fields = renamed;
+            targetColumns = new ArrayList<>(aliases);
+        }
+        // 提交分布式形态时才挂扫描腿投影 / 输出列（推导失败回退 Master 时不改动计划的其余部分）
+        List<DistributedUnionAllOperator.Leg> legs = new ArrayList<>(legPlans.size());
+        for (UnionAllLegPlan p : legPlans) {
+            if (p.scanShape() != null) {
+                p.scanShape().scan().setProjection(p.scanShape().projection());
+            }
+            legs.add(new DistributedUnionAllOperator.Leg(p.target(), p.projection()));
+        }
+        DistributedUnionAllOperator unionAll = new DistributedUnionAllOperator(legs);
+        final List<Field> ctasFields = fields;
+        final List<String> ctasTargetColumns = targetColumns;
+        AtomicBoolean created = new AtomicBoolean();
+        Runnable prepare = () -> {
+            boolean c = connector.createTable(catalog, schema, table, ctasFields, ctas.ifNotExists());
+            created.set(c);
+            unionAll.setSink(catalog, schema, table, ctasTargetColumns);
+            if (!c) unionAll.skipDispatch();   // 表已存在 → 不派发、rows=0（不触碰既有表）
+        };
+        Runnable success = () -> { };
+        Runnable abort = () -> {
+            if (created.get()) {
+                try { connector.dropTable(catalog, schema, table); }
+                catch (Throwable ignored) { }
+            }
+        };
+        unionAll.setOverwriteLifecycle(prepare, success, abort);
+        return new PhysicalNode(
+                "DistributedCTAS[" + catalog + "." + schema + "." + table + ", union-all]",
+                unionAll, outCols, innerRoot);
+    }
+
+    /** 各腿静态字段逐列取交集（类型必须完全一致）→ 规范列名；任一腿推不出 / 不一致返回 null。 */
+    private List<Field> inferUnionAllFields(List<UnionAllLegPlan> legPlans, List<String> outCols) {
+        if (outCols == null || outCols.isEmpty()) return null;
+        List<List<Field>> perLeg = new ArrayList<>(legPlans.size());
+        for (UnionAllLegPlan p : legPlans) {
+            List<Field> f;
+            if (p.distributedShape() != null) {
+                DistributedSinkShape s = p.distributedShape();
+                f = inferProjectionFields(s.target().outputFields(), s.outputColumns(),
+                        s.computedColumns(), s.expressions(), s.renames());
+            } else if (p.scanShape() != null) {
+                f = inferScanSinkFields(p.scanShape(),
+                        connectorFor(p.scanShape().scan().baseRequest().catalog()));
+            } else if (p.target() instanceof AbstractDistributedOperator d) {
+                f = d.outputFields();
+            } else {
+                return null;
+            }
+            if (f == null || f.size() != outCols.size()) return null;
+            perLeg.add(f);
+        }
+        List<Field> out = new ArrayList<>(outCols.size());
+        for (int i = 0; i < outCols.size(); i++) {
+            Field base = perLeg.get(0).get(i);
+            boolean nullable = base.isNullable();
+            for (int k = 1; k < perLeg.size(); k++) {
+                Field f = perLeg.get(k).get(i);
+                if (!base.getType().equals(f.getType())) return null;
+                nullable |= f.isNullable();
+            }
+            out.add(new Field(outCols.get(i),
+                    new FieldType(nullable, base.getType(), base.getDictionary(), base.getMetadata()),
+                    base.getChildren()));
+        }
+        return out;
     }
 
     /** 收集表达式文本引用的列（去限定符）—— 与 {@code ScalarProjectOperator} 两条求值路径同口径。 */
@@ -3238,8 +3807,15 @@ public final class Planner {
             case "avg" -> new Field(col, FieldType.nullable(
                     argType instanceof ArrowType.Decimal d ? AggregationSpec.widenDecimal(d) : fp), null);
             // MIN/MAX：与输入严格同型（数值保持 INT/FLOAT 原宽度，不再漂成 DOUBLE）
-            case "min", "max", "min_if", "max_if" ->
+            case "min", "max", "min_if", "max_if", "any", "any_value" ->
                     argType == null ? null : new Field(col, FieldType.nullable(argType), null);
+            // ARG_MAX / ARG_MIN：输出 = 第一个参数（value 列）的类型
+            case "arg_max", "arg_min" -> {
+                List<String> args = ScalarExpr.splitTopLevelComma(argText);
+                Field valF = args.isEmpty() ? null : baseFields.get(
+                        SqlTextUtil.stripQualifier(args.get(0).trim()).toLowerCase(Locale.ROOT));
+                yield valF == null ? null : new Field(col, valF.getFieldType(), valF.getChildren());
+            }
             // COLLECT_LIST / COLLECT_SET / ARRAY_AGG：list<输入类型>（子字段必须带上，ArrowType.List 不够）
             case "collect_list", "collect_set", "array_agg" -> {
                 if (arg == null) yield null;
@@ -7655,7 +8231,8 @@ public final class Planner {
         // 双输入聚合（collect_map / map_agg / collect_ordered_list）的参数是 "a, b[, flag]"，
         // 不能按单表达式解析 → 下面分支内解析
         boolean dualInputAgg = "COLLECT_MAP".equals(fn) || "MAP_AGG".equals(fn)
-                || "COLLECT_ORDERED_LIST".equals(fn);
+                || "COLLECT_ORDERED_LIST".equals(fn)
+                || "ARG_MAX".equals(fn) || "ARG_MIN".equals(fn);
         // 聚合参数：裸列名直接引用；CASE 表达式改写为派生列（CaseProject 预计算后聚合）
         String inputCol = (a.star() || dualInputAgg) ? null : resolveAggInput(argText, fn, upstream,
                 caseProjections, derivedCols);
@@ -7757,6 +8334,37 @@ public final class Planner {
                     }
                 }
                 yield AggregationSpec.collectOrderedList(valueCol, orderCol, outName, descending);
+            }
+            // ARG_MAX / ARG_MIN：组内按第二参数（order_key）取极值那一行的第一参数（value）。
+            case "ARG_MAX", "ARG_MIN" -> {
+                if (a.star()) {
+                    throw unsupported(fn + " 需要 (value, order_key) 列参数，不支持 *");
+                }
+                if (distinctAgg) {
+                    throw unsupported(fn + "(DISTINCT ...) 不支持：按序取值本身无去重语义");
+                }
+                List<String> args = ScalarExpr.splitTopLevelComma(argText);
+                if (args.size() != 2) {
+                    throw unsupported(fn + " 参数个数 " + args.size() + " 不对，应为 "
+                            + fn.toLowerCase(Locale.ROOT) + "(value, order_key)");
+                }
+                String valueCol = resolveAggInput(args.get(0).trim(), fn, upstream,
+                        caseProjections, derivedCols);
+                String orderCol = resolveAggInput(args.get(1).trim(), fn, upstream,
+                        caseProjections, derivedCols);
+                yield "ARG_MAX".equals(fn)
+                        ? AggregationSpec.argMax(valueCol, orderCol, outName)
+                        : AggregationSpec.argMin(valueCol, orderCol, outName);
+            }
+            // ANY / ANY_VALUE：组内任意一个非 NULL 值（输出类型 = 输入列类型）
+            case "ANY", "ANY_VALUE" -> {
+                if (a.star()) {
+                    throw unsupported(fn + " 需要列参数，不支持 *");
+                }
+                if (distinctAgg) {
+                    throw unsupported(fn + "(DISTINCT ...) 不支持：任意值本身无去重语义");
+                }
+                yield AggregationSpec.any(inputCol, outName);
             }
             default -> {
                 // 先查 collect-evaluate 型（CollectAggregateRegistry，框架攒值），再查增量型

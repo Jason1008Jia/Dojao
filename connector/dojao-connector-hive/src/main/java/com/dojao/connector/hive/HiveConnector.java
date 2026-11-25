@@ -176,6 +176,15 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
      */
     private static final String NESTED_MODE_KEY = "hive.nested.mode";
 
+    /**
+     * 写残留临时目录的清理阈值（分钟，catalog 属性 {@code catalog.hive.write.tmp.ttl.minutes}，默认 1440）。
+     *
+     * <p>正常写入的临时目录由会话收尾（{@code close}/{@code discard}）删除；但 Worker 进程被 kill /
+     * 机器重启时来不及收尾，{@code _dojao_tmp_*} 会永久留在表目录下。每次新建写会话时顺手清掉
+     * <b>超过阈值</b>的残留（不是本进程正在写的），0 = 关闭清理。</p>
+     */
+    private static final String TMP_TTL_KEY = "hive.write.tmp.ttl.minutes";
+
     private final String catalogName;
     private final HiveVersion version;
     private final HiveMetastore metastore;
@@ -280,6 +289,9 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
     /** 新建目录 / 文件的 HDFS 权限（catalog 属性可覆盖；默认对齐 Hive 的 umask 0002）。 */
     private final HiveWritePermissions writePermissions;
 
+    /** 写残留临时目录的清理阈值（毫秒）；{@code <= 0} = 不清理。见 {@link #TMP_TTL_KEY}。 */
+    private final long tmpTtlMillis;
+
     /** 慢操作告警阈值：低于它的步骤一声不吭，超过就报 —— 定位「读一个小查询为什么几十秒」用。 */
     private static final long SLOW_STEP_MS = 300L;
 
@@ -305,6 +317,11 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         // 按这个身份 newInstance 并缓存 —— 同 JVM 里多个 hive catalog 各用各的用户。
         this.hadoopUser = firstNonBlank(props.get("hadoop.user.name"), props.get("HADOOP_USER_NAME"));
         this.hadoopUgi = hadoopUser == null ? null : UserGroupInformation.createRemoteUser(hadoopUser);
+        // ★身份是权限问题的第一现场（分区目录属主 vs 写入身份）：catalog 装配时打一行，Master 与
+        // Worker 各自的日志里都能核对「载荷里的 hadoop.user.name 有没有真的生效」。
+        System.err.printf("[Hive] catalog=%s 写入身份=%s（%s）%n", catalogName,
+                hadoopUser != null ? hadoopUser : "进程默认用户",
+                hadoopUser != null ? "hadoop.user.name" : "未配置 hadoop.user.name / HADOOP_USER_NAME");
         this.metastore = new HiveMetastore(catalogName, uris, conf,
                 Boolean.parseBoolean(props.getOrDefault("hive.acid.read", "false")), version, hadoopUser);
         this.allocator = NodeMemory.shared().newChildAllocator("connector/hive", 0);
@@ -321,11 +338,32 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
         this.nestedNative = !"text".equalsIgnoreCase(
                 props.getOrDefault(NESTED_MODE_KEY, "native").trim());
         this.writePermissions = HiveWritePermissions.from(props);
+        this.tmpTtlMillis = resolveTmpTtl(props);
+    }
+
+    /** 残留临时目录 TTL（分钟，默认 24 小时）；非法值退回默认，{@code <=0} 表示关闭清理。 */
+    private static long resolveTmpTtl(Map<String, String> props) {
+        String raw = props.get(TMP_TTL_KEY);
+        long minutes = 1440L;
+        if (raw != null && !raw.isBlank()) {
+            try {
+                minutes = Long.parseLong(raw.trim());
+            } catch (NumberFormatException ignored) {
+                // 配置写错不该让 catalog 起不来：用默认值
+            }
+        }
+        return minutes <= 0 ? 0L : minutes * 60_000L;
     }
 
     public String getCatalogName() { return catalogName; }
     public HiveVersion getVersion() { return version; }
     public HiveMetastore getMetastore() { return metastore; }
+
+    /**
+     * 本 catalog 实际使用的 Hadoop 访问身份（{@code hadoop.user.name} 生效值）；{@code null} = 进程默认。
+     * 权限类问题（分区目录属主 / HMS 写校验）先核对它 —— 日志里 {@code [Hive] catalog=.. 写入身份=..} 同源。
+     */
+    public String effectiveUser() { return hadoopUser; }
 
     // ==================== Catalog 级别 ====================
 
@@ -1234,15 +1272,61 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
     }
 
     /**
+     * 放弃<b>当前线程</b>的写会话（Worker 片段失败 / 取消时由 {@code FragmentExecutor.runAndSink} 调）：
+     * <b>不</b>把临时目录搬进表目录、<b>不</b>提交事务，直接删掉 {@code _dojao_tmp_*} 临时目录。
+     *
+     * <p>与 {@link #closeWrite()} 的分工：正常写完 → {@code closeWrite()}（搬入 + 提交）；失败 / 取消 →
+     * {@code abortWrite()}（整片丢弃）。若走 close，被取消的片段会把半截数据静默追加进目标表 ——
+     * 这是比「丢数据」更坏的错。</p>
+     */
+    @Override
+    public void abortWrite() {
+        HiveWriteSession s = writeSessions.remove(Thread.currentThread());
+        if (s != null) discardQuietly(s, "abortWrite");
+    }
+
+    /**
      * 写语句整体收尾（Master 侧 {@code TableSinkOperator.doClose} 调，此时写线程都已停）：
      * 把本连接器里所有线程的会话都收掉。Worker 路径不走这里（各片段各收各的，见 {@link #closeWrite}）。
      */
     @Override
     public void finishWrite() {
-        closeWrite();
+        // 逐个收尾、失败不中断：一个会话搬失败不能把其余会话晾在临时目录里
+        //（那些数据本来已经写完，只是没搬进表目录 → 用户看到「部分数据凭空消失」）。
+        RuntimeException first = null;
         for (Thread t : new ArrayList<>(writeSessions.keySet())) {
             HiveWriteSession s = writeSessions.remove(t);
-            if (s != null) s.close();
+            if (s == null) continue;
+            try {
+                s.close();
+            } catch (RuntimeException e) {
+                if (first == null) first = e;
+                else first.addSuppressed(e);
+            }
+        }
+        if (first != null) throw first;
+    }
+
+    /**
+     * 放弃<b>所有线程</b>的写会话（Master 侧写语句中途失败时调）：删除各自的 {@code _dojao_tmp_*}
+     * 临时目录 / 回滚事务，<b>不搬入表目录</b> —— 失败的 INSERT 不该把已写出的前 N 页追加进目标表。
+     */
+    @Override
+    public void abortWriteAll() {
+        for (Thread t : new ArrayList<>(writeSessions.keySet())) {
+            HiveWriteSession s = writeSessions.remove(t);
+            if (s != null) discardQuietly(s, "abortWriteAll");
+        }
+    }
+
+    /** 丢弃会话并留一条可追溯日志（临时目录路径是排查残留的唯一线索）。 */
+    private static void discardQuietly(HiveWriteSession s, String why) {
+        String tmp = s.tempDirLocation();
+        try {
+            s.discard();
+            System.err.printf("[Hive] 放弃写会话（%s）：不提交半成品，临时目录 %s%n", why, tmp);
+        } catch (RuntimeException e) {
+            System.err.printf("[Hive] 放弃写会话失败（%s，临时目录 %s）：%s%n", why, tmp, e);
         }
     }
 
@@ -1319,15 +1403,23 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
     /** 取当前线程的写会话；没有就新建（并顺手清掉所属线程已死的旧会话）。 */
     private HiveWriteSession sessionFor(HiveTableMeta meta, String stagingDir) {
         Thread self = Thread.currentThread();
+        String key = targetKeyOf(meta, stagingDir);
         HiveWriteSession existing = writeSessions.get(self);
-        if (existing != null) return existing;
+        if (existing != null) {
+            if (existing.targetKey().equals(key)) return existing;
+            // 线程池复用：本线程上一次写的会话没被正常收尾（片段取消 / 异常），且目标已换
+            //（别的表 / 别的 staging）。此时绝不能复用 —— 那会把两次写入混进同一临时目录，
+            // 等新会话 close 时一起搬进新目标表。丢弃旧会话（删临时目录 / 回滚事务）后重建。
+            writeSessions.remove(self);
+            discardQuietly(existing, "写目标已切换");
+        }
 
         // 失败/取消残留的会话：所属线程已死，不会再有 close 调用 —— 丢弃（ACID 回滚事务）而不是
         // 把半截数据提交进去；顺带停掉心跳线程，避免悬挂事务被无限续命。
         for (Thread t : new ArrayList<>(writeSessions.keySet())) {
             if (t == self || t.isAlive()) continue;
             HiveWriteSession abandoned = writeSessions.remove(t);
-            if (abandoned != null) abandoned.discard();
+            if (abandoned != null) discardQuietly(abandoned, "所属线程已退出");
         }
         FileSystem fs = fsOf(meta.location());
         String tempDir;
@@ -1336,13 +1428,42 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
             tempDir = stagingDir;
             moveOnClose = false;
         } else {
+            cleanupStaleTempDirs(meta, fs);   // 进程被 kill 留下的临时目录：过期才清，尽力而为
             tempDir = new Path(new Path(meta.location()), HiveWriteSession.newTempDirName()).toString();
             moveOnClose = true;
         }
         HiveWriteSession created = new HiveWriteSession(conf, fs, meta, metastore, tempDir, moveOnClose,
-                nestedNativeFor(meta), writePermissions);
+                nestedNativeFor(meta), writePermissions, hadoopUser);
         HiveWriteSession raced = writeSessions.putIfAbsent(self, created);
         return raced != null ? raced : created;
+    }
+
+    /** 写入目标标识：会话复用时「同线程旧会话是否属于同一次写入」的判据。 */
+    private static String targetKeyOf(HiveTableMeta meta, String stagingDir) {
+        return meta.database() + "." + meta.table() + "|" + (stagingDir == null ? "" : stagingDir);
+    }
+
+    /**
+     * 清理表目录下<b>超过 TTL</b> 的 {@code _dojao_tmp_*} 残留目录（Worker 被 kill / 机器重启时
+     * 会话来不及收尾的产物）。只按修改时间判定，正在写的目录（mtime 一直在动）不会被误删；
+     * 清理失败（无权限 / 目录不存在）只记一笔，绝不影响本次写入。
+     */
+    private void cleanupStaleTempDirs(HiveTableMeta meta, FileSystem fs) {
+        if (tmpTtlMillis <= 0L) return;
+        long now = System.currentTimeMillis();
+        try {
+            for (FileStatus s : fs.listStatus(new Path(meta.location()))) {
+                String name = s.getPath().getName();
+                if (!s.isDirectory() || !name.startsWith(HiveWriteSession.TEMP_DIR_PREFIX)) continue;
+                if (now - s.getModificationTime() < tmpTtlMillis) continue;
+                if (fs.delete(s.getPath(), true)) {
+                    System.err.printf("[Hive] 清理残留写临时目录（超过 %d 分钟）：%s%n",
+                            tmpTtlMillis / 60_000L, s.getPath());
+                }
+            }
+        } catch (IOException e) {
+            // 目录刚被别处删掉 / 权限不足：下一次写入再试
+        }
     }
 
     // ==================== 建表 / 删表（CTAS） ====================

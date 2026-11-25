@@ -489,6 +489,25 @@ public class HiveMetastore implements AutoCloseable {
         }
     }
 
+    /**
+     * 已登记分区的物理位置；<b>未登记 / 查询失败返回 {@code null}</b>（不抛）。
+     *
+     * <p>用途：写入收尾前先判断分区是否已在 HMS 里 —— 已登记且位置一致就<b>不再
+     * {@code add_partition}</b>。Hive 的 {@code add_partition} 会对分区目录做一次
+     * <b>WRITE 权限校验</b>（以写入身份执行）；目录若是别的身份（如 HiveServer2 用户
+     * {@code jiaxin}）建的，即便本身份能把数据 rename 进去，校验也会
+     * {@code AccessControlException: Permission denied} 把整个写入收尾打挂 —— 而分区本来就在，
+     * 重复登记纯属多余。</p>
+     */
+    public synchronized String partitionLocation(String database, String table, List<String> values) {
+        try {
+            Partition p = client().getPartition(database, table, values);
+            return p == null || p.getSd() == null ? null : p.getSd().getLocation();
+        } catch (Exception e) {
+            return null;   // NoSuchObject（未登记）/ 查询失败：交给调用方走 add_partition，行为与改动前一致
+        }
+    }
+
     // ==================== 写元数据（CTAS / INSERT 用） ====================
     //
     // 以下方法均 synchronized：与读方法共用同一个非线程安全的 HiveMetaStoreClient。

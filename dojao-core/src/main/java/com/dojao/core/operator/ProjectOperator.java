@@ -118,8 +118,9 @@ public class ProjectOperator extends AbstractMeasurableOperator {
             FieldVector dst = out.createVector(allocator);
             dst.setInitialCapacity(rowCount);
             dst.allocateNew();
-            org.apache.arrow.vector.util.TransferPair tp = src.makeTransferPair(dst);
-            for (int i = 0; i < rowCount; i++) tp.copyValueSafe(i, i);
+            // ★整列批量拷贝（定长列 memcpy；变长列才逐行）：143 列宽表下逐行 copyValueSafe 是
+            //   2.7M 行 × 143 列 ≈ 3.9 亿次调用，实测占窗口 Phase 2 输出的可观比例。
+            RowAccumulator.copyColumnBatch(src, dst, 0, 0, rowCount);
             dst.setValueCount(rowCount);
             fields.add(out);
             vectors.add(dst);

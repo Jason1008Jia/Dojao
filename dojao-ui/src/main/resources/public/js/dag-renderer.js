@@ -350,7 +350,16 @@ function opLabel(op) {
             + '  avg ' + fmtRate(op.avgRowsPerSec));
         var mem = fmtBytes(op.currentMemBytes);
         var misc = fmtDuration(op.elapsedMs) + '  cpu ' + fmtDuration(op.cpuMs) + '  p=' + op.parallelism;
-        if (Number(op.spilledBytes) > 0) misc += '  spill ' + fmtBytes(op.spilledBytes);
+        var spilled = Number(op.spilledBytes) || 0;
+        var compaction = Number(op.compactionBytes) || 0;
+        if (spilled > 0) {
+            var first = Math.max(0, spilled - compaction);
+            misc += '  spill ' + fmtBytes(first);
+            if (compaction > 0) {
+                misc += '+重写 ' + fmtBytes(compaction)
+                    + (first > 0 ? '(' + (spilled / first).toFixed(1) + 'x)' : '');
+            }
+        }
         if (mem !== '0 B') misc += '  ' + mem;
         lines.push(misc);
         return lines.join('\n');

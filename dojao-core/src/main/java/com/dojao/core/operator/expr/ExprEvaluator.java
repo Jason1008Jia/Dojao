@@ -442,6 +442,27 @@ public final class ExprEvaluator {
     private static Object evalFuncCall(ExprNode.FuncCall f, VectorSchemaRoot root, int row,
                                        Map<String, Integer> indexOf) {
         String name = f.name().toLowerCase();
+        // ★宽表关键优化：同一行里 100+ 个 get_json_object(<同一列>, '$.x') 只解析一次 JSON。
+        //   旧实现每次调用都 Jackson readTree 同一段 8KB 文本 —— 2.7M 行 × 143 列 ≈ 3.9 亿次解析，
+        //   实测占 WindowSort Phase 2「流式读取输出」360s 里的绝大部分。
+        if ("get_json_object".equals(name) && f.args().size() == 2
+                && f.args().get(0) instanceof ExprNode.Column col) {
+            JsonRowCache cache = JSON_CACHE.get();
+            if (!cache.matches(root, row)) cache.reset(root, row);
+            com.fasterxml.jackson.databind.JsonNode node;
+            if (cache.nodes.containsKey(col.name())) {
+                node = cache.nodes.get(col.name());
+            } else {
+                Object raw = eval(f.args().get(0), root, row, indexOf);
+                node = com.dojao.core.function.scalar.string.StringFunctions.parseJson(
+                        raw == null ? null : com.dojao.core.function.scalar.ScalarSupport.string(raw));
+                cache.nodes.put(col.name(), node);
+            }
+            Object pathArg = eval(f.args().get(1), root, row, indexOf);
+            if (pathArg == null) return null;
+            return com.dojao.core.function.scalar.string.StringFunctions.jsonValue(
+                    node, com.dojao.core.function.scalar.ScalarSupport.string(pathArg));
+        }
         Object[] args = new Object[f.args().size()];
         for (int i = 0; i < args.length; i++) {
             args[i] = eval(f.args().get(i), root, row, indexOf);
@@ -451,6 +472,26 @@ public final class ExprEvaluator {
         }
         ScalarFunction fn = ScalarFunctionRegistry.resolve(name);
         return fn.evaluate(args);
+    }
+
+    /** 一行内 {@code get_json_object} 的 JSON 解析缓存（线程本地；页 / 行切换即失效）。 */
+    private static final ThreadLocal<JsonRowCache> JSON_CACHE =
+            ThreadLocal.withInitial(JsonRowCache::new);
+
+    private static final class JsonRowCache {
+        Object root;
+        int row = -1;
+        final Map<String, com.fasterxml.jackson.databind.JsonNode> nodes = new java.util.HashMap<>(4);
+
+        boolean matches(Object r, int rw) {
+            return root == r && row == rw;
+        }
+
+        void reset(Object newRoot, int newRow) {
+            root = newRoot;
+            row = newRow;
+            nodes.clear();
+        }
     }
 
     private static Object readColumn(VectorSchemaRoot root, int row, Map<String, Integer> indexOf, String name) {

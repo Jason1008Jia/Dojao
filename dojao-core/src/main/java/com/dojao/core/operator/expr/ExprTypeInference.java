@@ -99,6 +99,9 @@ public final class ExprTypeInference {
             case "coalesce", "nvl", "ifnull", "if_null", "greatest", "least" -> mergeAll(args, fields);
             case "if" -> args.size() == 3 ? mergeArgs(args.get(1), args.get(2), fields) : null;
             case "nullif" -> args.size() == 2 ? infer(args.get(0), fields) : null;
+            // 数值常用函数：abs 保持操作数数值类型；hash 恒 long（CryptoFunctions）。
+            case "abs" -> args.size() == 1 ? numericOperandType(args.get(0), fields) : null;
+            case "hash" -> INT64;
             // 结果恒为字符串的内置标量函数（ScalarEvaluator 按 Java String 结果建 Utf8 向量）：
             // CTAS scan-sink 需要据静态类型先建目标表，故在这里补全（其余函数仍返回 null → 回退）。
             case "get_json_object", "json_extract", "parse_url",

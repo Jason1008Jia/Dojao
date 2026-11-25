@@ -102,6 +102,16 @@ public record AggregationSpec(
     }
 
     /**
+     * 是否 {@code arg_max / arg_min}（双输入列：{@code inputColumn} = value、{@code valueColumn} = order_key；
+     * 输出类型 = value 列类型）。
+     */
+    public boolean isArgExtremum() {
+        if (aggregate == null) return false;
+        String name = aggregate.functionName();
+        return "arg_max".equals(name) || "arg_min".equals(name);
+    }
+
+    /**
      * 状态是否走「逐值溢写流」（collect_list / collect_set / collect_ordered_list / collect_map）：
      * 标量流里不占列。
      */
@@ -188,7 +198,8 @@ public record AggregationSpec(
         if (inputField != null && aggregate != null) {
             String name = aggregate.functionName();
             ArrowType t = inputField.getType();
-            if ("min".equals(name) || "max".equals(name)) {
+            if ("min".equals(name) || "max".equals(name) || "any".equals(name) || "any_value".equals(name)
+                    || isArgExtremum()) {
                 return t;
             }
             // ★SUM/AVG(DECIMAL) 必须输出 DECIMAL（不能退回 DOUBLE），否则累加结果带浮点尾差。
@@ -239,6 +250,26 @@ public record AggregationSpec(
 
     public static AggregationSpec max(String inputColumn, String outputColumn) {
         return new AggregationSpec(inputColumn, outputColumn, MaxAggregateFunction.INSTANCE);
+    }
+
+    /**
+     * ARG_MAX(value, order_key)：组内 order_key 最大的那一行的 value（输出类型 = value 列类型）。
+     * 双输入列：{@code inputColumn} = value、{@code valueColumn} = order_key。
+     */
+    public static AggregationSpec argMax(String valueColumn, String orderColumn, String outputColumn) {
+        return new AggregationSpec(valueColumn, outputColumn, ArgMaxAggregateFunction.INSTANCE,
+                null, List.of(), orderColumn, false);
+    }
+
+    /** ARG_MIN(value, order_key)：组内 order_key 最小的那一行的 value。 */
+    public static AggregationSpec argMin(String valueColumn, String orderColumn, String outputColumn) {
+        return new AggregationSpec(valueColumn, outputColumn, ArgMinAggregateFunction.INSTANCE,
+                null, List.of(), orderColumn, false);
+    }
+
+    /** ANY / ANY_VALUE：组内任意一个非 NULL 值（输出类型 = 输入列类型）。 */
+    public static AggregationSpec any(String inputColumn, String outputColumn) {
+        return new AggregationSpec(inputColumn, outputColumn, AnyAggregateFunction.INSTANCE);
     }
 
     /**

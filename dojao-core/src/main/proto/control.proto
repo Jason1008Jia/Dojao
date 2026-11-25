@@ -377,12 +377,27 @@ message SinkStepMsg {
   string schema = 2;
   string table = 3;
   repeated string target_columns = 4;
+  // 可选：Worker sink 前先执行的投影（复用 scan-sink 的 ScanProjection 描述）。
+  // 让「分布式 join/window/agg + 顶层表达式投影」的 INSERT 也能在归属 Worker 就地算完并写走，
+  // 数据不回 Master（2026-11-24）。
+  ScanProjectionMsg projection = 5;
 }
 
 // 扫描分片侧投影（scan-sink 就地写）：Worker 扫完切片后先投影（透传列按 output_columns 顺序
 // 组装，计算列由 expressions 求值），再写 SinkStepMsg 指定的目标表。expressions 为空 = 纯列投影
 // （ProjectOperator 语义），非空 = 标量表达式投影（ScalarProjectOperator 语义）。
+// 投影改名项（SELECT a AS b / 派生表列改名）：Worker 从上游页取第 occurrence 个 source_name，
+// 以 output_name 输出（同 ProjectOperator.ColumnRef 口径）。
+message ProjectRenameMsg {
+  string source_name = 1;
+  int32 occurrence = 2;
+  string output_name = 3;
+}
+
 message ScanProjectionMsg {
+  repeated ProjectRenameMsg renames = 5;
+  // 行内 CASE / IF 派生列（Worker 在表达式投影之后求值）
+  repeated CaseProjectionMsg case_projections = 6;
   repeated string output_columns = 1;                       // 最终输出列顺序
   repeated string computed_columns = 2;                     // 其中由表达式计算出的列名
   repeated GroupKeyExpressionMsg expressions = 3;           // 表达式列：derived_column = 输出列名
@@ -641,6 +656,12 @@ message QueryFragmentTelemetryMsg {
                              // 与 spilled_bytes 同帧：平均文件大小 = spilled_bytes / spill_files。
   int64 spill_triggers = 8;  // 该段累计溢写触发次数（分区缓冲槽满 → 提交一次溢写）；-1 = 无读数。
                              // 与 spill_files 分开：归并重写会写文件但不触发。
+  int64 compaction_bytes = 9; // spilled_bytes 中属于「归并重写」的部分；-1 = 无读数（旧 Worker）。
+                             // 首次溢写量 = spilled_bytes - compaction_bytes：前者是写盘吞吐，
+                             // 后者是多次归并的全量重写，两者差几倍时监控需能分开看（2026-11-24）。
+  int64 peak_disk_bytes = 10; // 该段溢写目录的峰值实际磁盘占用（Worker 遍历目录采样）；
+                             // -1 = 无读数。与累计写入量不同：归并删除旧文件后读数回落，
+                             // 峰值反映「任一时刻最多占了多少盘」，用户可拿 du 对照。
 }
 
 message QueryTelemetryGroup {

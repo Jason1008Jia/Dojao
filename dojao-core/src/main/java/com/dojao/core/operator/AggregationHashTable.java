@@ -304,7 +304,7 @@ public class AggregationHashTable extends RowHashTable implements Slot {
         FieldVector vec = root.getVector(inputColIndices[si]);
         // 双输入聚合（collect_map 的 key/value、collect_ordered_list 的 value/排序键）。
         // NULL 由聚合函数自身跳过。
-        if (specs[si].isCollectMap() || specs[si].isOrderedList()) {
+        if (specs[si].isCollectMap() || specs[si].isOrderedList() || specs[si].isArgExtremum()) {
             Object first = vec.isNull(row) ? null : vec.getObject(row);
             Object second = null;
             if (valueColIndices != null && valueColIndices[si] >= 0) {

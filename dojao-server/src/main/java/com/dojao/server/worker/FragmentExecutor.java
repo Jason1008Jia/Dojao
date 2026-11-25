@@ -28,9 +28,13 @@ import com.dojao.core.operator.ShuffleReader;
 import com.dojao.core.operator.SortMergeJoinOperator;
 import com.dojao.core.operator.WindowFilterConfig;
 import com.dojao.core.operator.WindowFunctionOperator;
+import com.dojao.core.operator.WindowFunctionSpec;
 import com.dojao.core.operator.WindowFunctionType;
 import com.dojao.core.operator.WindowSortOperator;
 import com.dojao.core.function.aggregate.AvgAggregateFunction;
+import com.dojao.core.function.aggregate.AnyAggregateFunction;
+import com.dojao.core.function.aggregate.ArgMaxAggregateFunction;
+import com.dojao.core.function.aggregate.ArgMinAggregateFunction;
 import com.dojao.core.function.aggregate.CollectListAggregateFunction;
 import com.dojao.core.function.aggregate.CollectOrderedListAggregateFunction;
 import com.dojao.core.function.aggregate.CollectSetAggregateFunction;
@@ -51,7 +55,9 @@ import com.dojao.spi.function.CollectAggregateRegistry;
 import org.apache.arrow.vector.types.pojo.Field;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.TimeUnit;
@@ -210,8 +216,12 @@ public final class FragmentExecutor {
         final OperatorStats stats = mo.getStats();
         // 溢写字节 + 文件数 + 触发次数同帧上报：平均文件大小（= 字节/文件数）是「阈值是否过低、
         // 是否小文件风暴」的直接判据，调参不能只看总量。
+        // 另带「归并重写字节」与「溢写目录峰值占用」：前者把首次溢写和重写放大分开（总量是写盘
+        // 吞吐，不是数据量），后者是实际目录遍历峰值（与 du 对得上）。采样走 supplier，
+        // 可溢写算子内部按 1s 节流，不会每拍都遍历目录。
         telemetry.trackSpill(queryId, fragmentId, stats::getSpilledBytes,
-                stats::getSpillFiles, stats::getSpillTriggers);
+                stats::getSpillFiles, stats::getSpillTriggers,
+                stats::getCompactionBytes, mo::sampleSpillDiskBytes);
     }
 
     /**
@@ -760,12 +770,28 @@ public final class FragmentExecutor {
         Operator aliased = applyJoinAliases(join, spec.join());
         // 同 key 零交换的窗口若键含表达式：join 输出上就地物化合成列（没有任何重分区发送端）
         Operator followUpInput = aliased;
-        if (spec.followUp() instanceof FragmentSpec.WindowStep w) {
-            followUpInput = applyComputed(aliased, w.computed());
+        FragmentSpec.WindowStep windowStep =
+                spec.followUp() instanceof FragmentSpec.WindowStep w ? w : null;
+        if (windowStep != null) {
+            followUpInput = applyComputed(aliased, windowStep.computed());
+        }
+        // ★P2：把「窗口之上的行内投影」提前到窗口之前 —— 窗口排序只排 143 个窄列，不再扛
+        //   raw_json_data（8 KB/行）。门控保守：窗口键无表达式、键都在投影输出里，否则原样执行。
+        FragmentSpec.SinkStep sinkStep = spec.sink();
+        if (windowStep != null && sinkStep != null
+                && canProjectBeforeWindow(sinkStep.projection(), windowStep)) {
+            followUpInput = new ExpressionProjectOperator(followUpInput,
+                    sinkStep.projection().expressions());
+            windowStep = withProjectedOutputs(windowStep, sinkStep.projection());
+            sinkStep = withoutExpressions(sinkStep);
+            System.err.printf("[P2] 窗口前投影下推 fragment=%s：%d 个表达式在窗口排序前求值，"
+                            + "窗口只排窄列%n", spec.fragmentId(), sinkStep.projection().computedColumns().size());
         }
         // 后续窗口 / 聚合接在 join 输出上：join 只产出本片段 own 桶的数据 ⇒ 下游桶数 = 两侧 own 桶的较大值
         int followUpBuckets = Math.max(spec.leftIn().ownedCount(), spec.rightIn().ownedCount());
-        Operator op = buildFollowUp(spec.fragmentId(), followUpInput, spec.followUp(), followUpBuckets);
+        // windowStep 可能被 P2 改写过（输出列对齐）；聚合链仍是原始 followUp（不能传 null）
+        FragmentSpec.FollowUp followUp = windowStep != null ? windowStep : spec.followUp();
+        Operator op = buildFollowUp(spec.fragmentId(), followUpInput, followUp, followUpBuckets);
         // 二级聚合（外层全局聚合下沉）：链式聚合输出上同 Worker 再聚一次，每分区 1 行 partial。
         if (spec.partialFollowUp() != null) {
             op = buildFollowUp(spec.fragmentId(), op, spec.partialFollowUp(), followUpBuckets);
@@ -824,8 +850,8 @@ public final class FragmentExecutor {
         trackJoinPartitions(joinStageId, join);   // Join 框 n 个分区任务的实时行数 / 字节 / 完成
         boolean ok = false;
         try {
-            if (spec.sink() != null) {
-                runAndSink(spec.fragmentId(), terminal, spec.sink(), resultQueue,
+            if (sinkStep != null) {
+                runAndSink(spec.fragmentId(), terminal, sinkStep, resultQueue,
                         () -> livenessProgress(() -> left.pagesReceived() + right.pagesReceived(), terminal));
             } else {
                 runAndStream(spec.fragmentId(), terminal, resultQueue,
@@ -1128,22 +1154,26 @@ public final class FragmentExecutor {
                 () -> progressCounter.getAsLong() + sunkRows.get(), lastEmitNanos, done);
         long rows = 0;
         boolean completed = false;
+        DojaoConnector conn = null;
         // 排障计时（纯日志）：把「上游产出（= 窗口 Phase 2 流式读取）」与「connector.write（Hive ORC 落盘）」
         // 分开累计 —— 若 writeMs ≫ nextMs，Phase 2 的慢就不是本算子读/归并，而是被下游 sink 背压拖住。
         long nextNanos = 0L;
         long writeNanos = 0L;
         final long sinkStartNanos = System.nanoTime();
+        // 分布式写 + 顶层投影：先在 Worker 本机算完 SELECT 投影（get_json_object 等）再写目标表，
+        // 数据页不回 Master（SinkStep.projection，规划期从 Project/ScalarProject 提取）。
+        Operator sinkOp = applySinkProjection(op, sink.projection());
         try {
             // 目标 catalog 未在本 Worker 注册 → IllegalStateException → FragmentFailed（明确报错）
-            DojaoConnector conn = provider.get(sink.catalog());
-            op.open();
+            conn = provider.get(sink.catalog());
+            sinkOp.open();
             while (true) {
                 // ★取消抬头：同 runAndStream。
                 if (Thread.currentThread().isInterrupted()) {
                     throw new CancellationException("fragment cancelled: " + fragmentId);
                 }
                 long t0 = System.nanoTime();
-                Page p = op.next();
+                Page p = sinkOp.next();
                 nextNanos += System.nanoTime() - t0;
                 if (p.isEOF()) break;
                 // 跳过 partition-end 标记页（无 Arrow root、零数据），只写真实数据页
@@ -1167,6 +1197,16 @@ public final class FragmentExecutor {
             if (Thread.currentThread().isInterrupted()) return;
             emitFailure(resultQueue, new FragmentEvent.FragmentFailed(fragmentId, fullStack(t)), t, 5);
         } finally {
+            // 失败 / 取消：绝不让已写出的半成品提交 —— Hive 走 abortWrite 删掉本片段的
+            // _dojao_tmp_* 临时目录（否则表目录下会堆一批空/半截目录，还会被复用线程的下一次
+            // 写会话接手，把两次写入混在一起搬进目标表）。
+            if (!completed && conn != null) {
+                try {
+                    conn.abortWrite();
+                } catch (Throwable t) {
+                    System.err.println("[SHUFFLE-PROF] 放弃写会话失败 taskId=" + fragmentId + "：" + t);
+                }
+            }
             System.err.printf("[SHUFFLE-PROF] sink 写完 taskId=%s：%d 行，op.next() %dms + connector.write %dms，总用时 %dms%n",
                     fragmentId, rows, nextNanos / 1_000_000, writeNanos / 1_000_000,
                     (System.nanoTime() - sinkStartNanos) / 1_000_000);
@@ -1174,7 +1214,7 @@ public final class FragmentExecutor {
             if (heartbeat != null) {
                 try { heartbeat.join(3_000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
             }
-            try { op.close(); } catch (Throwable ignored) { }
+            try { sinkOp.close(); } catch (Throwable ignored) { }
             // 同 runAndStream：终端写片段的溢写采样器收尾（未登记 → no-op）
             if (completed) {
                 finishTelemetry(fragmentId);
@@ -1182,6 +1222,91 @@ public final class FragmentExecutor {
                 untrack(fragmentId);
             }
         }
+    }
+
+    /**
+     * 能否把「窗口之上的行内投影」提前到窗口之前（P2）。门控保守，任一条不满足就保持原计划：
+     * <ul>
+     *   <li>有表达式（纯改名没有收益，也不必动）；</li>
+     *   <li>窗口键没有「表达式合成列」（{@code computed} 非空时不碰，避免两处物化口径打架）；</li>
+     *   <li>窗口的分区键 / 排序键都在投影输出列里（否则窗口会取不到键）。</li>
+     * </ul>
+     * 表达式引用的列由 Planner 侧 {@code detectDistributedSink} 已校验（都在分布式输出里），
+     * 而这里窗口输入正是 join 输出，故不再重复校验。
+     */
+    private static boolean canProjectBeforeWindow(FragmentSpec.ScanProjection projection,
+                                                  FragmentSpec.WindowStep window) {
+        if (projection == null || projection.expressions().isEmpty()) return false;
+        if (!window.computed().isEmpty()) return false;
+        Set<String> outputs = new HashSet<>(projection.outputColumns());
+        for (FragmentSpec.ColumnRename r : projection.renames()) outputs.add(r.outputName());
+        for (String key : window.partitionBy()) {
+            if (!outputs.contains(key)) return false;
+        }
+        for (String key : window.orderBy()) {
+            if (!outputs.contains(key)) return false;
+        }
+        return true;
+    }
+
+    /** 窗口声明输出 = 投影输出（**源列名**，改名留给 sink）+ 窗口函数列 —— 与提前投影后的实际 schema 对齐。 */
+    private static FragmentSpec.WindowStep withProjectedOutputs(FragmentSpec.WindowStep window,
+                                                                FragmentSpec.ScanProjection projection) {
+        List<String> outputs = new ArrayList<>();
+        if (projection.hasRenames()) {
+            for (FragmentSpec.ColumnRename r : projection.renames()) outputs.add(r.sourceName());
+        } else {
+            outputs.addAll(projection.outputColumns());
+        }
+        for (WindowFunctionSpec f : window.functions()) {
+            outputs.add(f.outputColumn());
+        }
+        return new FragmentSpec.WindowStep(window.partitionBy(), window.orderBy(), window.ascending(),
+                window.functions(), window.memoryLimit(), window.numPartitions(), window.filter(),
+                window.computed(), outputs);
+    }
+
+    /** 表达式已在窗口前算过 → sink 侧只保留「投影后谓词 + 改名/收窄」，避免重复求值。 */
+    private static FragmentSpec.SinkStep withoutExpressions(FragmentSpec.SinkStep sink) {
+        FragmentSpec.ScanProjection p = sink.projection();
+        if (p == null || p.expressions().isEmpty()) return sink;
+        return new FragmentSpec.SinkStep(sink.catalog(), sink.schema(), sink.table(),
+                sink.targetColumns(),
+                new FragmentSpec.ScanProjection(p.outputColumns(), p.computedColumns(), List.of(),
+                        p.filterAfterProjection(), p.renames()));
+    }
+
+    /**
+     * Worker sink 前套投影：表达式投影（get_json_object / from_str_to_array / json_array_explode 等）
+     * → 投影后谓词 → 最终输出列选择。语义与 scan-sink 的 {@code ScanProjection} 完全一致；
+     * {@code projection == null} 时原样返回（纯写算子输出列）。
+     */
+    private static Operator applySinkProjection(Operator op, FragmentSpec.ScanProjection projection) {
+        if (projection == null) return op;
+        Operator cur = op;
+        if (!projection.expressions().isEmpty()) {
+            cur = new ExpressionProjectOperator(cur, projection.expressions());
+        }
+        if (projection.hasCaseProjections()) {
+            cur = new CaseProjectOperator(cur, projection.caseProjections());
+        }
+        if (projection.hasFilterAfterProjection()) {
+            for (String cond : SqlTextUtil.splitConjuncts(projection.filterAfterProjection())) {
+                if (!cond.isBlank()) {
+                    cur = new FilterOperator(cur, cond);
+                }
+            }
+        }
+        if (projection.hasRenames()) {
+            List<ProjectOperator.ColumnRef> refs = new ArrayList<>(projection.renames().size());
+            for (FragmentSpec.ColumnRename r : projection.renames()) {
+                refs.add(new ProjectOperator.ColumnRef(r.sourceName(), r.occurrence(), r.outputName()));
+            }
+            cur = ProjectOperator.aliased(cur, refs);
+        } else if (projection.outputColumns() != null && !projection.outputColumns().isEmpty()) {
+            cur = new ProjectOperator(cur, projection.outputColumns());
+        }
+        return cur;
     }
 
     /**
@@ -1255,6 +1380,12 @@ public final class FragmentExecutor {
             return AggregationSpec.collectOrderedList(dto.inputColumn(), dto.valueColumn(),
                     dto.outputColumn(), dto.mapAppend());
         }
+        if ("arg_max".equalsIgnoreCase(dto.aggregateName())) {
+            return AggregationSpec.argMax(dto.inputColumn(), dto.valueColumn(), dto.outputColumn());
+        }
+        if ("arg_min".equalsIgnoreCase(dto.aggregateName())) {
+            return AggregationSpec.argMin(dto.inputColumn(), dto.valueColumn(), dto.outputColumn());
+        }
         return new AggregationSpec(dto.inputColumn(), dto.outputColumn(), aggregateFor(dto.aggregateName()));
     }
 
@@ -1275,6 +1406,9 @@ public final class FragmentExecutor {
             case "collect_list" -> CollectListAggregateFunction.INSTANCE;
             case "collect_set" -> CollectSetAggregateFunction.INSTANCE;
             case "collect_ordered_list" -> CollectOrderedListAggregateFunction.ASCENDING;
+            case "arg_max" -> ArgMaxAggregateFunction.INSTANCE;
+            case "arg_min" -> ArgMinAggregateFunction.INSTANCE;
+            case "any", "any_value" -> AnyAggregateFunction.INSTANCE;
             default -> null;
         };
         if (builtin != null) return builtin;

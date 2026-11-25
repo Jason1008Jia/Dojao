@@ -761,6 +761,9 @@ public class QueryServiceImpl {
             }
             if (distributedWrite) {
                 totalRows = ((AbstractDistributedOperator) op).totalOutputRows();
+            } else if (op instanceof com.dojao.core.operator.DistributedUnionAllOperator unionAll) {
+                // UNION ALL 之上写：各腿各写各的，行数 = 各腿写入行数之和
+                totalRows = unionAll.totalRows();
             } else if (op instanceof com.dojao.core.operator.DistributedScanOperator scan
                     && scan.hasSink()) {
                 // scan-sink（纯扫描+投影就地写）：数据页不回 Master，行数 = 各分区写入行数之和

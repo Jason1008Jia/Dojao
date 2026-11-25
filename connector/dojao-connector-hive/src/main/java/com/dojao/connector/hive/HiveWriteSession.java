@@ -129,6 +129,14 @@ final class HiveWriteSession implements AutoCloseable {
     private final String fileToken = UUID.randomUUID().toString().replace("-", "").substring(0, 8);
     private long fileSeq;
     private boolean closed;
+    /**
+     * 本次写入目标标识（{@code 库.表|staging目录}）—— 连接器据此识别「同线程的上一个会话属于别的写入目标」：
+     * 任务池复用线程时若不换会话，上一次被取消的写入会把这一次的数据一起搬进表目录。
+     */
+    private final String targetKey;
+
+    /** 本会话的 Hadoop 写入身份（catalog {@code hadoop.user.name} 生效值）；null = 进程默认。仅用于报错定位。 */
+    private final String writeUser;
 
     HiveWriteSession(Configuration conf, FileSystem fs, HiveTableMeta meta, HiveMetastore metastore,
                      String tempDirLocation, boolean moveOnClose) {
@@ -144,6 +152,12 @@ final class HiveWriteSession implements AutoCloseable {
     HiveWriteSession(Configuration conf, FileSystem fs, HiveTableMeta meta, HiveMetastore metastore,
                      String tempDirLocation, boolean moveOnClose, boolean nestedNative,
                      HiveWritePermissions permissions) {
+        this(conf, fs, meta, metastore, tempDirLocation, moveOnClose, nestedNative, permissions, null);
+    }
+
+    HiveWriteSession(Configuration conf, FileSystem fs, HiveTableMeta meta, HiveMetastore metastore,
+                     String tempDirLocation, boolean moveOnClose, boolean nestedNative,
+                     HiveWritePermissions permissions, String writeUser) {
         this.conf = conf;
         this.fs = fs;
         this.meta = meta;
@@ -152,6 +166,7 @@ final class HiveWriteSession implements AutoCloseable {
         this.moveOnClose = moveOnClose;
         this.nestedNative = nestedNative;
         this.permissions = permissions;
+        this.writeUser = writeUser;
         this.acid = meta.transactional();
         this.insertOnly = meta.insertOnly();
         this.dataColumnNames = new ArrayList<>();
@@ -159,10 +174,18 @@ final class HiveWriteSession implements AutoCloseable {
         this.partitionColumnNames = meta.partitionKeys();
         this.bucketColumnNames = meta.bucketCols();
         this.bucketColumnTypes = meta.bucketColumnTypes();
+        this.targetKey = meta.database() + "." + meta.table() + "|"
+                + (moveOnClose ? "" : tempDirLocation);
     }
 
+    /** 写入目标标识（见 {@link #targetKey}）—— 连接器用来判定「同线程旧会话是否还能复用」。 */
+    String targetKey() { return targetKey; }
+
+    /** 写临时目录前缀：关闭/放弃时删除，读路径按 {@code _} 前缀跳过，绝不被当作数据。 */
+    static final String TEMP_DIR_PREFIX = "_dojao_tmp_";
+
     static String newTempDirName() {
-        return "_dojao_tmp_" + UUID.randomUUID().toString().replace("-", "");
+        return TEMP_DIR_PREFIX + UUID.randomUUID().toString().replace("-", "");
     }
 
     String tempDirLocation() { return tempDir.toString(); }
@@ -369,7 +392,9 @@ final class HiveWriteSession implements AutoCloseable {
             moveIntoPlace();
         } catch (IOException | RuntimeException e) {
             if (acid) abortAcid();
-            throw new RuntimeException("Hive 写入收尾失败（临时目录 " + tempDir + "）", e);
+            // 把 cause 文本也拼进 message：收尾失败是「查询报成功但表里没数据」的直接原因，
+            // 日志若只留临时目录路径，现场根本看不出是 mv 失败、权限失败还是 HMS 登记失败。
+            throw new RuntimeException("Hive 写入收尾失败（临时目录 " + tempDir + "）: " + e, e);
         } finally {
             stopHeartbeat();
         }
@@ -390,7 +415,10 @@ final class HiveWriteSession implements AutoCloseable {
         writers.clear();
         if (acid) {
             abortAcid();
-        } else {
+        } else if (moveOnClose) {
+            // 只有本会话自己建的临时目录才归本会话删。staging（INSERT OVERWRITE）目录是<b>全查询共享</b>的：
+            // 单个片段失败就把它删掉，会让正在写的兄弟片段报「目录不存在」，清理统一交给 Master 的
+            // abortOverwrite（或 TTL 残留清理）—— 本片段只保证不把自己的半成品搬进去。
             try {
                 fs.delete(tempDir, true);
             } catch (IOException ignored) {
@@ -539,8 +567,14 @@ final class HiveWriteSession implements AutoCloseable {
             String dirName = s.getPath().getName();
             Path dest = new Path(target, dirName);
             permissions.mkdirs(fs, dest);
-            moveFilesInDir(s.getPath(), dest);
+            // ★先登记分区、再搬数据：
+            //   · 登记失败（HMS 权限 / 元数据）→ 文件还在临时目录，本次写入整体失败也不会在表目录
+            //     留下「有文件但分区未登记」的半截状态；
+            //   · 分区已登记且位置一致 → 直接跳过登记（见 registerPartition），避免 add_partition
+            //     对分区目录做 WRITE 权限校验把整个写入收尾打挂；
+            //   · 重跑时分区已在，跳过登记后搬文件即可自愈。
             registerPartition(dirName, dest);
+            moveFilesInDir(s.getPath(), dest);
         }
         fs.delete(tempDir, true);
     }
@@ -557,7 +591,13 @@ final class HiveWriteSession implements AutoCloseable {
         }
     }
 
-    /** 由已搬好的分区目录名（{@code k=v}）登记 / 更新 HMS 分区。 */
+    /**
+     * 由分区目录名（{@code k=v}）登记 / 更新 HMS 分区。
+     *
+     * <p><b>已登记且位置一致 → 完全不动 HMS</b>：这是「Hive 目录属主是 jiaxin、Dojao 写入身份是
+     * hadoop」场景的根治点 —— {@code add_partition} 会以写入身份对分区目录做 WRITE 权限校验，
+     * 校验失败会把一个本来完全正常的追加写整体打挂（数据已就位、分区也早就登记过）。</p>
+     */
     private void registerPartition(String dirName, Path location) {
         List<String> values = new ArrayList<>(partitionColumnNames.size());
         for (String segment : dirName.split("/")) {
@@ -567,13 +607,64 @@ final class HiveWriteSession implements AutoCloseable {
         }
         if (values.size() != partitionColumnNames.size()) return;
 
+        String existing = metastore.partitionLocation(meta.database(), meta.table(), values);
+        if (existing != null && sameLocation(existing, location.toString())) {
+            System.err.printf("[Hive] 分区已登记且位置一致，跳过重复登记：%s.%s %s → %s%n",
+                    meta.database(), meta.table(), values, location);
+            return;
+        }
+
         Partition p = new Partition();
         p.setDbName(meta.database());
         p.setTableName(meta.table());
         p.setValues(values);
         p.setSd(partitionSd(location.toString()));
         p.setParameters(new HashMap<>());
-        metastore.upsertPartition(p);
+        try {
+            metastore.upsertPartition(p);
+        } catch (RuntimeException e) {
+            if (!permissionDenied(e)) throw e;
+            // 并发场景：另一路已把同一分区登记好（我们首次查询却没查到）→ 也算成功，不再误报。
+            String after = metastore.partitionLocation(meta.database(), meta.table(), values);
+            if (after != null && sameLocation(after, location.toString())) {
+                System.err.printf("[Hive] 分区已被并发登记，按成功处理：%s.%s %s%n",
+                        meta.database(), meta.table(), values);
+                return;
+            }
+            // HMS 的 add_partition 会对分区目录做 WRITE 权限校验（以写入身份）—— 目录属主/属组与
+            // 写入身份不一致时报 AccessControlException。给出可操作的处置，而不是只甩 HDFS 栈。
+            throw new RuntimeException("登记 Hive 分区失败（HDFS 写权限不足）："
+                    + meta.database() + "." + meta.table() + " " + values
+                    + "，分区目录 " + location + " 的属主/属组与写入身份不一致。"
+                    + "本次写入身份=" + (writeUser != null ? writeUser : "进程默认用户")
+                    + "（catalog 属性 hadoop.user.name" + (writeUser != null ? " 已生效" : " 未生效/未配置") + "）。"
+                    + "处理方式：把 catalog 的 hadoop.user.name 配置成该目录属主（或让写入身份加入属组/开通组写权限）",
+                    e);
+        }
+    }
+
+    /** 目标路径是否同一个（忽略末尾斜杠；Windows 本地路径的分隔符差异也归一）。 */
+    private static boolean sameLocation(String a, String b) {
+        return normalizeLocation(a).equals(normalizeLocation(b));
+    }
+
+    private static String normalizeLocation(String s) {
+        if (s == null) return "";
+        String out = s.replace('\\', '/');
+        while (out.length() > 1 && out.endsWith("/")) {
+            out = out.substring(0, out.length() - 1);
+        }
+        return out;
+    }
+
+    /** 异常链里是否出现 HDFS 权限拒绝（{@code AccessControlException: Permission denied}）。 */
+    private static boolean permissionDenied(Throwable t) {
+        for (int depth = 0; t != null && depth < 8; depth++) {
+            String msg = String.valueOf(t.getMessage());
+            if (msg.contains("AccessControlException") || msg.contains("Permission denied")) return true;
+            t = t.getCause() == t ? null : t.getCause();
+        }
+        return false;
     }
 
     private StorageDescriptor partitionSd(String location) {

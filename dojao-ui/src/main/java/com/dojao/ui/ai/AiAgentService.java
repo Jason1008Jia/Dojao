@@ -2476,6 +2476,32 @@ public final class AiAgentService {
         return sb.toString();
     }
 
+    /**
+     * 溢写描述：首次溢写量（数据量口径）+ 累计写盘吞吐 / 归并重写量 + 溢写目录峰值占用。
+     *
+     * <p>首值用「数据量」而不是累计写盘量 —— 归并会把同一批数据反复重写，累计值可达数据量数倍，
+     * 直接当「溢出了多少数据」会严重误导（UI 同步采用相同口径）。</p>
+     */
+    static String spillText(MonitorOperator op) {
+        long spilled = op.spilledBytes();
+        long compaction = op.compactionBytes();
+        long first = Math.max(0L, spilled - compaction);
+        StringBuilder b = new StringBuilder(humanBytes(first));
+        if (compaction > 0) {
+            b.append("（累计写 ").append(humanBytes(spilled))
+                    .append("，其中归并重写 ").append(humanBytes(compaction));
+            if (first > 0) {
+                b.append("，放大 ").append(String.format(java.util.Locale.ROOT, "%.1fx",
+                        (double) spilled / first));
+            }
+            b.append('）');
+        }
+        if (op.peakSpillDiskBytes() > 0) {
+            b.append("；峰值磁盘 ").append(humanBytes(op.peakSpillDiskBytes()));
+        }
+        return b.toString();
+    }
+
     /** 单个算子的紧凑指标行（query_status / operator_status 列表共用）。 */
     static String operatorLine(MonitorOperator op) {
         StringBuilder b = new StringBuilder();
@@ -2492,7 +2518,7 @@ public final class AiAgentService {
             b.append("(峰值 ").append(humanBytes(op.peakMemBytes())).append(')');
         }
         if (op.spilledBytes() > 0) {
-            b.append("｜溢写 ").append(humanBytes(op.spilledBytes()));
+            b.append("｜溢写 ").append(spillText(op));
         }
         b.append("｜CPU ").append(num(op.cpuMs())).append("ms")
                 .append("｜耗时 ").append(num(op.elapsedMs())).append("ms");
@@ -2589,7 +2615,7 @@ public final class AiAgentService {
         if (op.peakMemBytes() > 0) {
             sb.append("（峰值 ").append(humanBytes(op.peakMemBytes())).append('）');
         }
-        sb.append("；溢写：").append(humanBytes(op.spilledBytes())).append('\n');
+        sb.append("；溢写：").append(op.spilledBytes() > 0 ? spillText(op) : humanBytes(0)).append('\n');
         sb.append("- CPU：").append(num(op.cpuMs())).append(" ms")
                 .append("；耗时：").append(num(op.elapsedMs())).append(" ms\n");
         sb.append("- 速率：瞬时 ").append(num(op.instantRowsPerSec())).append(" 行/秒")

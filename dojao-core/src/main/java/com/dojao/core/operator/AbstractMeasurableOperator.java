@@ -142,7 +142,9 @@ public abstract class AbstractMeasurableOperator implements MeasurableOperator {
         try {
             doClose();
         } catch (Exception e) {
-            log.warn("Operator {} close error: {}", stats.getOperatorId(), e.getMessage());
+            // 带栈打印：doClose 里的收尾失败（Hive 临时目录没搬进表目录 / staging 没清）是「查询
+            // 报成功但表里没数据」的唯一线索，只打 message 会把 cause 链丢掉。
+            log.warn("Operator {} close error: {}", stats.getOperatorId(), e.getMessage(), e);
         }
         onFinish();
     }

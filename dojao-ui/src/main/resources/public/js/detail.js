@@ -56,6 +56,23 @@ function spillAvgText(op) {
     return files > 0 ? '平均 ' + fmtBytes(bytes / files) : '无文件';
 }
 
+/** 首次溢写量 = 累计写盘吞吐 − 归并重写（数据量口径，可与溢写目录 / 输入量对照）。 */
+function spillFirstBytes(op) {
+    var spilled = Number(op.spilledBytes) || 0;
+    var compaction = Number(op.compactionBytes) || 0;
+    return Math.max(0, spilled - compaction);
+}
+
+/** Spilled 卡副标题：累计写 / 重写量 / 写放大倍数。 */
+function spillDetailText(op) {
+    var spilled = Number(op.spilledBytes) || 0;
+    var compaction = Number(op.compactionBytes) || 0;
+    var first = spillFirstBytes(op);
+    if (compaction <= 0) return '首次溢写 · 数据量';
+    return '累计写 ' + fmtBytes(spilled) + ' · 重写 ' + fmtBytes(compaction)
+        + (first > 0 ? ' (' + (spilled / first).toFixed(1) + '×)' : '');
+}
+
 /** 算子详情指标卡：带 data-metric 键，轮询时可原地刷新数值而不重建 DOM。 */
 function opCard(key, label, value, sub, cls) {
     return '<div class="metric-card ' + (cls || '') + '" data-metric="' + key + '">'
@@ -131,7 +148,8 @@ function refreshLiveOperator() {
             + opCard('elapsed', 'Elapsed', fmtDuration(op.elapsedMs), '', '')
             + opCard('cpu', 'CPU', fmtDuration(op.cpuMs), '', '')
             + opCard('mem', 'Memory', fmtBytes(op.currentMemBytes), '峰值 ' + fmtBytes(op.peakMemBytes), '')
-            + opCard('spilled', 'Spilled', op.spilledBytes > 0 ? fmtBytes(op.spilledBytes) : '\u2014', '溢写总量', '')
+            + opCard('spilled', 'Spilled', op.spilledBytes > 0 ? fmtBytes(spillFirstBytes(op)) : '\u2014', spillDetailText(op), '')
+            + opCard('peakDisk', 'Peak Disk', op.peakSpillDiskBytes > 0 ? fmtBytes(op.peakSpillDiskBytes) : '\u2014', '溢写目录峰值占用', '')
             + opCard('spillFiles', 'Spill Files', op.spillFiles > 0 ? fmtRows(op.spillFiles) : '\u2014', spillAvgText(op), '')
             + opCard('spillTrig', 'Spill Triggers', op.spillTriggers > 0 ? fmtRows(op.spillTriggers) : '\u2014', '槽满 → 提交溢写', '')
             + '</div></div>'
@@ -154,7 +172,8 @@ function refreshLiveOperator() {
     setMetric(body, 'elapsed', fmtDuration(op.elapsedMs));
     setMetric(body, 'cpu', fmtDuration(op.cpuMs));
     setMetric(body, 'mem', fmtBytes(op.currentMemBytes), '峰值 ' + fmtBytes(op.peakMemBytes));
-    setMetric(body, 'spilled', op.spilledBytes > 0 ? fmtBytes(op.spilledBytes) : '\u2014');
+    setMetric(body, 'spilled', op.spilledBytes > 0 ? fmtBytes(spillFirstBytes(op)) : '\u2014', spillDetailText(op));
+    setMetric(body, 'peakDisk', op.peakSpillDiskBytes > 0 ? fmtBytes(op.peakSpillDiskBytes) : '\u2014');
     setMetric(body, 'spillFiles', op.spillFiles > 0 ? fmtRows(op.spillFiles) : '\u2014', spillAvgText(op));
     setMetric(body, 'spillTrig', op.spillTriggers > 0 ? fmtRows(op.spillTriggers) : '\u2014');
 

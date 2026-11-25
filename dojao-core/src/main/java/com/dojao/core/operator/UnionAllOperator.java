@@ -84,6 +84,18 @@ public class UnionAllOperator extends AbstractMeasurableOperator {
 
     public List<String> outputColumns() { return outputColumns; }
 
+    /**
+     * 是否纯拼接：每腿输出列数 = 规范列数且槽位逐位恒等（无缺席列补 NULL / 无重排）。
+     *
+     * <p>纯拼接可安全拆腿（如 {@code UNION ALL} 之上直接写目标表，各腿按位置写即可）；
+     * CUBE / GROUPING SETS 改写的多腿 UNION 通常不是（腿输出规范列的子序列，缺列由本算子
+     * 运行期补 typed NULL），拆腿会静默错列。</p>
+     */
+    public boolean identityConcat() {
+        for (boolean id : identity) if (!id) return false;
+        return true;
+    }
+
     /** 孩子算子列表（供列裁剪递归）。 */
     public Operator[] childrenOperators() { return children; }
 

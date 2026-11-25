@@ -275,11 +275,25 @@ public class SortMergeJoinOperator extends AbstractMeasurableOperator implements
                     @Override public void onSpillBytes(long bytes) { addSpilledBytes(bytes); }
                     @Override public void onSpillFile() { getStats().recordSpillFile(); }
                     @Override public void onSpillTrigger() { getStats().recordSpillTrigger(); }
+                    @Override public void onCompactionBytes(long bytes) { getStats().recordCompactionBytes(bytes); }
                 };
         leftSort.setSpillStatsListener(forward);
         rightSort.setSpillStatsListener(forward);
         leftSort.open();   // JoinSortOperator.doOpen() 会 auto-open upstream
         rightSort.open();
+    }
+
+    /**
+     * 溢写磁盘峰值 = 两侧 {@link JoinSortOperator} 各自峰值之和 —— 真正落盘的是子排序算子，
+     * 包装算子自己的目录从不写文件；不覆盖的话监控上排序归并 join 的峰值磁盘恒 0。
+     */
+    @Override
+    public long sampleSpillDiskBytes() {
+        long sum = 0L;
+        if (leftSort != null) sum += leftSort.sampleSpillDiskBytes();
+        if (rightSort != null) sum += rightSort.sampleSpillDiskBytes();
+        getStats().recordPeakSpillDiskBytes(sum);
+        return getStats().getPeakSpillDiskBytes();
     }
 
     /**

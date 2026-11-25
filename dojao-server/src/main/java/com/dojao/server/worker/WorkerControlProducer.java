@@ -376,14 +376,30 @@ public final class WorkerControlProducer implements FlightProducer {
      * 否则 {@link ProjectOperator}（纯列投影，含重复列与列改名由 outputColumns 表达）。
      */
     private static Operator applyProjection(Operator source, FragmentSpec.ScanProjection p) {
-        if (p.expressions().isEmpty()) {
-            return new com.dojao.core.operator.ProjectOperator(source, p.outputColumns());
+        Operator cur = source;
+        if (!p.expressions().isEmpty()) {
+            List<ScalarProjectOperator.Projection> items = p.expressions().stream()
+                    .map(g -> new ScalarProjectOperator.Projection(g.exprText(), g.derivedColumn()))
+                    .toList();
+            cur = new ScalarProjectOperator(cur, p.outputColumns(),
+                    new java.util.LinkedHashSet<>(p.computedColumns()), items);
         }
-        List<ScalarProjectOperator.Projection> items = p.expressions().stream()
-                .map(g -> new ScalarProjectOperator.Projection(g.exprText(), g.derivedColumn()))
-                .toList();
-        return new ScalarProjectOperator(source, p.outputColumns(),
-                new java.util.LinkedHashSet<>(p.computedColumns()), items);
+        if (p.hasCaseProjections()) {
+            cur = new com.dojao.core.operator.CaseProjectOperator(cur, p.caseProjections());
+        }
+        if (p.hasRenames()) {
+            List<com.dojao.core.operator.ProjectOperator.ColumnRef> refs =
+                    new java.util.ArrayList<>(p.renames().size());
+            for (FragmentSpec.ColumnRename r : p.renames()) {
+                refs.add(new com.dojao.core.operator.ProjectOperator.ColumnRef(
+                        r.sourceName(), r.occurrence(), r.outputName()));
+            }
+            cur = com.dojao.core.operator.ProjectOperator.aliased(cur, refs);
+        } else if (p.expressions().isEmpty() && !p.hasCaseProjections()
+                && p.outputColumns() != null && !p.outputColumns().isEmpty()) {
+            cur = new com.dojao.core.operator.ProjectOperator(cur, p.outputColumns());
+        }
+        return cur;
     }
 
     /**

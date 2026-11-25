@@ -516,7 +516,10 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
     protected static ArrowType dtoAggregateType(String aggregateName, Field inputField) {
         if (inputField != null && aggregateName != null) {
             ArrowType t = inputField.getType();
-            if (aggregateName.equalsIgnoreCase("min") || aggregateName.equalsIgnoreCase("max")) {
+            if (aggregateName.equalsIgnoreCase("min") || aggregateName.equalsIgnoreCase("max")
+                    || aggregateName.equalsIgnoreCase("any") || aggregateName.equalsIgnoreCase("any_value")
+                    || aggregateName.equalsIgnoreCase("arg_max")
+                    || aggregateName.equalsIgnoreCase("arg_min")) {
                 return t;
             }
             // DECIMAL 的 SUM/AVG 输出 DECIMAL（精度放宽），保证跨 Worker 部分聚合仍精确

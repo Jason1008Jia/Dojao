@@ -29,11 +29,16 @@ public record OperatorSnapshot(
         long cpuMs,
         long currentMemBytes,
         long peakMemBytes,
+        /** 累计溢写字节（写盘吞吐：首次溢写 + 每次归并重写）。 */
         long spilledBytes,
+        /** spilledBytes 中属于归并重写的部分：首次溢写量 = spilledBytes − compactionBytes。 */
+        long compactionBytes,
         /** 累计溢写文件数（含归并重写）；平均文件大小 = spilledBytes / spillFiles。 */
         long spillFiles,
         /** 累计溢写触发次数（分区缓冲槽满 → 提交一次溢写）。 */
         long spillTriggers,
+        /** 溢写目录峰值实际磁盘占用（Worker 遍历目录采样；与累计写入量口径不同）。 */
+        long peakSpillDiskBytes,
         long elapsedMs,
         /** 瞬时吞吐（行/秒）：两次快照间 rowsOut 差分 / 时间差。 */
         long instantRowsPerSec,
@@ -59,8 +64,12 @@ public record OperatorSnapshot(
                        long bytesIn, long bytesOut,
                        /** 该片段（阶段）在 Worker 侧的累计溢写字节 —— 各阶段框各报各的。 */
                        long spilledBytes,
+                       /** 该片段溢写中属于归并重写的字节（首次溢写 = spilledBytes − 本字段）。 */
+                       long compactionBytes,
                        /** 该片段的溢写文件数 / 触发次数（与 spilledBytes 同帧遥测）。 */
                        long spillFiles, long spillTriggers,
+                       /** 该片段溢写目录的峰值实际磁盘占用（Worker 目录采样）。 */
+                       long peakSpillDiskBytes,
                        long dispatchNanos, long finishNanos,
                        String failure, String source,
                        /** Producer 扫描基表的探查行数总量估计（{@code schema.table} 命中才有，否则 -1）。 */

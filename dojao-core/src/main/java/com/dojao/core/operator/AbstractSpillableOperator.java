@@ -203,6 +203,11 @@ public abstract class AbstractSpillableOperator<S extends Slot>
     /** 本实例用过的全部溢写实例子目录（换盘后不止一个）—— 关闭时逐个删干净。 */
     protected final Set<Path> spillDirsUsed = ConcurrentHashMap.newKeySet();
 
+    /** 溢写目录占用采样的最小间隔：监控 300ms 一拍，目录遍历不必每拍都做（且别和溢写 I/O 抢盘）。 */
+    private static final long SPILL_DISK_SAMPLE_INTERVAL_NANOS = 1_000_000_000L;
+    /** 上次目录占用采样时刻（ns，0 = 从未采过）。 */
+    private final AtomicLong lastSpillDiskSampleNanos = new AtomicLong(0L);
+
     /**
      * 溢写统计转发回调（可空）。包装算子（{@link SortMergeJoinOperator} 汇总两侧
      * {@link JoinSortOperator}）据此把子算子的溢写字节 / 文件数 / 触发次数计入自己的
@@ -215,6 +220,7 @@ public abstract class AbstractSpillableOperator<S extends Slot>
         void onSpillBytes(long bytes);
         default void onSpillFile() {}
         default void onSpillTrigger() {}
+        default void onCompactionBytes(long bytes) {}
     }
 
     /** 累积超内存预算时的溢写策略（默认 {@link #SPILL} 沿用旧行为）。 */
@@ -701,6 +707,8 @@ public abstract class AbstractSpillableOperator<S extends Slot>
                 bumpMergeProgress();   // 每等完一个分区的落盘 → 归并推进（长溢写期间的心跳存活信号）
             }
         }
+        // Phase 1 全部落盘、归并尚未删旧文件 = 可预见的占用高点：补一次无节流采样
+        captureSpillDiskPeak();
         // ★与监控同一口径：直接读统计数据（Σ dataFileSize 曾是另一套口径，归并重写后会对不上）。
         long spilledBytes = getStats().getSpilledBytes();
         System.err.printf("[%s] Spilled: %s（分区 %d，触发 %d 次，单槽阈值 %s = memoryLimit %s × ratio %.2f ÷ owned %d，slots %d）%n",
@@ -846,6 +854,9 @@ public abstract class AbstractSpillableOperator<S extends Slot>
         while ((p = outputQueue.poll()) != null) {
             try { p.close(); } catch (Exception ignored) {}
         }
+        // 删目录前补一次峰值采样：运行期采样可能恰好错过了最后的占用高点。
+        // ★必须在 partition.close() 之前 —— 它会删掉各分区的溢写文件，之后再采样恒为 0。
+        captureSpillDiskPeak();
         for (PartitionState<S> pa : partitions) {
             if (pa != null) pa.close();
         }
@@ -1117,6 +1128,19 @@ public abstract class AbstractSpillableOperator<S extends Slot>
     }
 
     /**
+     * 记一次<b>归并重写</b>字节（本算子 + 转发给包装算子）。这部分字节同时已计入溢写总量
+     * （{@link #accountSpilledBytes(long)}），这里只单独拆出来，供监控区分「首次溢写」与
+     * 「重写放大」——两者差了 N 倍时（线上 Join 节点曾 6.4GB 数据写 41GB），用户才知道
+     * 该调扇入 / 阈值而不是怀疑计数有误。
+     */
+    protected final void noteCompactionBytes(long bytes) {
+        if (bytes <= 0) return;
+        getStats().recordCompactionBytes(bytes);
+        SpillStatsListener l = spillStatsListener;
+        if (l != null) l.onCompactionBytes(bytes);
+    }
+
+    /**
      * 归并（compaction / K 路归并）输出文件写完后记账。
      *
      * <p>归并把多个溢写批重写成 key 连续文件，这同样是真实磁盘写入。此前既不进
@@ -1133,8 +1157,63 @@ public abstract class AbstractSpillableOperator<S extends Slot>
             // 并发归并线程共享该字段：同步累加（与 writeBatchToArrow 同口径）。
             synchronized (pa) { pa.dataFileSize += bytes; }
             accountSpilledBytes(bytes);
+            // 单独标记「这笔是归并重写」：监控据此把首次溢写与重写放大分开显示
+            noteCompactionBytes(bytes);
         } catch (IOException e) {
             log.warn("统计归并输出文件大小失败: {}", file, e);
+        }
+    }
+
+    /**
+     * 采样本算子溢写目录的<b>实际磁盘占用</b>并更新峰值，返回当前峰值（字节）。
+     *
+     * <p>为什么不用累计写入量代替：同一份数据在归并里会被重写多轮（线上 Join 节点 6.4GB 数据
+     * 累计写 41GB），而旧文件消费 / 归并后即删 —— 用户拿 {@code du} 一对就以为「计数不准」。
+     * 这里是真实遍历 {@link #spillDirsUsed} 求和，归并删除旧文件后读数会回落，峰值才反映
+     * 「任一时刻最多占了这块盘多少」。</p>
+     *
+     * <p>由遥测采样线程每拍调用；按 {@link #SPILL_DISK_SAMPLE_INTERVAL_NANOS} 节流，
+     * 目录多 / 文件多时也不会成为额外 I/O 负担。</p>
+     */
+    public long sampleSpillDiskBytes() {
+        long now = System.nanoTime();
+        long last = lastSpillDiskSampleNanos.get();
+        long peak = getStats().getPeakSpillDiskBytes();
+        if (last != 0L && now - last < SPILL_DISK_SAMPLE_INTERVAL_NANOS) {
+            return peak;
+        }
+        if (!lastSpillDiskSampleNanos.compareAndSet(last, now)) {
+            return peak;   // 另一线程刚采过，沿用最新峰值
+        }
+        try {
+            long bytes = currentSpillDiskBytes();
+            getStats().recordPeakSpillDiskBytes(bytes);
+        } catch (Throwable t) {
+            log.debug("[溢写] {} 目录占用采样失败: {}", getStats().getOperatorId(), t.toString());
+        }
+        return getStats().getPeakSpillDiskBytes();
+    }
+
+    /** 本算子全部溢写目录当前在盘上的字节数（换过盘则求和）。 */
+    public long currentSpillDiskBytes() {
+        long sum = 0L;
+        for (Path dir : spillDirsUsed) {
+            sum += SpillDirs.dirSizeBytes(dir);
+        }
+        return sum;
+    }
+
+    /**
+     * 无节流地记一次目录占用峰值（Phase 1 收尾 / 关闭前调用：这两个时点是可预见的占用高点）。
+     *
+     * <p>protected：{@link JoinSortOperator} 覆盖了 {@code doNext()} 自己跑 Phase 1/2
+     * （不经基类 {@link #startPhase2()}），需在等待溢写落盘后自行调用一次。</p>
+     */
+    protected void captureSpillDiskPeak() {
+        try {
+            getStats().recordPeakSpillDiskBytes(currentSpillDiskBytes());
+        } catch (Throwable t) {
+            log.debug("[溢写] {} 目录占用峰值采样失败: {}", getStats().getOperatorId(), t.toString());
         }
     }
 
@@ -1145,11 +1224,26 @@ public abstract class AbstractSpillableOperator<S extends Slot>
         Path batchFile = spillDirForWrite().resolve("p" + pid + "_b" + batchIndex + ".arrow");
         pa.batchFiles.add(batchFile);
         if (pa.dataFilePath == null) pa.dataFilePath = batchFile;
-        long bytes = writeArrowFile(batchFile, root);
+        long bytes = writeArrowFileBatched(batchFile, root, spillBatchBytes());
         noteSpillFile();
         // 并发溢写线程共享该字段：原子累加，避免一次写入丢失（Phase 2 的 Spilled 汇总口径）。
         synchronized (pa) { pa.dataFileSize += bytes; }
         return new BatchWrite(batchIndex, bytes);
+    }
+
+    /**
+     * 单个溢写文件内 <b>record batch 的目标字节数</b>；{@code 0} = 整份数据写成一个 batch（旧行为）。
+     *
+     * <p><b>为什么需要</b>：归并（compaction）时每个源文件必须整批读进内存（{@code loadRecordBatch}），
+     * 一个 35 MB 的槽位写成一个 batch 时，110 MB 预算只够同时开 2–3 个源 ⇒ 扇入 3 ⇒ 73 个文件要
+     * 归并 5 轮，<b>每轮重写全量</b>（线上 Join 节点 111 GB 溢写里 ~4/5 是这 5 轮重写）。切成 4 MB
+     * 小 batch 后扇入能到 8–10，轮数降到 2–3。</p>
+     *
+     * <p>只有排序类算子（{@link JoinSortOperator} / {@link WindowSortOperator}）覆写；聚合的
+     * 「一组一文件」走 {@code loadBatchFromArrow}（只读首个 block），保持单批不变。</p>
+     */
+    protected long spillBatchBytes() {
+        return 0L;
     }
 
     /**
@@ -1162,6 +1256,53 @@ public abstract class AbstractSpillableOperator<S extends Slot>
         try (FileChannel ch = FileChannel.open(file, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
              ArrowFileWriter w = SpillCompression.writer(root, ch)) {
             w.writeBatch();
+        }
+        return Files.size(file);
+    }
+
+    /**
+     * 按 {@code maxBatchBytes} 把一个页切成若干 record batch 写进<b>同一个</b> Arrow IPC 文件。
+     *
+     * <p>{@code maxBatchBytes <= 0} 或数据本身不超限 → 等价于 {@link #writeArrowFile}（单批）。
+     * 切批只影响「一个 batch 多大」，文件语义不变（读侧 {@code getRecordBlocks()} 逐块读）。</p>
+     */
+    static long writeArrowFileBatched(Path file, VectorSchemaRoot root, long maxBatchBytes)
+            throws IOException {
+        int rows = root.getRowCount();
+        long size = 0L;
+        for (FieldVector v : root.getFieldVectors()) size += v.getBufferSize();
+        if (maxBatchBytes <= 0L || rows <= 1 || size <= maxBatchBytes) {
+            return writeArrowFile(file, root);
+        }
+        int perBatch = (int) Math.max(1L, maxBatchBytes * (long) rows / Math.max(1L, size));
+        if (perBatch >= rows) {
+            return writeArrowFile(file, root);
+        }
+        List<Field> fields = root.getSchema().getFields();
+        BufferAllocator alloc = root.getFieldVectors().get(0).getAllocator();
+        List<FieldVector> dstVecs = new ArrayList<>(fields.size());
+        for (Field f : fields) {
+            FieldVector v = f.createVector(alloc);
+            v.setInitialCapacity(perBatch);
+            v.allocateNew();
+            dstVecs.add(v);
+        }
+        VectorSchemaRoot dst = new VectorSchemaRoot(new ArrayList<>(fields), dstVecs, 0);
+        try {
+            try (FileChannel ch = FileChannel.open(file, StandardOpenOption.CREATE,
+                    StandardOpenOption.WRITE);
+                 ArrowFileWriter w = SpillCompression.writer(dst, ch)) {
+                for (int from = 0; from < rows; from += perBatch) {
+                    int len = Math.min(perBatch, rows - from);
+                    for (int c = 0; c < dstVecs.size(); c++) {
+                        RowAccumulator.copyColumnBatch(root.getVector(c), dstVecs.get(c), from, 0, len);
+                    }
+                    dst.setRowCount(len);
+                    w.writeBatch();
+                }
+            }
+        } finally {
+            dst.close();
         }
         return Files.size(file);
     }

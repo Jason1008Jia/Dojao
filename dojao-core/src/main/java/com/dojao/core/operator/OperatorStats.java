@@ -31,10 +31,21 @@ public class OperatorStats {
     private final AtomicLong currentMemoryBytes = new AtomicLong(0);
     private volatile long peakMemoryBytes;
     private final AtomicLong spilledBytes = new AtomicLong(0);
+    /**
+     * 累计溢写字节中<b>归并重写</b>（compaction）的部分。{@link #spilledBytes} 是写盘吞吐总量
+     * （首次溢写 + 每次归并重写），本字段单独记后者 ⇒ 首次溢写量 = spilledBytes − compactionBytes，
+     * 与磁盘上实际残留的数据量同量级（监控用它解释「为什么 WebUI 的溢写比 du 大几倍」）。
+     */
+    private final AtomicLong compactionBytes = new AtomicLong(0);
     /** 已写出的溢写文件数（含归并重写产生的批次文件）——平均文件大小 = spilledBytes / spillFiles。 */
     private final AtomicLong spillFiles = new AtomicLong(0);
     /** 溢写触发次数（一个分区缓冲槽满 → 提交一次溢写 = 一次）。与 spillFiles 分开：归并会写文件但不触发。 */
     private final AtomicLong spillTriggers = new AtomicLong(0);
+    /**
+     * 溢写目录的峰值磁盘占用（字节，实际遍历目录求和，含换盘后的多个目录）。
+     * 与累计写入量的区别：归并改写 / 消费后删除的文件不重复计入 ⇒ 反映「任一时刻最多占了多少盘」。
+     */
+    private volatile long peakSpillDiskBytes;
 
     // CPU
     private final AtomicLong cpuTimeNanos = new AtomicLong(0);
@@ -108,9 +119,17 @@ public class OperatorStats {
      * 扣掉，算子一溢写就显示 {@code Memory = -Σspill}（线上曾出现
      * {@code Memory=-1759560748 B}，即约 1.64GB 溢写量取负）。溢写量是累计吞吐指标，
      * 与瞬时驻留内存无关，两个口径必须分开。</p>
+     *
+     * <p>注意：这是<b>写盘吞吐</b>口径（首次溢写 + 每次归并重写都算）。想拿「数据集规模」看
+     * {@link #getLogicalSpilledBytes()}，想拿「实际占了多少盘」看 {@link #getPeakSpillDiskBytes()}。</p>
      */
     void recordSpilledBytes(long bytes) {
         spilledBytes.addAndGet(bytes);
+    }
+
+    /** 记账一次归并重写（这部分同时已计入 {@link #spilledBytes}，此处只做拆分标记）。 */
+    void recordCompactionBytes(long bytes) {
+        compactionBytes.addAndGet(bytes);
     }
 
     /** 记一次溢写文件写出（含归并重写）。 */
@@ -121,6 +140,13 @@ public class OperatorStats {
     /** 记一次溢写触发（分区缓冲槽达到阈值 → 提交溢写）。 */
     void recordSpillTrigger() {
         spillTriggers.incrementAndGet();
+    }
+
+    /** 记录一次溢写目录磁盘占用采样，仅当高于历史峰值时更新（best-effort，采样线程并发调用）。 */
+    void recordPeakSpillDiskBytes(long bytes) {
+        if (bytes > peakSpillDiskBytes) {
+            peakSpillDiskBytes = bytes;
+        }
     }
 
     // ==================== CPU ====================
@@ -145,8 +171,14 @@ public class OperatorStats {
     public long getCurrentMemoryBytes() { return currentMemoryBytes.get(); }
     public long getPeakMemoryBytes() { return peakMemoryBytes; }
     public long getSpilledBytes() { return spilledBytes.get(); }
+    /** 首次溢写字节（不含归并重写）= 溢写总量 − 重写量；≈ 数据集本身的溢写规模。 */
+    public long getLogicalSpilledBytes() { return Math.max(0L, spilledBytes.get() - compactionBytes.get()); }
+    /** 累计归并重写字节（已包含在 {@link #getSpilledBytes()} 中）。 */
+    public long getCompactionBytes() { return compactionBytes.get(); }
     public long getSpillFiles() { return spillFiles.get(); }
     public long getSpillTriggers() { return spillTriggers.get(); }
+    /** 溢写目录峰值磁盘占用（实际目录遍历结果；0 = 尚未采样 / 无溢写）。 */
+    public long getPeakSpillDiskBytes() { return peakSpillDiskBytes; }
     public long getCpuTimeNanos() { return cpuTimeNanos.get(); }
     public long getInputBytes() { return inputBytes.get(); }
     public long getOutputBytes() { return outputBytes.get(); }

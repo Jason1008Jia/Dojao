@@ -27,11 +27,16 @@ public record MonitorOperator(
         long outputBytes,
         long currentMemBytes,
         long peakMemBytes,
+        /** 累计溢写字节（写盘吞吐：首次溢写 + 每次归并重写）。 */
         long spilledBytes,
+        /** spilledBytes 中属于归并重写的部分：首次溢写量 = spilledBytes − compactionBytes。 */
+        long compactionBytes,
         /** 累计溢写文件数（含归并重写）；平均文件大小 = spilledBytes / spillFiles。 */
         long spillFiles,
         /** 累计溢写触发次数（分区缓冲槽满 → 提交一次溢写）。 */
         long spillTriggers,
+        /** 溢写目录峰值实际磁盘占用（与累计写入量口径不同，可与 du 对照）。 */
+        long peakSpillDiskBytes,
         long cpuMs,
         long elapsedMs,
         long instantRowsPerSec,

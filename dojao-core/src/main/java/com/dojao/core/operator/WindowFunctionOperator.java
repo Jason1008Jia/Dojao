@@ -1520,7 +1520,10 @@ public class WindowFunctionOperator extends AbstractMeasurableOperator implement
             }
             // ★整分区缓冲落盘同样是真实溢写 I/O：计入算子溢写统计（监控「溢写总量」）。
             //   不记账时，无过滤的大分区窗口在监控上完全看不到任何溢写。
+            //   这些文件到算子关闭才删（见 cleanupSpillDir）⇒ 累计量即当前实际磁盘占用，
+            //   直接记峰值即可（否则本算子的峰值磁盘恒 0）。
             addSpilledBytes(Files.size(file));
+            getStats().recordPeakSpillDiskBytes(getStats().getSpilledBytes());
             getStats().recordSpillFile();
             bufferedPages.add(BufferedPage.file(file, accRows));
             accRoot.close();

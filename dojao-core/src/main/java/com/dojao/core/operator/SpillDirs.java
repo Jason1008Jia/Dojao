@@ -293,6 +293,31 @@ public final class SpillDirs {
         }
     }
 
+    /**
+     * 目录当前占用的真实字节数（递归求和普通文件大小；目录不存在 / 无权限 → 0）。
+     *
+     * <p>供溢写峰值监控使用：与「累计写入量」口径不同 —— 归并删除旧文件后读数回落，
+     * 峰值才是「任一时刻最多占了这块盘多少」，用户拿 {@code du} 对照时不会觉得数字虚高。</p>
+     */
+    public static long dirSizeBytes(Path dir) {
+        if (dir == null || !Files.isDirectory(dir)) {
+            return 0L;
+        }
+        final long[] sum = {0L};
+        try (Stream<Path> s = Files.walk(dir)) {
+            s.filter(Files::isRegularFile).forEach(p -> {
+                try {
+                    sum[0] += Files.size(p);
+                } catch (IOException ignored) {
+                    // 文件刚好被并发清理：不计入即可
+                }
+            });
+        } catch (IOException ignored) {
+            // 目录被并发删除 / 无权限：返回已统计到的部分
+        }
+        return sum[0];
+    }
+
     /** 递归删除（幂等：不存在返回 false）。 */
     public static boolean deleteRecursively(Path dir) {
         if (dir == null || !Files.exists(dir)) {

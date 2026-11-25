@@ -95,12 +95,14 @@ public final class WorkerQueryTelemetry implements AutoCloseable {
      */
     private record Sampler(LongSupplier rows, LongSupplier bytesIn, LongSupplier bytesOut,
                            LongSupplier spilled, LongSupplier spillFiles, LongSupplier spillTriggers,
+                           LongSupplier compaction, LongSupplier peakDisk,
                            BooleanSupplier done) {
     }
 
     /** 一拍的采样值；各通道 {@code -1} = 该通道本拍不可读（Master 不覆盖该表）。 */
     private record Sample(long rows, long bytesIn, long bytesOut, long spilled,
-                          long spillFiles, long spillTriggers) {
+                          long spillFiles, long spillTriggers,
+                          long compaction, long peakDisk) {
 
         /** 整条不可读（无任何有效通道）→ 本拍跳过。 */
         boolean empty() {
@@ -139,6 +141,8 @@ public final class WorkerQueryTelemetry implements AutoCloseable {
                         prev == null ? null : prev.spilled(),
                         prev == null ? null : prev.spillFiles(),
                         prev == null ? null : prev.spillTriggers(),
+                        prev == null ? null : prev.compaction(),
+                        prev == null ? null : prev.peakDisk(),
                         doneSupplier != null ? doneSupplier : (prev == null ? null : prev.done())));
     }
 
@@ -167,6 +171,21 @@ public final class WorkerQueryTelemetry implements AutoCloseable {
      */
     public void trackSpill(String queryId, String taskId, LongSupplier spilledSupplier,
                            LongSupplier spillFilesSupplier, LongSupplier spillTriggersSupplier) {
+        trackSpill(queryId, taskId, spilledSupplier, spillFilesSupplier, spillTriggersSupplier,
+                null, null);
+    }
+
+    /**
+     * 登记纯溢写采样器（完整通道）：额外带<b>归并重写字节</b>（首次溢写 = spilled − compaction）
+     * 与<b>溢写目录峰值占用</b>（实际遍历目录，与累计写入量口径不同）。
+     *
+     * <p>四个溢写通道都按<b>累加</b>合并（同片段多个溢写算子各报各的）；{@code peakDisk} 语义上
+     * 应取 max，但同一片段内各溢写算子基本顺序执行、各自峰值不会同刻出现，按累加呈现「该片段
+     * 溢写目录总峰值」更接近用户对磁盘占用的直觉。</p>
+     */
+    public void trackSpill(String queryId, String taskId, LongSupplier spilledSupplier,
+                           LongSupplier spillFilesSupplier, LongSupplier spillTriggersSupplier,
+                           LongSupplier compactionSupplier, LongSupplier peakDiskSupplier) {
         if (queryId == null || taskId == null || spilledSupplier == null) {
             return;
         }
@@ -174,12 +193,15 @@ public final class WorkerQueryTelemetry implements AutoCloseable {
                 .compute(taskId, (k, prev) -> {
                     if (prev == null) {
                         return new Sampler(null, null, null, spilledSupplier,
-                                spillFilesSupplier, spillTriggersSupplier, null);
+                                spillFilesSupplier, spillTriggersSupplier,
+                                compactionSupplier, peakDiskSupplier, null);
                     }
                     return new Sampler(prev.rows(), prev.bytesIn(), prev.bytesOut(),
                             sumSuppliers(prev.spilled(), spilledSupplier),
                             sumSuppliers(prev.spillFiles(), spillFilesSupplier),
                             sumSuppliers(prev.spillTriggers(), spillTriggersSupplier),
+                            sumSuppliers(prev.compaction(), compactionSupplier),
+                            sumSuppliers(prev.peakDisk(), peakDiskSupplier),
                             prev.done());
                 });
     }
@@ -341,6 +363,8 @@ public final class WorkerQueryTelemetry implements AutoCloseable {
                             .setSpilledBytes(s.spilled())
                             .setSpillFiles(Math.max(-1L, s.spillFiles()))
                             .setSpillTriggers(Math.max(-1L, s.spillTriggers()))
+                            .setCompactionBytes(Math.max(-1L, s.compaction()))
+                            .setPeakDiskBytes(Math.max(-1L, s.peakDisk()))
                             .setDone(doneSet.containsKey(taskId) || doneSampled.contains(taskId)));
                     fragCount.incrementAndGet();
                 });
@@ -403,7 +427,9 @@ public final class WorkerQueryTelemetry implements AutoCloseable {
                 safeRows(s.bytesOut()),
                 s.spilled() == null ? -1L : safeRows(s.spilled()),
                 s.spillFiles() == null ? -1L : safeRows(s.spillFiles()),
-                s.spillTriggers() == null ? -1L : safeRows(s.spillTriggers()));
+                s.spillTriggers() == null ? -1L : safeRows(s.spillTriggers()),
+                s.compaction() == null ? -1L : safeRows(s.compaction()),
+                s.peakDisk() == null ? -1L : safeRows(s.peakDisk()));
     }
 
     private static boolean safeDone(BooleanSupplier supplier) {

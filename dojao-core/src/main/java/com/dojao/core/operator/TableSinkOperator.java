@@ -70,6 +70,15 @@ public final class TableSinkOperator extends AbstractMeasurableOperator {
     private ExecutorService writerPool;
     private Page eofPage;        // 上游 EOF 页（收尾后返回）
     private boolean eofMode;     // 已进入 EOF 收尾：只从 drainBuffer 出页
+    /**
+     * 数据是否已<b>真正落库</b>（连接器收尾完成）。
+     *
+     * <p>★这条标志是「事故 10」的直接产物：Hive 的临时目录 → 表分区搬运发生在
+     * {@code connector.finishWrite()} 里。若把它留在 {@code doClose}，异常只会被
+     * {@code AbstractMeasurableOperator.close} 记一条 WARN，查询照样报「写入完成 rows=N」，
+     * 而表里 0 行 —— 用户看到成功、Hive 查不到数据。故收尾必须走数据路径（EOF），异常直接让查询失败。</p>
+     */
+    private boolean writeFinalized;
 
     public TableSinkOperator(Operator upstream, DojaoConnector connector,
                              String catalog, String schema, String table) {
@@ -152,7 +161,7 @@ public final class TableSinkOperator extends AbstractMeasurableOperator {
             eofMode = true;
             finishWriting();   // 发 POISON、等所有写线程收尾、收集剩余已写页
             checkWriterFailure();
-            commitOverwriteIfNeeded();
+            finalizeWrite();   // ★必须在这里（数据路径）：失败 → 查询失败，而不是 doClose 里被吞掉
             return drainBuffer.isEmpty() ? eofPage : drainBuffer.remove(0);
         }
         if (page.getRoot() == null) return page;   // 分区结束标记：透传，不写
@@ -181,6 +190,7 @@ public final class TableSinkOperator extends AbstractMeasurableOperator {
                 eofMode = true;
                 finishWriting();   // 写线程此刻空闲，POISON 立即被消费退出
                 checkWriterFailure();
+                finalizeWrite();   // 空写入也要收尾（关闭空会话），失败同样要让查询失败
                 return eofPage;
             }
         }
@@ -224,7 +234,15 @@ public final class TableSinkOperator extends AbstractMeasurableOperator {
                         + schema + "." + table + " —— " + t);
             }
         }
-        connector.finishWrite();
+        if (!writeFinalized) {
+            // 没走到 EOF 收尾就结束（上游失败 / 查询取消 / 收尾本身抛错）：绝不把半成品提交。
+            try {
+                connector.abortWriteAll();
+            } catch (Throwable t) {
+                System.err.println("[TableSink] 放弃写会话失败: " + catalog + "." + schema + "." + table
+                        + " —— " + t);
+            }
+        }
         upstream.close();
     }
 
@@ -238,20 +256,35 @@ public final class TableSinkOperator extends AbstractMeasurableOperator {
     }
 
     /**
-     * 全部页写完（写线程已停）后一次性提交覆盖。<b>空结果也要提交</b> ——
-     * {@code INSERT OVERWRITE ... SELECT} 命中 0 行在 Hive 里就是把表清空，不是「什么都不做」。
+     * 全部页写完（写线程已停）后<b>在数据路径上</b>一次性收尾：
+     * <ol>
+     *   <li>{@code connector.finishWrite()} —— Hive 在这里把 {@code _dojao_tmp_*} 临时目录搬进
+     *       表分区并登记 partition；JDBC 在这里 flush 最后一批；</li>
+     *   <li>INSERT OVERWRITE：{@code commitOverwrite} 原子切换 staging。</li>
+     * </ol>
+     *
+     * <p><b>为什么必须在 doNext（EOF）而不是 doClose</b>：{@code close()} 失败的异常只会被
+     * {@code AbstractMeasurableOperator.close} 记一条 WARN —— 查询照样报「写入完成 rows=N」，
+     * 而数据全在没搬走的临时目录里（或根本没落库）。收尾放到数据路径后，任何失败都会让查询失败。</p>
+     *
+     * <p><b>空结果也要提交</b>：{@code INSERT OVERWRITE ... SELECT} 命中 0 行在 Hive 里就是
+     * 把表清空，不是「什么都不做」。</p>
      */
-    private void commitOverwriteIfNeeded() {
-        if (overwrite == null || overwriteCommitted) return;
+    private void finalizeWrite() {
+        if (writeFinalized) return;
         ensureOverwriteBegun();
-        try {
-            // 先把所有写会话 flush 落盘（staging 里的 ORC 文件必须完整），再搬运
-            connector.finishWrite();
-            overwrite.commitOverwrite(catalog, schema, table, stagingId);
-            overwriteCommitted = true;
-        } catch (RuntimeException e) {
-            throw new RuntimeException("TableSink 覆盖提交失败: " + catalog + "." + schema + "." + table, e);
+        if (overwrite != null) {
+            try {
+                connector.finishWrite();          // staging 里的 ORC 文件必须完整，再搬运
+                overwrite.commitOverwrite(catalog, schema, table, stagingId);
+                overwriteCommitted = true;
+            } catch (RuntimeException e) {
+                throw new RuntimeException("TableSink 覆盖提交失败: " + catalog + "." + schema + "." + table, e);
+            }
+        } else {
+            connector.finishWrite();              // 失败直接向上抛 → 查询失败（不再静默丢数据）
         }
+        writeFinalized = true;
     }
 
     // ==================== 并行写内部 ====================
