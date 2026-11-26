@@ -172,21 +172,13 @@ public final class StringFunctions {
         reg("json_extract", "JSON 取值 json_extract(json,path[,path...])：返回合法 JSON 文本（字符串带引号；多路径返回数组）", args -> {
             ScalarSupport.requireAtLeast("json_extract", args, 2);
             if (args[0] == null) return null;
-            String json = ScalarSupport.string(args[0]);
-            List<JsonNode> nodes = new java.util.ArrayList<>(args.length - 1);
+            String[] paths = new String[args.length - 1];
             for (int i = 1; i < args.length; i++) {
                 if (args[i] == null) return null;
-                nodes.add(resolveJsonNode(json, ScalarSupport.string(args[i])));
+                paths[i - 1] = ScalarSupport.string(args[i]);
             }
-            if (args.length == 2) {
-                return jsonText(nodes.get(0));
-            }
-            com.fasterxml.jackson.databind.node.ArrayNode arr = MAPPER.createArrayNode();
-            for (JsonNode n : nodes) {
-                if (n == null) arr.addNull();
-                else arr.add(n);
-            }
-            return arr.toString();
+            // 同一 JSON 文本只解析一次（多路径取同一棵树），与表达式求值器的行级缓存同口径
+            return jsonExtract(parseJson(ScalarSupport.string(args[0])), paths);
         });
         reg("find_in_set", "在逗号列表中查位置（1-based；未找到 0）", args -> {
             ScalarSupport.requireArity("find_in_set", args, 2);
@@ -377,6 +369,24 @@ public final class StringFunctions {
         return node == null ? null : node.toString();
     }
 
+    /**
+     * json_extract 的节点版：在已解析的 JSON 上按多条路径取值。
+     *
+     * <p>单路径 → 该节点 JSON 文本（未命中 → null）；多路径 → 数组文本（未命中的路径落
+     * JSON null 占位）。整棵 JSON 非法（{@code node == null}）时与逐路径解析的历史口径
+     * 保持一致：单路径 → null，多路径 → 全 null 的数组文本。</p>
+     */
+    public static String jsonExtract(JsonNode node, String[] paths) {
+        if (paths.length == 1) return jsonText(resolveNode(node, paths[0]));
+        com.fasterxml.jackson.databind.node.ArrayNode arr = MAPPER.createArrayNode();
+        for (String p : paths) {
+            JsonNode n = resolveNode(node, p);
+            if (n == null) arr.addNull();
+            else arr.add(n);
+        }
+        return arr.toString();
+    }
+
     /** 解析 JSON（非法 / null → null）。供表达式求值器做「同一行只解析一次」的缓存。 */
     public static JsonNode parseJson(String json) {
         if (json == null || json.isEmpty()) return null;
@@ -403,8 +413,14 @@ public final class StringFunctions {
         return resolveNode(parseJson(json), path);
     }
 
-    /** 已解析节点按路径取值（非法路径 / 缺失 / JSON null → null）。 */
-    private static JsonNode resolveNode(JsonNode node, String path) {
+    /**
+     * 已解析节点按路径取值（非法路径 / 缺失 / JSON null → null）。
+     *
+     * <p>路径语法：{@code $} 根、{@code $.a.b}、{@code $['a']}、{@code $[0]}。
+     * 裸字段名 / 裸点号路径需调用方先补 {@code $.} 前缀（见
+     * {@code ExprBuiltins.pathValue}，json_array_explode 家族按此口径支持两种写法）。</p>
+     */
+    public static JsonNode resolveNode(JsonNode node, String path) {
         if (node == null || path == null) return null;
         String p = path.trim();
         if (!p.startsWith("$")) return null;

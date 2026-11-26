@@ -2,8 +2,12 @@ package com.dojao.core.operator.expr;
 
 import com.dojao.core.function.scalar.ScalarExpr;
 import com.dojao.core.function.scalar.ScalarFunctionRegistry;
+import com.dojao.core.function.scalar.ScalarSupport;
+import com.dojao.core.function.scalar.string.StringFunctions;
 import com.dojao.core.planner.SqlTextUtil;
 import com.dojao.spi.function.ScalarFunction;
+
+import com.fasterxml.jackson.databind.JsonNode;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.BigIntVector;
@@ -316,8 +320,27 @@ public final class ExprEvaluator {
         return stringTyped(n, root, indexOf) ? NullKind.STRING : NullKind.NONE;
     }
 
-    /** 全 NULL DECIMAL 的输出向量：类型参数优先取 CAST 的 (p,s)，缺省 38/10 并夹紧。 */
-    private static FieldVector decimalVector(String name, BufferAllocator allocator, ExprNode node) {
+    /**
+     * 整批全 NULL 时的静态输出类型 —— 供 {@link com.dojao.core.operator.ScalarProjectOperator}
+     * 行外层求值预建结果向量用（口径与 {@link #evaluateTo} 的全 NULL 兜底完全一致，
+     * 含 DECIMAL 取 CAST 的 (p,s)、NONE 落 Int64）。
+     */
+    public static ArrowType staticNullType(ExprNode node, VectorSchemaRoot root,
+                                           Map<String, Integer> indexOf) {
+        return switch (staticNullKind(node, root, indexOf)) {
+            case STRING -> ArrowType.Utf8.INSTANCE;
+            case DOUBLE -> new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE);
+            case DECIMAL -> decimalType(node);
+            case BIGINT -> new ArrowType.Int(64, true);
+            case BIT -> ArrowType.Bool.INSTANCE;
+            case LIST -> ArrowType.List.INSTANCE;
+            // 静态类型确实未知 → 与 evaluateTo 的 Int64 兜底一致
+            case NONE -> new ArrowType.Int(64, true);
+        };
+    }
+
+    /** 全 NULL DECIMAL 类型：参数优先取 CAST 的 (p,s)，缺省 38/10 并夹紧。 */
+    private static ArrowType.Decimal decimalType(ExprNode node) {
         int precision = 38;
         int scale = 10;
         if (node instanceof ExprNode.Cast cs) {
@@ -325,7 +348,13 @@ public final class ExprEvaluator {
             if (cs.scale() >= 0) scale = Math.min(cs.scale(), precision);
         }
         precision = Math.max(precision, Math.max(1, scale));
-        return new DecimalVector(name, allocator, precision, scale);
+        return new ArrowType.Decimal(precision, scale, 128);
+    }
+
+    /** 全 NULL DECIMAL 的输出向量：类型参数优先取 CAST 的 (p,s)，缺省 38/10 并夹紧。 */
+    private static FieldVector decimalVector(String name, BufferAllocator allocator, ExprNode node) {
+        ArrowType.Decimal t = decimalType(node);
+        return new DecimalVector(name, allocator, t.getPrecision(), t.getScale());
     }
 
     /** 表达式在本批全 NULL 时是否应落 Utf8（只判断「确定是字符串」，其余一律 false）。 */
@@ -441,27 +470,15 @@ public final class ExprEvaluator {
 
     private static Object evalFuncCall(ExprNode.FuncCall f, VectorSchemaRoot root, int row,
                                        Map<String, Integer> indexOf) {
-        String name = f.name().toLowerCase();
-        // ★宽表关键优化：同一行里 100+ 个 get_json_object(<同一列>, '$.x') 只解析一次 JSON。
-        //   旧实现每次调用都 Jackson readTree 同一段 8KB 文本 —— 2.7M 行 × 143 列 ≈ 3.9 亿次解析，
-        //   实测占 WindowSort Phase 2「流式读取输出」360s 里的绝大部分。
-        if ("get_json_object".equals(name) && f.args().size() == 2
-                && f.args().get(0) instanceof ExprNode.Column col) {
-            JsonRowCache cache = JSON_CACHE.get();
-            if (!cache.matches(root, row)) cache.reset(root, row);
-            com.fasterxml.jackson.databind.JsonNode node;
-            if (cache.nodes.containsKey(col.name())) {
-                node = cache.nodes.get(col.name());
-            } else {
-                Object raw = eval(f.args().get(0), root, row, indexOf);
-                node = com.dojao.core.function.scalar.string.StringFunctions.parseJson(
-                        raw == null ? null : com.dojao.core.function.scalar.ScalarSupport.string(raw));
-                cache.nodes.put(col.name(), node);
-            }
-            Object pathArg = eval(f.args().get(1), root, row, indexOf);
-            if (pathArg == null) return null;
-            return com.dojao.core.function.scalar.string.StringFunctions.jsonValue(
-                    node, com.dojao.core.function.scalar.ScalarSupport.string(pathArg));
+        String name = f.name().toLowerCase(Locale.ROOT);
+        // ★宽表关键优化：同一行里同一列 / 同一段 JSON 文本只解析一次。
+        //   旧实现每次 JSON 函数调用都 Jackson readTree 同一段 8KB 文本 —— 2.7M 行 × 143 列
+        //   ≈ 3.9 亿次解析，实测占 WindowSort Phase 2「流式读取输出」360s 里的绝大部分。
+        //   覆盖整个 JSON 函数族（get_json_object / json_extract / from_str_to_array /
+        //   json_array_explode[_with_separator]）；参数个数不合法的调用不拦截，
+        //   照旧落到注册表 / 内置表抛原始的参数个数错误。
+        if (JSON_CACHED_FUNCTIONS.contains(name) && jsonArityOk(name, f.args().size())) {
+            return evalJsonFunc(f, name, root, row, indexOf);
         }
         Object[] args = new Object[f.args().size()];
         for (int i = 0; i < args.length; i++) {
@@ -474,14 +491,187 @@ public final class ExprEvaluator {
         return fn.evaluate(args);
     }
 
-    /** 一行内 {@code get_json_object} 的 JSON 解析缓存（线程本地；页 / 行切换即失效）。 */
+    /** 行级 JSON 缓存覆盖的函数族（语义见各自注册实现；此处只负责「解析一次」）。 */
+    private static final Set<String> JSON_CACHED_FUNCTIONS = Set.of(
+            "get_json_object", "json_extract", "from_str_to_array",
+            "json_array_explode", "json_array_explode_with_separator");
+
+    /**
+     * 是否是走行级 JSON 缓存的函数 —— {@link com.dojao.core.operator.ScalarProjectOperator}
+     * 据此把这些顶层投影从「已注册标量函数快路径」改到通用表达式路径：注册表直调每次都会
+     * readTree，行级缓存只存在于 {@link #evalFuncCall}。
+     */
+    public static boolean isJsonCachedFunction(String name) {
+        return name != null && JSON_CACHED_FUNCTIONS.contains(name.toLowerCase(Locale.ROOT));
+    }
+
+    private static boolean jsonArityOk(String name, int n) {
+        return switch (name) {
+            case "get_json_object", "json_array_explode" -> n == 2;
+            case "json_extract" -> n >= 2;
+            case "from_str_to_array" -> n == 1;
+            case "json_array_explode_with_separator" -> n >= 3;
+            default -> false;
+        };
+    }
+
+    /**
+     * JSON 函数族的统一求值入口：第一个参数先取「已解析节点」再交给节点版实现，
+     * 避免同一行内对同一段 JSON 反复 {@code readTree}。
+     *
+     * <p><b>NULL 口径不变</b>：参数 SQL NULL 与「非法 JSON」对多数函数同为 NULL 结果，
+     * 但 {@code json_extract} 多路径对非法 JSON 返回全 null 的数组文本（历史行为），
+     * 故用 {@link #JSON_ARG_NULL} 区分两者。</p>
+     */
+    private static Object evalJsonFunc(ExprNode.FuncCall f, String name, VectorSchemaRoot root,
+                                       int row, Map<String, Integer> indexOf) {
+        JsonRowCache cache = JSON_CACHE.get();
+        if (!cache.matches(root, row)) cache.reset(root, row);
+        switch (name) {
+            case "get_json_object": {
+                Object node = jsonNodeFor(cache, f.args().get(0), root, row, indexOf);
+                Object pathArg = eval(f.args().get(1), root, row, indexOf);
+                if (pathArg == null || node == JSON_ARG_NULL) return null;
+                return StringFunctions.jsonValue(castNode(node), ScalarSupport.string(pathArg));
+            }
+            case "json_extract": {
+                String[] paths = new String[f.args().size() - 1];
+                for (int i = 0; i < paths.length; i++) {
+                    Object p = eval(f.args().get(i + 1), root, row, indexOf);
+                    if (p == null) return null;
+                    paths[i] = ScalarSupport.string(p);
+                }
+                Object node = jsonNodeFor(cache, f.args().get(0), root, row, indexOf);
+                if (node == JSON_ARG_NULL) return null;   // SQL NULL ≠ 非法 JSON（后者多路径落全 null 数组）
+                return StringFunctions.jsonExtract(castNode(node), paths);
+            }
+            case "from_str_to_array": {
+                Object node = jsonNodeFor(cache, f.args().get(0), root, row, indexOf);
+                if (node == JSON_ARG_NULL) return null;
+                return ExprBuiltins.jsonTextArray(castNode(node));
+            }
+            case "json_array_explode": {
+                Object key = eval(f.args().get(1), root, row, indexOf);
+                if (key == null) return null;
+                Object node = jsonNodeFor(cache, f.args().get(0), root, row, indexOf);
+                if (node == JSON_ARG_NULL) return null;
+                return ExprBuiltins.jsonFieldArray(castNode(node), ScalarSupport.string(key));
+            }
+            case "json_array_explode_with_separator": {
+                Object sep = eval(f.args().get(1), root, row, indexOf);
+                if (sep == null) return null;
+                String[] paths = new String[f.args().size() - 2];
+                for (int i = 0; i < paths.length; i++) {
+                    Object p = eval(f.args().get(i + 2), root, row, indexOf);
+                    if (p == null) return null;
+                    paths[i] = ScalarSupport.string(p);
+                }
+                Object node = jsonNodeFor(cache, f.args().get(0), root, row, indexOf);
+                if (node == JSON_ARG_NULL) return null;
+                return ExprBuiltins.jsonFieldJoinArray(
+                        castNode(node), ScalarSupport.string(sep), paths);
+            }
+            default:
+                throw new IllegalStateException("未处理的 JSON 函数: " + name);
+        }
+    }
+
+    private static JsonNode castNode(Object node) {
+        return node == null || node == JSON_ARG_NULL ? null : (JsonNode) node;
+    }
+
+    /**
+     * 第一个 JSON 参数 → 已解析节点。返回三类值：
+     * <ul>
+     *   <li>{@link com.fasterxml.jackson.databind.JsonNode} —— 解析成功；</li>
+     *   <li>{@code null} —— 文本非 NULL 但 JSON 非法 / 为空；</li>
+     *   <li>{@link #JSON_ARG_NULL} —— 参数在 SQL 层为 NULL。</li>
+     * </ul>
+     *
+     * <p>三种取法都走行级缓存：<b>裸列</b>按列名缓存整棵树（宽表 100+ 个函数引用同一列时
+     * 只解析一次）；<b>{@code get_json_object(裸列, path)}</b> 直接在缓存的树上下钻并缓存子树，
+     * 省掉「序列化回文本 → 再 readTree」的往返（{@code json_array_explode(get_json_object(...))}
+     * 等嵌套正是这种形态）；其余表达式先求值成文本，再按<b>同一 String 实例</b>命中一行内
+     * 上一次解析的结果。</p>
+     */
+    private static Object jsonNodeFor(JsonRowCache cache, ExprNode arg, VectorSchemaRoot root,
+                                      int row, Map<String, Integer> indexOf) {
+        if (arg instanceof ExprNode.Column col) {
+            return columnJsonNode(cache, col.name(), root, row, indexOf);
+        }
+        if (arg instanceof ExprNode.FuncCall inner
+                && "get_json_object".equalsIgnoreCase(inner.name())
+                && inner.args().size() == 2
+                && inner.args().get(0) instanceof ExprNode.Column col) {
+            Object rootNode = columnJsonNode(cache, col.name(), root, row, indexOf);
+            Object pathArg = eval(inner.args().get(1), root, row, indexOf);
+            if (rootNode == JSON_ARG_NULL || rootNode == null || pathArg == null) {
+                return JSON_ARG_NULL;
+            }
+            String path = ScalarSupport.string(pathArg);
+            String key = col.name() + '' + path;
+            if (cache.subNodes.containsKey(key)) return cache.subNodes.get(key);
+            JsonNode hit = StringFunctions.resolveNode((JsonNode) rootNode, path);
+            Object value = hit == null ? JSON_ARG_NULL : hit;
+            cache.subNodes.put(key, value);
+            return value;
+        }
+        Object raw = eval(arg, root, row, indexOf);
+        if (raw == null) return JSON_ARG_NULL;
+        String text = ScalarSupport.string(raw);
+        if (cache.lastText == text) return cache.lastNode;
+        cache.parses++;
+        JsonNode node = StringFunctions.parseJson(text);
+        cache.lastText = text;
+        cache.lastNode = node;
+        return node;
+    }
+
+    private static Object columnJsonNode(JsonRowCache cache, String column, VectorSchemaRoot root,
+                                         int row, Map<String, Integer> indexOf) {
+        if (cache.nodes.containsKey(column)) return cache.nodes.get(column);
+        Object raw = readColumn(root, row, indexOf, column);
+        if (raw != null) cache.parses++;
+        Object value = raw == null ? JSON_ARG_NULL : StringFunctions.parseJson(ScalarSupport.string(raw));
+        cache.nodes.put(column, value);
+        return value;
+    }
+
+    /** 参数在 SQL 层为 NULL（区别于「非 NULL 但 JSON 非法」）。 */
+    private static final Object JSON_ARG_NULL = new Object();
+
+    /** 一行内的 JSON 解析缓存（线程本地；页 / 行切换即失效）。 */
     private static final ThreadLocal<JsonRowCache> JSON_CACHE =
             ThreadLocal.withInitial(JsonRowCache::new);
+
+    /**
+     * 丢弃当前线程的行级 JSON 缓存 —— 页求值结束后调用，避免工作线程在空闲期仍持有
+     * 上一页 root / 解析树的引用（大页 buffer 不能被回收）。
+     */
+    public static void clearJsonCache() {
+        JSON_CACHE.remove();
+    }
+
+    /**
+     * 当前线程自上次 {@link #clearJsonCache()} 以来的 JSON {@code readTree} 次数（诊断用）。
+     * 行外层共享生效时整页解析次数 ≈ 行数 × 不同根列数，而非 行数 × 投影数。
+     */
+    public static long jsonParseCount() {
+        return JSON_CACHE.get().parses;
+    }
 
     private static final class JsonRowCache {
         Object root;
         int row = -1;
-        final Map<String, com.fasterxml.jackson.databind.JsonNode> nodes = new java.util.HashMap<>(4);
+        /** 实际 {@code readTree} 次数（不清零，随 {@link #clearJsonCache()} 一并丢弃）。 */
+        long parses;
+        /** 列名 → 整棵树（值为 null 表示非法 JSON，{@link #JSON_ARG_NULL} 表示 SQL NULL）。 */
+        final Map<String, Object> nodes = new HashMap<>(4);
+        /** {@code 列名\0path} → get_json_object 的子树（避免序列化-再解析往返）。 */
+        final Map<String, Object> subNodes = new HashMap<>(4);
+        /** 其它文本参数的「上一次解析」快照（引用相等才命中，避免大字符串 equals 开销）。 */
+        String lastText;
+        com.fasterxml.jackson.databind.JsonNode lastNode;
 
         boolean matches(Object r, int rw) {
             return root == r && row == rw;
@@ -491,6 +681,9 @@ public final class ExprEvaluator {
             root = newRoot;
             row = newRow;
             nodes.clear();
+            subNodes.clear();
+            lastText = null;
+            lastNode = null;
         }
     }
 

@@ -821,8 +821,8 @@ public class HiveConnector implements DojaoConnector, OverwriteEnable {
      * 「够前缀的那几个文件」并返回<b>一个</b>切片（见 {@link #prefixFiles}）—— 连裁剪后的目录都
      * 不用列全，也不去开那些根本读不到的并行线程。该分支不参与合并、也不做文件内切割：它的分组
      * 口径是「按行数凑够前缀」，且 reader 拿到前缀文件后读够 limit 即自停。</p>
-     *
-     * <p>返回空列表 = 「不可切分，按整表单片走」（并行度 ≤ 1、带 limit/offset、无数据文件、
+
+     * <p>返回*空列表 = 「不可切分，按整表单片走」（并行度 ≤ 1、带 limit/offset、无数据文件、
      * 前缀文件数不可知），由引擎回退成 {@code ScanSlice.whole}。谓词原样保留在 {@code request} 里
      * —— 切片不借用 {@code filterExpression} 传递私有信息。</p>
      */

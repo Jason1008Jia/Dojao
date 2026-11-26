@@ -125,8 +125,8 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
      * Worker 的 {@code putNext} 随之阻塞，形成端到端背压。</p>
      */
     private static final int EVENT_QUEUE_CAPACITY = 64;
-    private final BlockingQueue<ScanEvent> eventQueue =
-            new ScanEventQueue(EVENT_QUEUE_CAPACITY, ByteBoundedQueue.defaultBudgetBytes());
+    private final ScanEventQueue eventQueue =
+            new ScanEventQueue(EVENT_QUEUE_CAPACITY, Math.min(128L << 20, ByteBoundedQueue.defaultBudgetBytes()));
     /** 控制面：taskId → 分区任务跟踪记录。 */
     private final ConcurrentHashMap<String, ScanTask> taskTracker = new ConcurrentHashMap<>();
     /** 已确认完成（ScanFinished）的分区计数，到齐 totalPartitions 则 EOF。 */
@@ -504,6 +504,9 @@ public class DistributedScanOperator extends AbstractMeasurableOperator implemen
         }
         // 排空事件队列并关闭残余数据页（对齐 AbstractDistributedOperator.doClose）—— 直接 clear()
         // 会丢弃排队中的 ScanPage 却不 close()，其 Arrow 缓冲随之泄漏（实测 32MB）。
+        // ★先关闭队列：与 doClose 并发的接收线程可能在 drain 之后才 put 成功（旧唯一的泄漏口，
+        //   每次「LIMIT 提前收尾 / 用户取消」漏掉几页，累积到 1.1GB 后整节点 Arrow OOM）。
+        eventQueue.closeQueue();
         ScanEvent ev;
         while ((ev = eventQueue.poll()) != null) {
             if (ev instanceof ScanEvent.ScanPage sp) {

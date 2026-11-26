@@ -28,4 +28,15 @@ final class ScanEventQueue extends ByteBoundedQueue<ScanEvent> {
         }
         return 0L;
     }
+
+    /** 队列已关闭后的迟到页：立即释放，避免滞留在无人消费的队列里（Master 堆外泄漏）。 */
+    @Override
+    protected void reject(ScanEvent e) {
+        if (e instanceof ScanEvent.ScanPage p && p.page() != null) {
+            try {
+                p.page().close();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
 }

@@ -259,6 +259,16 @@ public final class ResourceConfig {
     public static final String QUERY_PARTITION_METADATA_SCAN = "query.partition.metadataScan";
     /** 多次引用 CTE 物化开关（{@code query.cte.materialize}，默认开）。 */
     public static final String QUERY_CTE_MATERIALIZE = "query.cte.materialize";
+
+    /**
+     * 强制物化开关（{@code query.cte.materialize.heavy}，默认 {@code true}）：
+     * <b>即使</b> {@code query.cte.materialize=false} 也仍然物化多引用 CTE。
+     *
+     * <p>关闭普通物化不该让「被引用 N 次的 CTE」被内联 N 份 —— 里面的窗口/聚合会被重复排序、
+     * 重复聚合（#9）。要彻底关闭物化（接受重复计算），需把本键与 {@code query.cte.materialize}
+     * 同时设为 {@code false}。</p>
+     */
+    public static final String QUERY_CTE_MATERIALIZE_HEAVY = "query.cte.materialize.heavy";
     /**
      * 物化 CTE 随切片下发的 wire 载荷总量上限（{@code query.cte.wire.maxBytes}）。
      *
@@ -1276,6 +1286,12 @@ public final class ResourceConfig {
      */
     public static boolean cteMaterializeEnabled() {
         String v = value(QUERY_CTE_MATERIALIZE, String.valueOf(DEFAULT_CTE_MATERIALIZE));
+        return !"false".equalsIgnoreCase(v.trim());
+    }
+
+    /** 重体（窗口/聚合/DISTINCT）多引用 CTE 的强制物化开关，默认 {@code true}。 */
+    public static boolean cteMaterializeHeavyEnabled() {
+        String v = value(QUERY_CTE_MATERIALIZE_HEAVY, "true");
         return !"false".equalsIgnoreCase(v.trim());
     }
 

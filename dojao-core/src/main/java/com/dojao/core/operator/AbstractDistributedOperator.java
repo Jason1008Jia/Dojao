@@ -86,13 +86,10 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
      * Arrow 预算（线上 {@code row_number()} 派生表整表回传：接收线程分配 2MB 时已占 1.1GB）。
      * 字节预算与扫描回传同口径（{@link ByteBoundedQueue#defaultBudgetBytes()}）。</p>
      */
-    protected final BlockingQueue<FragmentEvent> resultQueue =
-            new FragmentEventQueue(RESULT_QUEUE_CAPACITY,
-                    // 回传数据页预算：默认 = 节点 Arrow 预算/4（Master 上可达 ~275MB）。
-                    // 宽行写回（143 列 JSON 提取 + 多 worker 并发 copyPage）时仍嫌大 —— 再封顶 128MB，
-                    // 把「排队页 + Flight 流根 + copyPage 瞬时拷贝」压在 Master 预算内（线上 2026-11-24
-                    // 当前分配 1.11GB 时申请 2MB 失败）。
-                    Math.min(128L << 20, ByteBoundedQueue.defaultBudgetBytes()));
+    protected final BlockingQueue<FragmentEvent> resultQueue;
+    /** 实体类型引用（{@link #resultQueue} 的同一对象）：doClose 需要 closeQueue() —— 关队列后
+     *  迟到页立即释放，堵住「drain 之后 put 成功 → 页永远留在死队列」的泄漏。 */
+    private final FragmentEventQueue resultQueueImpl;
     /**
      * Worker 回传的<b>控制事件</b>队列（FINISHED / FAILED / PROGRESS，无界）。
      *
@@ -164,6 +161,13 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
         this.numPartitions = Math.max(1, numPartitions);
         this.gateway = gateway;
         this.workers = List.copyOf(workers);
+        // 回传数据页预算：默认 = 节点 Arrow 预算/4（Master 上可达 ~275MB）。
+        // 宽行写回（143 列 JSON 提取 + 多 worker 并发 copyPage）时仍嫌大 —— 再封顶 128MB，
+        // 把「排队页 + Flight 流根 + copyPage 瞬时拷贝」压在 Master 预算内（线上 2026-11-24
+        // 当前分配 1.11GB 时申请 2MB 失败）。
+        this.resultQueueImpl = new FragmentEventQueue(RESULT_QUEUE_CAPACITY,
+                Math.min(128L << 20, ByteBoundedQueue.defaultBudgetBytes()));
+        this.resultQueue = resultQueueImpl;
     }
 
     /**
@@ -903,6 +907,9 @@ public abstract class AbstractDistributedOperator extends AbstractMeasurableOper
             }
         }
         // 2. 排空结果队列，关闭残余数据页；控制事件无资源可放
+        //    ★先关闭：与 doClose 并发的接收线程可能在 drain 之后才 put 成功 → 页留在死队列里
+        //      （每次「LIMIT 提前收尾 / 用户取消」漏几页，累积到 1.1GB 后整节点 Arrow OOM）。
+        resultQueueImpl.closeQueue();
         FragmentEvent ev;
         while ((ev = resultQueue.poll()) != null) {
             if (ev instanceof FragmentEvent.FragmentData d) {

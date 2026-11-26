@@ -1,7 +1,9 @@
 package com.dojao.server.master;
 
 import com.dojao.common.data.Page;
+import com.dojao.common.memory.AllocatorUsage;
 import com.dojao.common.memory.NodeMemory;
+import com.dojao.common.memory.SizeFormat;
 import com.dojao.core.operator.RowAccumulator;
 import com.dojao.core.rpc.FlightActions;
 import com.dojao.core.rpc.QueryRequest;
@@ -64,10 +66,23 @@ public final class MasterControlFlightProducer implements FlightProducer {
 
     private static final Logger log = LoggerFactory.getLogger(MasterControlFlightProducer.class);
 
+    /**
+     * 结果回传拷贝的节点级水位：超过即暂停拷贝（等待消费/释放）。留 20% 给 Flight 帧化
+     * （{@code ArrowMessage.frame} 的 4MB 块）与 {@code copyPage} 的变长扩容 —— 这些分配发生在
+     * 「余量检查」之后，不能指望它们自己等到水位以下。
+     */
+    private static final double NODE_COPY_WATERMARK = 0.80;
+
     private final QueryServiceImpl queryService;
     private final WorkerRegistry registry;
     private final ResultRouter router;
     private final BufferAllocator allocator;
+    /**
+     * 串行化「余量检查 + 拷贝」。<b>为什么必须是锁而不是仅检查</b>：N 路 Flight 收流线程并发，
+     * 各自看到「低于水位」就通过，然后同时 copyPage —— 合计能越过硬上限（线上 6 路分区回传，
+     * 分配 4MB 时已占 1.11GB）。锁内完成检查与分配，把在途拷贝压到 1 页。
+     */
+    private final Object copyLock = new Object();
 
     public MasterControlFlightProducer(QueryServiceImpl queryService,
                                        WorkerRegistry registry,
@@ -267,8 +282,7 @@ public final class MasterControlFlightProducer implements FlightProducer {
                     VectorSchemaRoot root = flightStream.getRoot();
                     if (root.getRowCount() > 0 && sink != null) {
                         // 接收端「即将占用更多堆外」——先过背压闸门，把多页滞留压回读取端
-                        awaitAllocatorHeadroom(allocator);
-                        sink.data(copyPage(root, allocator));
+                        deliverPage(taskId, sink, root);
                     }
                     continue;
                 }
@@ -281,8 +295,7 @@ public final class MasterControlFlightProducer implements FlightProducer {
                             // 拷贝进 Master 分配器 → 路由入队；队列满阻塞 = 背压（Worker 生产随之阻塞）。
                             // throttle 在拷贝前施加：堆外高水位时先等溢写/消费把用量压下来，
                             // 避免结果回传洪峰把 Arrow 预算（尤其单机回退的多窗口分组）瞬间吃穿。
-                            awaitAllocatorHeadroom(allocator);
-                            sink.data(copyPage(root, allocator));
+                            deliverPage(taskId, sink, root);
                         }
                     }
                     case FINISHED -> {
@@ -336,9 +349,21 @@ public final class MasterControlFlightProducer implements FlightProducer {
                 response.close();
             }
         } catch (Exception e) {
-            // 关键：不吞异常 —— Worker 全部 FINISHED 未送达时这里是最先暴露的地方
-            log.error("doExchange 处理异常: taskId={}", taskId, e);
-            if (!terminalDelivered && sink != null && !router.isCancelled(taskId)) {
+            boolean cancelled = router.get(taskId) == null || router.isCancelled(taskId);
+            if (isOutOfMemory(e)) {
+                // 内存类失败最需要「谁在占」：把分配器现状与各类别 TOP 打出来，下一次不必再猜。
+                log.error("[内存] 结果回传 OOM: taskId={} 分配器={}/上限 {}；占比 TOP: {}",
+                        taskId, SizeFormat.bytes(allocator.getAllocatedMemory()),
+                        SizeFormat.bytes(allocator.getLimit()),
+                        allocatorDigest(), SizeFormat.humanize(String.valueOf(e)));
+            } else if (cancelled) {
+                // 取消 / 提前收尾（LIMIT 已够行数）时上游被中断属正常，不刷 ERROR。
+                log.info("doExchange 中止（任务已取消/摘除）: taskId={} cause={}", taskId, e.toString());
+            } else {
+                // 关键：不吞异常 —— Worker 全部 FINISHED 未送达时这里是最先暴露的地方
+                log.error("doExchange 处理异常: taskId={}", taskId, e);
+            }
+            if (!terminalDelivered && sink != null && !cancelled) {
                 try {
                     sink.streamEnded("结果流异常中断且未收到 FINISHED/FAILED: " + e);
                 } catch (Exception sinkError) {
@@ -368,38 +393,100 @@ public final class MasterControlFlightProducer implements FlightProducer {
         return workerId.substring(0, Math.min(8, workerId.length()));
     }
 
-    /** 原生 batch → 独立 allocator 的页（逐列拷贝，var 列安全；与交换接收端同构）。 */
     /**
-     * 拷贝前等待 Master Arrow 分配器腾出安全余量（默认至少 1/8 且不低于 64MB）。
+     * 把 FlightStream 当前页拷进 Master 分配器并交给结果汇（<b>页所有权：成功入队交给汇</b>）。
+     *
+     * <p>所有失败路径（任务已取消 / 队列已关闭 / 拷贝异常）都在这里 {@code close()}，绝不把
+     * 已分配的 Arrow 页留在无主状态 —— 这是「反复 LIMIT 查询后 Master 分配器只涨不降，
+     * 最终 1.1GB 时连 4MB 都分不出」的直接原因。</p>
+     */
+    private void deliverPage(String taskId, ResultSink sink, VectorSchemaRoot root) throws Exception {
+        // 取消 / 提前收尾后汇已摘除：别再拷贝（拷了也没人消费）。
+        if (router.get(taskId) != sink) return;
+        Page page;
+        synchronized (copyLock) {
+            awaitAllocatorHeadroom(allocator, taskId, sink);
+            page = copyPage(root, allocator);
+        }
+        try {
+            sink.data(page);
+        } catch (Exception e) {
+            page.close();
+            throw e;
+        }
+    }
+
+    /**
+     * 拷贝前等待 Master Arrow 分配器腾出安全余量（默认至少 1/4 且不低于 96MB）。
      *
      * <p>本方法在 gRPC 收流线程上执行：等待期间 Worker 的 Flight 流控自然阻塞，上游扫描/计算随之
      * 降速 —— 这正是我们要的端到端背压。结果页由 Master 侧 sink（写 Hive / 回传 UI）消费释放，
-     * 正常会持续推进；查询取消时线程被中断，检查点立即退出。</p>
+     * 正常会持续推进；任务被取消 / 汇被摘除时立即退出，避免线程永久挂在一个已被遗弃的任务上。</p>
      */
-    private static void awaitAllocatorHeadroom(BufferAllocator alloc) throws InterruptedException {
+    private void awaitAllocatorHeadroom(BufferAllocator alloc, String taskId, ResultSink sink)
+            throws InterruptedException {
         long limit = alloc.getLimit();
-        if (limit <= 0 || limit == Long.MAX_VALUE) return;
-        long headroom = Math.max(64L << 20, limit / 8);
-        long keepBelow = Math.max(1L, limit - headroom);
-        while (alloc.getAllocatedMemory() > keepBelow) {
+        long headroom = limit <= 0 || limit == Long.MAX_VALUE
+                ? 0L : Math.max(96L << 20, limit / 4);
+        long keepBelow = limit <= 0 || limit == Long.MAX_VALUE ? Long.MAX_VALUE : Math.max(1L, limit - headroom);
+        // 两个水位都要满足：本分配器余量 + <b>节点整体</b>余量。只看本分配器不够 —— 算子 / 连接器
+        // 各自也吃同一个共享根，本分配器 75% + 其它 50% 同样会把根撑爆。
+        while (alloc.getAllocatedMemory() > keepBelow
+                || NodeMemory.shared().directUsageRatio() > NODE_COPY_WATERMARK) {
+            if (router.get(taskId) != sink) throw new InterruptedException("结果汇已摘除（任务取消/收尾）");
             NodeMemory.shared().throttle();
             Thread.sleep(10);
         }
     }
 
+    /** 分配器各类别占用摘要（TOP 6），OOM 时定位「谁在占内存」。 */
+    private static String allocatorDigest() {
+        List<AllocatorUsage> top = NodeMemory.shared().snapshot();
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < Math.min(6, top.size()); i++) {
+            AllocatorUsage u = top.get(i);
+            if (u.allocatedBytes() <= 0) break;
+            if (sb.length() > 0) sb.append(", ");
+            sb.append(u.category()).append('=').append(SizeFormat.bytes(u.allocatedBytes()));
+        }
+        return sb.length() == 0 ? "<none>" : sb.toString();
+    }
+
+    private static boolean isOutOfMemory(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof OutOfMemoryError
+                    || c.getClass().getName().contains("OutOfMemory")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 原生 batch → 独立 allocator 的页（逐列拷贝，var 列安全；与交换接收端同构）。 */
     private static Page copyPage(VectorSchemaRoot src, BufferAllocator allocator) {
         int rc = src.getRowCount();
         List<FieldVector> copied = new ArrayList<>(src.getFieldVectors().size());
-        for (int col = 0; col < src.getFieldVectors().size(); col++) {
-            FieldVector s = src.getVector(col);
-            FieldVector d = s.getField().createVector(allocator);
-            d.setInitialCapacity(rc);
-            d.allocateNew();
-            RowAccumulator.copyColumnBatch(s, d, 0, 0, rc);
-            d.setValueCount(rc);
-            copied.add(d);
+        try {
+            for (int col = 0; col < src.getFieldVectors().size(); col++) {
+                FieldVector s = src.getVector(col);
+                FieldVector d = s.getField().createVector(allocator);
+                d.setInitialCapacity(rc);
+                d.allocateNew();
+                RowAccumulator.copyColumnBatch(s, d, 0, 0, rc);
+                d.setValueCount(rc);
+                copied.add(d);
+            }
+            return Page.fromRoot(new VectorSchemaRoot(src.getSchema().getFields(), copied, rc));
+        } catch (RuntimeException | Error e) {
+            // 拷贝中途失败（典型 = OOM）：已分配的前几列必须释放，否则又是一次无主泄漏。
+            for (FieldVector v : copied) {
+                try {
+                    v.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            throw e;
         }
-        return Page.fromRoot(new VectorSchemaRoot(src.getSchema().getFields(), copied, rc));
     }
 
     private static VectorSchemaRoot emptyRoot(BufferAllocator allocator) {

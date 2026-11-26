@@ -31,10 +31,37 @@ abstract class ByteBoundedQueue<T> extends LinkedBlockingQueue<T> {
     private final Object bytesLock = new Object();
     /** 队列中（未出队）数据页的字节数。 */
     private long queuedBytes;
+    /**
+     * 队列是否已关闭（消费方 doClose 后置位）。关闭后<b>任何</b>迟到入队都必须立即释放，
+     * 否则会滞留在已无人消费的队列里，随查询次数累积成 Arrow 泄漏。
+     */
+    private volatile boolean closed;
 
     ByteBoundedQueue(int capacity, long maxBytes) {
         super(capacity);
         this.maxBytes = Math.max(1L, maxBytes);
+    }
+
+    /**
+     * 关闭接收队列：此后入队的数据页交给 {@link #reject} 立即释放，且唤醒正在等待字节额度的
+     * 生产线程。调用方（算子 doClose）随后排空并关闭队列中<b>已存在</b>的页。
+     */
+    void closeQueue() {
+        closed = true;
+        synchronized (bytesLock) {
+            bytesLock.notifyAll();
+        }
+    }
+
+    boolean isClosed() {
+        return closed;
+    }
+
+    /**
+     * 队列已关闭时收到的事件。默认忽略（不持有资源的事件）；持有 Arrow 页的子类必须在此
+     * 调用 {@code page.close()}，否则页就是泄漏。
+     */
+    protected void reject(T e) {
     }
 
     /** 事件占用的堆外字节数；非数据事件返回 0（不受字节预算约束）。 */
@@ -55,19 +82,37 @@ abstract class ByteBoundedQueue<T> extends LinkedBlockingQueue<T> {
 
     @Override
     public void put(T e) throws InterruptedException {
-        reserveUntil(e, Long.MAX_VALUE);
+        if (!reserveUntil(e, Long.MAX_VALUE)) {
+            reject(e);
+            throw new IllegalStateException("结果接收队列已关闭");
+        }
         try {
             super.put(e);
         } catch (InterruptedException | RuntimeException ex) {
             release(e);
             throw ex;
         }
+        // closeQueue 与 put 并发：入队后才发现已关闭 → 立刻摘出并释放，绝不留在死队列里
+        if (closed && remove(e)) {
+            release(e);
+            reject(e);
+        }
     }
 
     @Override
     public boolean offer(T e) {
-        if (!tryReserve(e)) return false;
-        if (super.offer(e)) return true;
+        if (!tryReserve(e)) {
+            if (closed) reject(e);
+            return false;
+        }
+        if (super.offer(e)) {
+            if (closed && remove(e)) {
+                release(e);
+                reject(e);
+                return false;
+            }
+            return true;
+        }
         release(e);
         return false;
     }
@@ -75,9 +120,17 @@ abstract class ByteBoundedQueue<T> extends LinkedBlockingQueue<T> {
     @Override
     public boolean offer(T e, long timeout, TimeUnit unit) throws InterruptedException {
         long deadline = System.nanoTime() + Math.max(0L, unit.toNanos(timeout));
-        if (!reserveUntil(e, deadline)) return false;
+        if (!reserveUntil(e, deadline)) {
+            if (closed) reject(e);
+            return false;
+        }
         try {
             if (super.offer(e, Math.max(0L, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)) {
+                if (closed && remove(e)) {
+                    release(e);
+                    reject(e);
+                    return false;
+                }
                 return true;
             }
         } catch (InterruptedException | RuntimeException ex) {
@@ -137,21 +190,24 @@ abstract class ByteBoundedQueue<T> extends LinkedBlockingQueue<T> {
     // ==================== 字节记账 ====================
 
     private boolean tryReserve(T e) {
+        if (closed) return false;
         long bytes = bytesOf(e);
         if (bytes <= 0) return true;
         synchronized (bytesLock) {
+            if (closed) return false;
             if (queuedBytes > 0 && queuedBytes + bytes > maxBytes) return false;
             queuedBytes += bytes;
             return true;
         }
     }
 
-    /** @return false = 到 deadline 还没腾出预算（{@code Long.MAX_VALUE} = 一直等） */
+    /** @return false = 队列已关闭，或到 deadline 还没腾出预算（{@code Long.MAX_VALUE} = 一直等） */
     private boolean reserveUntil(T e, long deadlineNanos) throws InterruptedException {
+        if (closed) return false;
         long bytes = bytesOf(e);
         if (bytes <= 0) return true;
         synchronized (bytesLock) {
-            while (queuedBytes > 0 && queuedBytes + bytes > maxBytes) {
+            while (!closed && queuedBytes > 0 && queuedBytes + bytes > maxBytes) {
                 if (deadlineNanos == Long.MAX_VALUE) {
                     bytesLock.wait();
                 } else {
@@ -160,6 +216,7 @@ abstract class ByteBoundedQueue<T> extends LinkedBlockingQueue<T> {
                     bytesLock.wait(Math.max(1L, remainNanos / 1_000_000L));
                 }
             }
+            if (closed) return false;
             queuedBytes += bytes;
             return true;
         }

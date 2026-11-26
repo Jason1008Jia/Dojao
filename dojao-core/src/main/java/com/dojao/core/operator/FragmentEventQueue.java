@@ -29,4 +29,15 @@ final class FragmentEventQueue extends ByteBoundedQueue<FragmentEvent> {
         }
         return 0L;
     }
+
+    /** 队列已关闭后的迟到页：立即释放，避免滞留在无人消费的队列里（Master 堆外泄漏）。 */
+    @Override
+    protected void reject(FragmentEvent e) {
+        if (e instanceof FragmentEvent.FragmentData d && d.page() != null) {
+            try {
+                d.page().close();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
 }

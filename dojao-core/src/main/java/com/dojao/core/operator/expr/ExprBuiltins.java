@@ -218,17 +218,29 @@ public final class ExprBuiltins {
     }
 
     /**
-     * JSON 数组文本 → 文本列表；非法 JSON 或非数组 → null。元素口径与 get_json_object 一致：
-     * 值节点取 {@code asText()}，对象/数组子节点保留 JSON 文本，JSON null → null 元素。
-     * 用 ArrayList 而非 List.of —— 子元素允许 NULL。
+     * JSON 文本 → 节点（非法 / null → null）。供表达式求值器「同一行同一文本只解析一次」的
+     * 行级缓存复用；数组函数另有节点版入口，缓存命中时可直接跳过解析。
      */
-    private static List<String> jsonTextArray(String text) {
-        JsonNode node;
+    public static JsonNode parseJsonText(String text) {
+        if (text == null) return null;
         try {
-            node = JSON_MAPPER.readTree(text);
+            return JSON_MAPPER.readTree(text);
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /** 文本版入口（内置函数 apply 路径）。 */
+    private static List<String> jsonTextArray(String text) {
+        return jsonTextArray(parseJsonText(text));
+    }
+
+    /**
+     * 已解析节点 → 文本列表；null / 非数组 → null。元素口径与 get_json_object 一致：
+     * 值节点取 {@code asText()}，对象/数组子节点保留 JSON 文本，JSON null → null 元素。
+     * 用 ArrayList 而非 List.of —— 子元素允许 NULL。
+     */
+    public static List<String> jsonTextArray(JsonNode node) {
         if (node == null || !node.isArray()) return null;
         List<String> out = new ArrayList<>(node.size());
         for (JsonNode el : node) {
@@ -245,12 +257,11 @@ public final class ExprBuiltins {
      * {@link #jsonFieldArray} 一致（标量取 {@code asText()}，对象/数组保留 JSON 文本）。
      */
     private static List<String> jsonFieldJoinArray(String text, String separator, String[] paths) {
-        JsonNode node;
-        try {
-            node = JSON_MAPPER.readTree(text);
-        } catch (Exception e) {
-            return null;
-        }
+        return jsonFieldJoinArray(parseJsonText(text), separator, paths);
+    }
+
+    /** 已解析节点版（供行级 JSON 缓存复用，跳过重复 readTree）。 */
+    public static List<String> jsonFieldJoinArray(JsonNode node, String separator, String[] paths) {
         if (node == null || !node.isArray()) return null;
         List<String> out = new ArrayList<>(node.size());
         for (JsonNode el : node) {
@@ -274,19 +285,26 @@ public final class ExprBuiltins {
         return out;
     }
 
-    /** 取 JSON path：{@code jobName} / {@code $.jobName} / {@code $.a.b}；任一层缺失 → null。 */
+    /**
+     * 取 JSON path：{@code jobName}（裸字段名）/ {@code $.jobName} / {@code $.a.b} /
+     * {@code $['a']} / {@code $[0]}；任一层缺失或 JSON null → null。
+     *
+     * <p><b>裸名与 {@code $.} 前缀等价</b>：旧 {@code json_array_explode} 只认字面键
+     * （{@code el.get(key)}），用户写 {@code '$.jobName'} 会整列静默 NULL；这里先归一
+     * 成 {@code $.} 路径再走 {@link StringFunctions#resolveNode}，与
+     * {@code json_array_explode_with_separator} 的口径统一。</p>
+     */
     private static JsonNode pathValue(JsonNode obj, String path) {
         String p = path == null ? "" : path.trim();
-        if (p.startsWith("$")) p = p.substring(1);
-        while (p.startsWith(".")) p = p.substring(1);
         if (p.isEmpty()) return obj;
-        JsonNode cur = obj;
-        for (String seg : p.split("\\.")) {
-            if (cur == null || !cur.isObject()) return null;
-            cur = cur.get(seg);
-            if (cur == null) return null;
-        }
-        return cur;
+        if (!p.startsWith("$")) p = "$." + p;
+        // 归一：'$' / '$.' / '.a' / '$.a' 都按「从根开始」处理；括号段（$['a'] / $[0]）交给 resolveNode
+        int i = 1;
+        while (i < p.length() && p.charAt(i) == '.') i++;
+        if (i >= p.length()) return obj;
+        String rest = p.substring(i);
+        return com.dojao.core.function.scalar.string.StringFunctions.resolveNode(
+                obj, rest.startsWith("[") ? "$" + rest : "$." + rest);
     }
 
     /**
@@ -295,16 +313,15 @@ public final class ExprBuiltins {
      * JSON null → null）；元素不是对象或没有该字段 → null（保留下标对齐）。
      */
     private static List<String> jsonFieldArray(String text, String key) {
-        JsonNode node;
-        try {
-            node = JSON_MAPPER.readTree(text);
-        } catch (Exception e) {
-            return null;
-        }
+        return jsonFieldArray(parseJsonText(text), key);
+    }
+
+    /** 已解析节点版（供行级 JSON 缓存复用，跳过重复 readTree）。 */
+    public static List<String> jsonFieldArray(JsonNode node, String key) {
         if (node == null || !node.isArray()) return null;
         List<String> out = new ArrayList<>(node.size());
         for (JsonNode el : node) {
-            JsonNode v = el != null && el.isObject() ? el.get(key) : null;
+            JsonNode v = el != null && el.isObject() ? pathValue(el, key) : null;
             out.add(v == null || v.isNull() ? null
                     : v.isValueNode() ? v.asText() : v.toString());
         }

@@ -2,6 +2,7 @@ package com.dojao.core.planner;
 
 import com.dojao.core.operator.Explainable;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -69,7 +70,14 @@ public final class PhysicalPlanPrinter {
             }
         }
 
-        List<PhysicalNode> children = node.children();
+        // 子节点：跳过「包了同一个算子」的重复节点（写节点 DistributedWrite[X] 的 child 就是
+        // 算子节点 DistributedWindowChain[X]，两者 operator() 是同一个实例 —— 直接渲染会把
+        // 同一份 window#0 / scan 明细打印两遍，看起来像「有两个窗口」）。
+        List<PhysicalNode> children = new ArrayList<>(node.children().size());
+        for (PhysicalNode child : node.children()) {
+            if (child.operator() == node.operator()) continue;
+            children.add(child);
+        }
         for (int i = 0; i < children.size(); i++) {
             render(children.get(i), childPrefix, i == children.size() - 1, sb, actualRows);
         }

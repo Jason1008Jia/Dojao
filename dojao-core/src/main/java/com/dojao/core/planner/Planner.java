@@ -204,8 +204,10 @@ public final class Planner {
         logicalPlan = inlineCtes(logicalPlan);
         // 多引用 CTE 物化：内联后同一查询体对象出现在 N 个引用点 ⇒ 只规划/执行一次，
         // 结果落盘供各引用重放（否则源表被读 N 次，见漏斗 SQL 4 份分布式聚合）。
-        if (ResourceConfig.cteMaterializeEnabled()) {
-            prepareCteMaterialization(logicalPlan);
+        if (ResourceConfig.cteMaterializeEnabled() || ResourceConfig.cteMaterializeHeavyEnabled()) {
+            prepareCteMaterialization(logicalPlan,
+                    ResourceConfig.cteMaterializeEnabled(),
+                    ResourceConfig.cteMaterializeHeavyEnabled());
         }
         PhysicalNode root;
         boolean skipColumnPruning = false;
@@ -1053,12 +1055,17 @@ public final class Planner {
      * 统计后<b>递归全树</b>登记：即使外层查询体已被物化，它内部的多引用 CTE 仍会因为
      * 该查询体只执行一次而只执行一次 —— 登记它不增加任何执行次数（幂等存储）。</p>
      *
-     * <p>只物化 {@link LogicalPlan.Select} 形态的查询体；UNION 查询体等暂按旧行为逐引用规划。</p>
+     * <p>可物化形态：{@link LogicalPlan.Select} 与集合运算（{@link LogicalPlan.SetOperation}）；
+     * 其它形状逐引用规划，并打印告警。</p>
      */
     private void prepareCteMaterialization(LogicalPlan plan) {
+        prepareCteMaterialization(plan, true, true);
+    }
+
+    private void prepareCteMaterialization(LogicalPlan plan, boolean all, boolean heavyEnabled) {
         IdentityHashMap<LogicalPlan, Integer> counts = new IdentityHashMap<>();
         countCteRefs(plan, counts);
-        registerSharedBodies(plan, counts);
+        registerSharedBodies(plan, counts, all, heavyEnabled);
     }
 
     private static void countCteRefs(LogicalPlan plan, IdentityHashMap<LogicalPlan, Integer> counts) {
@@ -1090,35 +1097,63 @@ public final class Planner {
     }
 
     private void registerSharedBodies(LogicalPlan plan, IdentityHashMap<LogicalPlan, Integer> counts) {
+        registerSharedBodies(plan, counts, true, true);
+    }
+
+    /**
+     * @param all          普通多引用 CTE 是否物化（{@code query.cte.materialize}）
+     * @param heavyEnabled 重体（窗口 / 聚合 / DISTINCT）多引用 CTE 是否强制物化
+     *                     （{@code query.cte.materialize.heavy}，默认 true）
+     */
+    private void registerSharedBodies(LogicalPlan plan, IdentityHashMap<LogicalPlan, Integer> counts,
+                                      boolean all, boolean heavyEnabled) {
         if (plan instanceof LogicalPlan.Select s) {
             for (LogicalPlan.ResolvedRelation rel : s.fromRelations()) {
                 if (rel.subquery().isEmpty()) {
                     continue;
                 }
                 LogicalPlan body = rel.subquery().get();
-                if (counts.getOrDefault(body, 0) > 1
-                        && body instanceof LogicalPlan.Select sel
-                        && !materializedCtes.containsKey(body)) {
-                    String name = rel.table().isBlank() ? "cte" : rel.table();
-                    materializedCtes.put(body, new MaterializedCteScanOperator.Store(
-                            name, () -> planMaterializedBody(sel)));
+                String cteName = rel.table().isBlank() ? "cte" : rel.table();
+                if (counts.getOrDefault(body, 0) > 1 && !materializedCtes.containsKey(body)) {
+                    // ★body 既可能是 SELECT，也可能是 UNION / UNION ALL（集合运算）：两者都能物化
+                    //   （planMaterializedBody 已支持）；漏掉集合运算会让多引用 CTE 被内联 N 份。
+                    //   物化开关（#9）：
+                    //   · query.cte.materialize=true（默认）          → 多引用 CTE 全部物化；
+                    //   · materialize=false + heavy=true（默认 true） → <b>仍然物化</b>：
+                    //       关闭普通物化不该让窗口/聚合被内联 N 份重复计算（#9）；
+                    //   · 两个都 false                                → 彻底不物化（显式选择重复计算）。
+                    boolean materializable = body instanceof LogicalPlan.Select
+                            || body instanceof LogicalPlan.SetOperation;
+                    if (materializable && (all || heavyEnabled)) {
+                        materializedCtes.put(body, new MaterializedCteScanOperator.Store(
+                                cteName, () -> planMaterializedBody(body)));
+                    } else if (materializable) {
+                        System.err.printf("[Planner] CTE '%s' 被引用 %d 次但未物化"
+                                        + "（query.cte.materialize=false 且 query.cte.materialize.heavy=false）"
+                                        + " —— 该段会按引用次数重复计算（窗口/聚合会被重复排序/聚合）%n",
+                                cteName, counts.get(body));
+                    } else {
+                        System.err.printf("[Planner] CTE '%s' 被引用 %d 次但形状不支持物化（%s）——"
+                                        + "该段会按引用次数重复计算%n",
+                                cteName, counts.get(body), body.getClass().getSimpleName());
+                    }
                 }
-                registerSharedBodies(body, counts);
+                registerSharedBodies(body, counts, all, heavyEnabled);
             }
             for (Expression.ScalarSubquery sub : s.scalarSubqueries()) {
-                registerSharedBodies(sub.inner(), counts);
+                registerSharedBodies(sub.inner(), counts, all, heavyEnabled);
             }
         } else if (plan instanceof LogicalPlan.SetOperation so) {
-            registerSharedBodies(so.left(), counts);
-            registerSharedBodies(so.right(), counts);
+            registerSharedBodies(so.left(), counts, all, heavyEnabled);
+            registerSharedBodies(so.right(), counts, all, heavyEnabled);
         } else if (plan instanceof LogicalPlan.Explain e) {
-            registerSharedBodies(e.statement(), counts);
+            registerSharedBodies(e.statement(), counts, all, heavyEnabled);
         } else if (plan instanceof LogicalPlan.Insert ins) {
-            registerSharedBodies(ins.query(), counts);
+            registerSharedBodies(ins.query(), counts, all, heavyEnabled);
         } else if (plan instanceof LogicalPlan.CreateTableAsSelect ctas) {
-            registerSharedBodies(ctas.query(), counts);
+            registerSharedBodies(ctas.query(), counts, all, heavyEnabled);
         } else if (plan instanceof LogicalPlan.CreateView cv) {
-            registerSharedBodies(cv.query(), counts);
+            registerSharedBodies(cv.query(), counts, all, heavyEnabled);
         }
     }
 
@@ -1275,7 +1310,7 @@ public final class Planner {
                     dist, innerRoot.outputColumns(), innerRoot);
         }
         // 分布式写 + 顶层投影：`Project / ScalarProject / Filter` 包在分布式算子之上时，把投影
-        // （143 个 get_json_object 等）也下推到归属 Worker，在本地算完直接写走 —— 数据不回 Master。
+        // （如 43 处 get_json_object 等）也下推到归属 Worker，在本地算完直接写走 —— 数据不回 Master。
         DistributedSinkShape projectedWrite = detectDistributedSink(innerRoot);
         if (projectedWrite != null) {
             projectedWrite.target().setSink(new FragmentSpec.SinkStep(
@@ -7705,7 +7740,7 @@ public final class Planner {
             return false;                      // 引用外层列 → 不是纯内层谓词
         }
         if (ak == REF_UNKNOWN && bk == REF_UNKNOWN) {
-            return aLit && bLit;               // 常量比较（1 = 1）：下推无害
+            return aLit && bLit;               // 常量比较（如 1 = 1）：下推无害
         }
         if (ak == REF_INNER) {
             return bk == REF_INNER || (bk == REF_UNKNOWN && bLit);
@@ -10427,6 +10462,21 @@ public final class Planner {
         // 追加会静默丢掉既有组 —— 这类形状不在此扩展（保持回退口径）。
         if (carrier instanceof DistributedChainedOperator dco && !dco.hasWindowChain()) return null;
 
+        // ★#7 跨层窗口复用：外层窗口的「分组键 + 排序键 + 函数」与链上某一步完全一致时，
+        //   直接复用已有窗口输出列（补一个改名投影），不再追加窗口步。
+        if (groups.size() == 1) {
+            java.util.Map<String, String> reuse =
+                    matchReusableWindow(existing, groups.get(0), upstream.outputColumns(), absorbed);
+            if (reuse != null && !reuse.isEmpty()) {
+                PhysicalNode reused = reuseWindowColumns(upstream, reuse);
+                if (reused != null) {
+                    System.err.printf("[Planner] 窗口复用：外层窗口与链上已有窗口同 spec，省掉一次排序（%s）%n",
+                            reuse);
+                    return reused;
+                }
+            }
+        }
+
         // 吸收项与窗口键合成列由<b>同一个</b> ExpressionProjectOperator 在发送端一次求值：
         // 因此每个表达式只能引用载体既有列，且不得引用彼此的输出（不能链式求值）。
         Set<String> absorbedNames = new HashSet<>();
@@ -10863,6 +10913,187 @@ public final class Planner {
     /** 一个待计算的窗口值：{@code wf} + 输出列（根窗口 = 别名/默认名，嵌套窗口 = 合成列）。 */
     private record WindowUnit(Expression.WindowFunction wf, String out) {}
 
+    /**
+     * 外层窗口能否直接复用链上已有窗口（#7，加强版）。命中条件（全部满足才复用，否则返回 null）：
+     * <ul>
+     *   <li>PARTITION BY / ORDER BY（含升降序）逐项等价 —— 支持<b>改名</b>（外层 {@code ts} 经派生表
+     *       映射回内层 {@code es_update_time}）与<b>表达式键</b>（两侧物化成 {@code __win_key_N}，
+     *       比对 {@code computed()} 里的表达式文本）；</li>
+     *   <li>每个窗口函数在该步里有「类型 + 参数列 + 无帧」等价的已算函数（参数同样支持改名/表达式）；</li>
+     *   <li>命中的窗口输出列（含被派生表改名的情况）在<b>当前可见列</b>里。</li>
+     * </ul>
+     *
+     * <p>改写映射来自 {@code absorbed}（{@code tryExtendWindowChain} 穿透投影时收集的
+     * {@code 外层列 ← 源表达式}）：既用于把外层键/参数解析回源侧，也用于把已有的窗口输出列
+     * 映射成外层可见列名。</p>
+     */
+    private static Map<String, String> matchReusableWindow(List<FragmentSpec.WindowStep> steps,
+                                                           List<WindowUnit> group,
+                                                           List<String> availableColumns,
+                                                           List<GroupKeyExpression> absorbed) {
+        if (steps == null || steps.isEmpty() || group.isEmpty()) return null;
+
+        Map<String, String> sourceOf = new HashMap<>();
+        Map<String, String> visibleOf = new HashMap<>();
+        for (GroupKeyExpression g : absorbed) {
+            sourceOf.put(g.derivedColumn().toLowerCase(Locale.ROOT), g.exprText());
+            String e = g.exprText().trim();
+            if (SqlTextUtil.isSingleIdentifier(e)) {
+                visibleOf.put(e.toLowerCase(Locale.ROOT), g.derivedColumn());
+            }
+        }
+
+        Expression.WindowFunction first = group.get(0).wf();
+        List<String> part = new ArrayList<>(first.partitionBy().size());
+        for (String p : first.partitionBy()) {
+            part.add(resolveWindowExpr(p, sourceOf));
+        }
+        List<String> order = new ArrayList<>(first.orderBy().size());
+        List<Boolean> asc = new ArrayList<>(first.orderBy().size());
+        for (String o : first.orderBy()) {
+            SqlTextUtil.OrderKey ok = SqlTextUtil.parseOrderKey(SqlTextUtil.stripQualifiers(o));
+            order.add(resolveWindowExpr(ok.column(), sourceOf));
+            asc.add(ok.ascending());
+        }
+        Set<String> visible = new HashSet<>();
+        for (String c : availableColumns) visible.add(c.toLowerCase(Locale.ROOT));
+
+        for (FragmentSpec.WindowStep step : steps) {
+            if (!sameWindowKeys(step, part, order, asc)) continue;
+            Map<String, String> reuse = new LinkedHashMap<>();
+            boolean all = true;
+            for (WindowUnit u : group) {
+                String existing = matchWindowFunction(step, u.wf(), sourceOf);
+                if (existing == null) {
+                    all = false;
+                    break;
+                }
+                String visibleCol = visibleOf.getOrDefault(existing.toLowerCase(Locale.ROOT), existing);
+                if (!visible.contains(visibleCol.toLowerCase(Locale.ROOT))) {
+                    all = false;
+                    break;
+                }
+                reuse.put(u.out(), visibleCol);
+            }
+            if (all && !reuse.isEmpty()) return reuse;
+        }
+        return null;
+    }
+
+    /**
+     * 把外层窗口键/参数解析回源侧：裸列经 {@code sourceOf}（派生表改名）映射成源列名或源表达式。
+     */
+    private static String resolveWindowExpr(String text, Map<String, String> sourceOf) {
+        String t = SqlTextUtil.stripQualifiers(text).trim();
+        String upper = t.toUpperCase(Locale.ROOT);
+        if (upper.endsWith(" DESC")) t = t.substring(0, t.length() - 5).trim();
+        else if (upper.endsWith(" ASC")) t = t.substring(0, t.length() - 4).trim();
+        if (!SqlTextUtil.isSingleIdentifier(t)) return t;      // 表达式：保留原文（只去限定符）
+        String mapped = sourceOf.get(t.toLowerCase(Locale.ROOT));
+        return mapped == null ? t : mapped;
+    }
+
+    /** 窗口键是否等价（列名大小写不敏感；表达式按 computed 的表达式文本比对；排序方向逐项相同）。 */
+    private static boolean sameWindowKeys(FragmentSpec.WindowStep step, List<String> part,
+                                          List<String> order, List<Boolean> asc) {
+        if (step.partitionBy().size() != part.size() || step.orderBy().size() != order.size()) return false;
+        for (int i = 0; i < part.size(); i++) {
+            if (!windowKeyMatches(step, step.partitionBy().get(i), part.get(i))) return false;
+        }
+        for (int i = 0; i < order.size(); i++) {
+            if (!windowKeyMatches(step, step.orderBy().get(i), order.get(i))) return false;
+            boolean stepAsc = step.ascending() == null || step.ascending().size() <= i
+                    || step.ascending().get(i);
+            if (stepAsc != asc.get(i)) return false;
+        }
+        return true;
+    }
+
+    /** 单个窗口键等价：裸列比名字；表达式比该步 {@code computed()} 里的表达式文本（去空白后精确比对）。 */
+    private static boolean windowKeyMatches(FragmentSpec.WindowStep step, String stepKey, String outerKey) {
+        if (SqlTextUtil.isSingleIdentifier(outerKey)) {
+            return stepKey.equalsIgnoreCase(outerKey);
+        }
+        if (!stepKey.startsWith(WINDOW_KEY_ALIAS_PREFIX)) return false;
+        for (GroupKeyExpression g : step.computed()) {
+            if (g.derivedColumn().equals(stepKey)
+                    && normalizedExprText(g.exprText()).equals(normalizedExprText(outerKey))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String normalizedExprText(String text) {
+        return SqlTextUtil.stripQualifiers(text).replaceAll("\\s+", "");
+    }
+
+    /**
+     * 窗口函数能否复用：同型同参（函数名 + 参数）。参数：裸列比名字，表达式按该步
+     * {@code __win_arg_N} 与 {@code computed} 文本比对。只覆盖无帧的简单函数
+     * （ROW_NUMBER / RANK / DENSE_RANK / SUM / AVG / COUNT / MIN / MAX / FIRST_VALUE / LAST_VALUE）；
+     * LAG / LEAD / NTILE / NTH_VALUE 带偏移或默认值，一律不复用。
+     */
+    private static String matchWindowFunction(FragmentSpec.WindowStep step, Expression.WindowFunction wf,
+                                              Map<String, String> sourceOf) {
+        if (wf.windowFrame().isPresent()) return null;
+        String fn = wf.functionName().toUpperCase(Locale.ROOT);
+        String argRaw = wf.args().isEmpty() ? null : wf.args().get(0).trim();
+        if (argRaw != null && (argRaw.isEmpty() || argRaw.equals("*"))) argRaw = null;
+        String arg = argRaw == null ? null : resolveWindowExpr(argRaw, sourceOf);
+        for (WindowFunctionSpec spec : step.functions()) {
+            if (spec.frame() != null) continue;
+            String type = spec.type().name();
+            if (!type.equalsIgnoreCase(fn)) continue;
+            switch (type) {
+                case "ROW_NUMBER", "RANK", "DENSE_RANK" -> {
+                    if (arg == null) return spec.outputColumn();
+                }
+                case "SUM", "AVG", "COUNT", "MIN", "MAX", "FIRST_VALUE", "LAST_VALUE" -> {
+                    String in = spec.inputColumn();
+                    if (arg == null && (in == null || in.isEmpty())) return spec.outputColumn();
+                    if (arg == null || in == null) continue;
+                    if (SqlTextUtil.isSingleIdentifier(arg)) {
+                        if (in.equalsIgnoreCase(arg)) return spec.outputColumn();
+                    } else if (in.startsWith(WINDOW_ARG_ALIAS_PREFIX)) {
+                        for (GroupKeyExpression g : step.computed()) {
+                            if (g.derivedColumn().equals(in)
+                                    && normalizedExprText(g.exprText()).equals(normalizedExprText(arg))) {
+                                return spec.outputColumn();
+                            }
+                        }
+                    }
+                }
+                default -> {
+                    // 其余（LAG/LEAD/NTILE/AGGREGATE…）不复用
+                }
+            }
+        }
+        return null;
+    }
+
+    /** 复用列：在 upstream 之上补一个改名投影（{@code 已有列 → 外层别名}），不新增排序步。 */
+    private static PhysicalNode reuseWindowColumns(PhysicalNode upstream, Map<String, String> reuse) {
+        List<String> out = new ArrayList<>(upstream.outputColumns());
+        List<ProjectOperator.ColumnRef> refs = new ArrayList<>();
+        for (String c : upstream.outputColumns()) {
+            refs.add(new ProjectOperator.ColumnRef(c, 1, c));
+        }
+        boolean added = false;
+        for (Map.Entry<String, String> e : reuse.entrySet()) {
+            if (e.getKey().equalsIgnoreCase(e.getValue())) continue;   // 已是同名列：无需改
+            for (String c : out) {
+                if (c.equalsIgnoreCase(e.getKey())) return null;       // 别名与既有列冲突 → 放弃复用
+            }
+            refs.add(new ProjectOperator.ColumnRef(e.getValue(), 1, e.getKey()));
+            out.add(e.getKey());
+            added = true;
+        }
+        if (!added) return upstream;
+        ProjectOperator project = ProjectOperator.aliased(upstream.operator(), refs);
+        return new PhysicalNode("WindowReuse[reused=" + reuse.size() + "]", project, out, upstream);
+    }
+
     /** SELECT 项集合 → 待计算的窗口单元（按 SELECT 项顺序、项内窗口出现顺序）。 */
     private static List<WindowUnit> windowUnits(List<LogicalPlan.SelectItem> windowItems,
                                                 LogicalPlan.Select select) {
@@ -10906,9 +11137,12 @@ public final class Planner {
         List<WindowUnit> units = windowUnits(windowItems, select);
 
         // 按「PARTITION BY + ORDER BY」分组；顺序即 SELECT 中首次出现顺序。
+        // ★按「规范化后的键」分组：裸列去限定符 + 小写，ORDER BY 带升降序；表达式键保留原文
+        //   （大小写/字面量不能改）。否则同一 SELECT 里 `PARTITION BY t1.id` 与 `PARTITION BY id`
+        //   会被当成两组 —— 多排一次序、多一轮溢写。
         Map<String, List<WindowUnit>> groups = new LinkedHashMap<>();
         for (WindowUnit u : units) {
-            String key = u.wf().partitionBy() + "§" + u.wf().orderBy();
+            String key = windowGroupKey(u.wf());
             groups.computeIfAbsent(key, k -> new ArrayList<>()).add(u);
         }
         List<List<WindowUnit>> groupList = new ArrayList<>(groups.values());
@@ -11110,6 +11344,37 @@ public final class Planner {
             if (hasWindowKeyExpression(wf)) return true;
         }
         return false;
+    }
+
+    /**
+     * 窗口分组键（同一 SELECT 内「同一定义」的窗口合并成一个排序步）。
+     *
+     * <p>归一化规则：裸列名去限定符 + 小写；ORDER BY 附上升降序；表达式键只去限定符、保留原文
+     * （表达式里的字符串字面量大小写敏感，不能小写化）。这样 {@code PARTITION BY t1.id} 与
+     * {@code PARTITION BY ID}、{@code ORDER BY ts} 与 {@code ORDER BY ts ASC} 会落到同一组。</p>
+     */
+    private static String windowGroupKey(Expression.WindowFunction wf) {
+        StringBuilder sb = new StringBuilder();
+        for (String p : wf.partitionBy()) {
+            sb.append(normalizedWindowKey(p, false)).append(',');
+        }
+        sb.append('§');
+        for (String o : wf.orderBy()) {
+            sb.append(normalizedWindowKey(o, true)).append(',');
+        }
+        return sb.toString();
+    }
+
+    /** 单个窗口键项的规范化文本（见 {@link #windowGroupKey}）。 */
+    private static String normalizedWindowKey(String item, boolean orderKey) {
+        if (orderKey) {
+            SqlTextUtil.OrderKey ok = SqlTextUtil.parseOrderKey(SqlTextUtil.stripQualifiers(item));
+            String col = ok.column().trim();
+            if (SqlTextUtil.isSingleIdentifier(col)) col = col.toLowerCase(Locale.ROOT);
+            return col + (ok.ascending() ? " asc" : " desc");
+        }
+        String t = windowKeyText(item);
+        return SqlTextUtil.isSingleIdentifier(t) ? t.toLowerCase(Locale.ROOT) : t;
     }
 
     /** 窗口键原文 → 去限定符、去 ASC/DESC 的表达式文本（单列时即裸列名）。 */

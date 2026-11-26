@@ -42,6 +42,8 @@ public class Page implements AutoCloseable {
     /** 分区结束标记：root 为 null 但 {@link #isEOF()} 为 false（仅表达"该分区数据已发完"）。 */
     private final boolean endOfPartition;
     private final Map<String, Object> metadata;
+    /** close 幂等标记（见 {@link #close()}）。 */
+    private volatile boolean closed;
 
     // ==================== 构造 ====================
 
@@ -276,6 +278,13 @@ public class Page implements AutoCloseable {
 
     @Override
     public void close() {
+        // 幂等：接收队列关闭时的迟到页由生产端与队列各兜一次，可能重复 close；
+        // Arrow 的 vector/root 二次 close 会抛异常，这里先挡住。
+        if (closed) return;
+        synchronized (this) {
+            if (closed) return;
+            closed = true;
+        }
         if (root != null) {
             root.close();
         }
